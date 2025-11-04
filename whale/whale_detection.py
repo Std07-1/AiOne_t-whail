@@ -81,6 +81,9 @@ class BlockTradeAnalyzer:
     def __init__(self) -> None:
         """Ініціалізація аналізатора потоків з базовими налаштуваннями та логуванням."""
         self.exchange_flows: dict[str, float] = {}
+        # Не змінюємо контракт конструктора: джерело переказів можна
+        # інжектнути через set_transfer_provider() для тестів/інтеграцій.
+        self._transfer_provider: Any | None = None
         self.otc_desks_monitoring: list[str] = [
             "Genesis",
             "Circle",
@@ -93,6 +96,14 @@ class BlockTradeAnalyzer:
             ", ".join(self.otc_desks_monitoring),
         )
         logger.info("BlockTradeAnalyzer готовий до моніторингу інституційних потоків")
+
+    def set_transfer_provider(self, provider: Any) -> None:
+        """Задає провайдер переказів для monitor_blockchain_transfers.
+
+        Очікується callable на кшталт: provider(threshold: float) -> Iterable[dict].
+        Додатковий метод не ламає контракти — конструктор лишається без аргументів.
+        """
+        self._transfer_provider = provider
 
     def track_institutional_flows(self) -> dict[str, float]:
         """Повертає агреговані патерни потоків (заглушка з логуванням).
@@ -166,11 +177,28 @@ class BlockTradeAnalyzer:
         - Рекомендується асинхронна імплементація з лімітом паралельних запитів і кешуванням.
         - Не зберігати сирі ключі/секрети в логах.
         """
+        # Якщо задано провайдер — використовуємо його (для тестів/інтеграцій)
+        if self._transfer_provider is not None:
+            try:
+                transfers = list(self._transfer_provider(threshold))
+                logger.debug(
+                    "monitor_blockchain_transfers: отримано %d запис(и) від провайдера",
+                    len(transfers),
+                )
+                return transfers
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "monitor_blockchain_transfers: провайдер впав: %s — повертаємо []",
+                    exc,
+                )
+                return []
+
         logger.debug(
-            "monitor_blockchain_transfers: виклик заглушки з threshold=%.2f", threshold
+            "monitor_blockchain_transfers: провайдер відсутній, повертаємо [] (threshold=%.2f)",
+            threshold,
         )
         # TODO: інтегрувати з реальним провайдером (BlockCypher/Glassnode/Custom indexer)
-        # TODO: робити нормалізацію полів transfer: {amount, from_exchange, to_exchange, txid, timestamp, to_cold, from_cold}
+        # TODO: нормалізація полів transfer: {amount, from_exchange, to_exchange, txid, timestamp, to_cold, from_cold}
         return []
 
     def analyze_cold_storage_moves(
@@ -292,24 +320,74 @@ class SupplyDemandZones:
     - Повертає структуру з ключовими рівнями, ймовірними таргетами та якістю зон.
     - Немає побічних ефектів — заглушка, готова до інтеграції з реальними алгоритмами.
 
-    Logging:
-    - INFO — початок/кінець основних операцій, ключові результати.
-    - DEBUG — внутрішні розрахунки, розміри масивів, тимчасові значення.
+        logger.debug(
+            "find_accumulation_zones: n_prices=%d n_vols=%d", len(prices), len(vols)
+        )
     - WARNING — відсутні або некоректні вхідні дані.
 
     TODO:
     - Винести пороги/константи в config/config.py.
-            # Strict override via config
-            try:
-                if bool(ZONE_WINDOWS_STRICT_ENABLED):
-                    window = max(2, int(ZONE_WINDOW_LONG))
-            except Exception:
-                pass
-    - Додати Redis-кешування результатів з правильним ключем ai_one:levels:{symbol}:{granularity} та TTL.
-    - Реалізувати clustering (price-volume), time-decay та перевірку видимості ордербуку.
-    - Додати unit-тести: happy-path + edge-cases + псевдо-стріми історичних даних.
-    """
+        # Sliding-window heuristic: низька відносна волатильність + не нижчий за медіану обсяг
+        try:
+            # Вікна під прапором/конфігом (fallback на 10)
+            window = int(ZONE_WINDOW_SHORT or 10)
+            if ZONE_WINDOWS_STRICT_ENABLED:
+                try:
+                    window = max(window, int(ZONE_WINDOW_LONG or window))
+                except Exception:
+                    pass
+            window = max(3, window)
+            stride = max(1, window // 2)
 
+            def _mean(x: list[float]) -> float:
+                return sum(x) / len(x) if x else 0.0
+
+            zones_raw: list[tuple[float, float]] = []
+            median_vol = (
+                sorted(vols)[len(vols) // 2] if vols else 0.0
+            )
+            for i in range(0, max(1, len(prices) - window + 1), stride):
+                segment = prices[i : i + window]
+                seg_vol = sum(vols[i : i + window]) if vols else 0.0
+                if len(segment) < 3:
+                    continue
+                seg_mean = _mean(segment)
+                # std без numpy
+                var = sum((p - seg_mean) ** 2 for p in segment) / (len(segment) - 1)
+                std = math.sqrt(var)
+                cv = (std / seg_mean) if seg_mean > 0 else 0.0
+                # Пороги: відносна мінливість < 0.3% та обсяг >= медіани
+                if cv <= 0.003 and seg_vol >= max(1.0, median_vol):
+                    low, high = float(min(segment)), float(max(segment))
+                    zones_raw.append((low, high))
+
+            # Злиття перекривних зон
+            zones: list[tuple[float, float]] = []
+            for lo, hi in sorted(zones_raw):
+                if not zones:
+                    zones.append((lo, hi))
+                    continue
+                plo, phi = zones[-1]
+                if lo <= phi * 1.001:  # невелике перекриття/дотик
+                    zones[-1] = (min(plo, lo), max(phi, hi))
+                else:
+                    zones.append((lo, hi))
+
+            logger.info("find_accumulation_zones: знайдено %d зон", len(zones))
+            return zones
+                    "prices": list[float],
+                    "volumes": list[float],
+                    "time": list[int|float],  # epoch
+                    ...
+                }
+
+        Returns:
+            dict з полями:
+                - key_levels: dict (accumulation_zones, distribution_zones, stop_hunt_levels, liquidity_pools)
+                - key_levels_enriched: dict як key_levels, але збагачений volume для зон (dict із ключами {low, high, volume})
+                - probable_targets: list[float]
+                - risk_levels: dict з оцінками якості зон (0..1)
+        """
     def identify_institutional_levels(
         self, historical_data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -424,78 +502,89 @@ class SupplyDemandZones:
             logger.debug("find_accumulation_zones: немає цін -> []")
             return []
 
-        # Простий heuristic: брати сусідні вікна, де variance цін мала, але сумарний обсяг вищий за медіану
         try:
-            window = 10
-            zones: list[tuple[float, float]] = []
+            # Базова довжина вікна з конфігу (з fallback)
+            try:
+                window = int(ZONE_WINDOW_SHORT or 10)
+            except Exception:
+                window = 10
+            if ZONE_WINDOWS_STRICT_ENABLED:
+                try:
+                    window = max(window, int(ZONE_WINDOW_LONG or window))
+                except Exception:
+                    pass
+            window = max(3, window)
+            stride = max(1, window // 2)
+
+            def _mean(x: list[float]) -> float:
+                return sum(x) / len(x) if x else 0.0
+
             median_vol = sorted(vols)[len(vols) // 2] if vols else 0.0
-            for i in range(0, max(1, len(prices) - window + 1), window):
+            zones_raw: list[tuple[float, float]] = []
+            for i in range(0, max(1, len(prices) - window + 1), stride):
                 segment = prices[i : i + window]
-                seg_vol = sum(vols[i : i + window]) if vols else 0.0
-                if not segment:
+                if len(segment) < 3:
                     continue
-                price_range = max(segment) - min(segment)
-                # Тимчасові пороги — винести в config
-                if price_range < (
-                    sum(segment) / len(segment)
-                ) * 0.005 and seg_vol >= max(1.0, median_vol):
+                seg_vol = sum(vols[i : i + window]) if vols else 0.0
+                seg_mean = _mean(segment)
+                var = sum((p - seg_mean) ** 2 for p in segment) / (len(segment) - 1)
+                std = math.sqrt(var)
+                cv = (std / seg_mean) if seg_mean > 0 else 0.0
+                if cv <= 0.003 and seg_vol >= max(1.0, median_vol):
                     low, high = float(min(segment)), float(max(segment))
-                    zones.append((low, high))
-                    # logger.debug(
-                    #     "find_accumulation_zones: виявлено зона low=%.6f high=%.6f vol=%.2f",
-                    #     low,
-                    #     high,
-                    #     seg_vol,
-                    # )
+                    zones_raw.append((low, high))
+
+            # Злиття перекривних/дотичних зон
+            zones: list[tuple[float, float]] = []
+            for lo, hi in sorted(zones_raw):
+                if not zones:
+                    zones.append((lo, hi))
+                    continue
+                plo, phi = zones[-1]
+                if lo <= phi * 1.001:
+                    zones[-1] = (min(plo, lo), max(phi, hi))
+                else:
+                    zones.append((lo, hi))
             logger.info("find_accumulation_zones: знайдено %d зон", len(zones))
             return zones
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover
             logger.exception("find_accumulation_zones: помилка під час пошуку: %s", exc)
             return []
 
-    def find_distribution_zones(
-        self, historical_data: dict[str, Any]
-    ) -> list[tuple[float, float]]:  # noqa: D401
-        """Пошук зон розподілу (повертає список пар [low, high]).
-
-        Проксі: вимальовуються як ділянки з високою волатильністю та високими обсягами.
-        - TODO: Реалізувати справжній алгоритм ідентифікації зон розподілу на основі price-volume clustering, time-decay та перевірки видимості ордербуку. Поточна реалізація — простий heuristic з фіксованими порогами, який потрібно замінити на кластеризацію та калібрування порогів через config/config.py.
-        """
-        prices = list(historical_data.get("prices") or [])
-        vols = list(historical_data.get("volumes") or [])
-
-        logger.debug(
-            "find_distribution_zones: n_prices=%d n_vols=%d", len(prices), len(vols)
-        )
-        if not prices:
-            return []
-
         try:
-            window = 10
-            zones: list[tuple[float, float]] = []
+            try:
+                window = int(ZONE_WINDOW_SHORT or 10)
+            except Exception:
+                window = 10
+            window = max(3, window)
+            stride = max(1, window // 2)
+            zones_raw: list[tuple[float, float]] = []
             avg_vol = (sum(vols) / len(vols)) if vols else 0.0
-            for i in range(0, max(1, len(prices) - window + 1), window):
+            for i in range(0, max(1, len(prices) - window + 1), stride):
                 segment = prices[i : i + window]
-                seg_vol = sum(vols[i : i + window]) if vols else 0.0
-                if not segment:
+                if len(segment) < 3:
                     continue
+                seg_vol = sum(vols[i : i + window]) if vols else 0.0
+                seg_mean = sum(segment) / len(segment)
                 price_range = max(segment) - min(segment)
-                # Тимчасова логіка: велика амплітуда і обсяг -> distribution zone
-                if (
-                    price_range > (sum(segment) / len(segment)) * 0.01
-                    and seg_vol >= avg_vol
-                ):
+                rel_amp = (price_range / seg_mean) if seg_mean > 0 else 0.0
+                if rel_amp >= 0.008 and seg_vol >= avg_vol:
                     low, high = float(min(segment)), float(max(segment))
-                    zones.append((low, high))
-                    # logger.debug(
-                    #     "find_distribution_zones: виявлено зона low=%.6f high=%.6f vol=%.2f",
-                    #     low,
-                    #     high,
-                    #     seg_vol,
-                    # )
+                    zones_raw.append((low, high))
+
+            zones: list[tuple[float, float]] = []
+            for lo, hi in sorted(zones_raw):
+                if not zones:
+                    zones.append((lo, hi))
+                    continue
+                plo, phi = zones[-1]
+                if lo <= phi * 1.001:
+                    zones[-1] = (min(plo, lo), max(phi, hi))
+                else:
+                    zones.append((lo, hi))
             logger.info("find_distribution_zones: знайдено %d зон", len(zones))
             return zones
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover
             logger.exception("find_distribution_zones: помилка під час пошуку: %s", exc)
             return []
 
@@ -512,23 +601,26 @@ class SupplyDemandZones:
         if not prices:
             return []
         try:
-            # Простий підхід: локальні екстремуми як кандидати
+            # Локальні екстремуми + простий фільтр «помітності» (prominence)
             candidates: list[float] = []
+            win = max(3, min(20, (len(prices) // 10) or 3))
+            half = max(1, win // 2)
             for i in range(1, len(prices) - 1):
                 prev_p = float(prices[i - 1])
                 cur_p = float(prices[i])
                 next_p = float(prices[i + 1])
-                # локальний мінімум або максимум
-                if (cur_p < prev_p and cur_p < next_p) or (
+                is_ext = (cur_p < prev_p and cur_p < next_p) or (
                     cur_p > prev_p and cur_p > next_p
-                ):
+                )
+                if not is_ext:
+                    continue
+                left_idx = max(0, i - half)
+                right_idx = min(len(prices), i + half + 1)
+                neighborhood = prices[left_idx:right_idx]
+                nb_mean = sum(neighborhood) / len(neighborhood)
+                nb_dev = abs(cur_p - nb_mean) / nb_mean if nb_mean > 0 else 0.0
+                if nb_dev >= 0.005:  # >=0.5% відхилення від локального середнього
                     candidates.append(cur_p)
-                    # logger.debug(
-                    #    "identify_stop_hunt_zones: candidate at index=%d price=%.6f",
-                    #    i,
-                    #    cur_p,
-                    # )
-            # Зробимо унікальні і відсортуємо
             unique = sorted(set(candidates))
             logger.info(
                 "identify_stop_hunt_zones: знайдено %d candidate levels", len(unique)

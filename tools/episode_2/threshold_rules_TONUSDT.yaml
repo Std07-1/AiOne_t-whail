@@ -1,0 +1,10 @@
+rules:
+  - id: ton_relax_low_vol
+    priority: 80
+    when: { metric: volatility.max_60bar_move, op: "<", value: 0.018 }
+    actions:
+      stage1.volume_z_min: 2.2
+      stage2.move_pct_up_factor: 0.9
+      stage2.move_pct_down_factor: 0.9
+
+default_actions: {}

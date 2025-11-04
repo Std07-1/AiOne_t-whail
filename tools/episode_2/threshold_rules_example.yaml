@@ -1,0 +1,46 @@
+# Dynamic Threshold Rules Example
+# Вказуємо набір правил які можуть адаптувати Stage1/Stage2 пороги.
+# Формат:
+# rules:
+#   - id: rsi_extreme_expand
+#     when:
+#       metric: volatility.max_60bar_move
+#       op: ">="
+#       value: 0.05
+#     actions:
+#       stage1.rsi_overbought: 82
+#       stage1.rsi_oversold: 18
+#       stage1.volume_z_min: 3.5
+#       stage2.move_pct_up_factor: 1.2
+#       stage2.move_pct_down_factor: 1.2
+#     tags: [volatility, rsi]
+#   - id: quiet_market_relax
+#     when:
+#       metric: volatility.max_60bar_move
+#       op: "<"
+#       value: 0.02
+#     actions:
+#       stage1.volume_z_min: 2.5
+#       stage2.move_pct_up_factor: 0.85
+#       stage2.move_pct_down_factor: 0.85
+# default_actions: {}  # можна задати fallback
+
+rules:
+  - id: rsi_extreme_expand
+    when: { metric: volatility.max_60bar_move, op: ">=", value: 0.05 }
+    actions:
+      stage1.rsi_overbought: 82
+      stage1.rsi_oversold: 18
+      stage1.volume_z_min: 3.5
+      stage2.move_pct_up_factor: 1.2
+      stage2.move_pct_down_factor: 1.2
+    tags: [volatility, expansion]
+  - id: quiet_market_relax
+    when: { metric: volatility.max_60bar_move, op: "<", value: 0.02 }
+    actions:
+      stage1.volume_z_min: 2.5
+      stage2.move_pct_up_factor: 0.85
+      stage2.move_pct_down_factor: 0.85
+    tags: [volatility, contraction]
+
+default_actions: {}

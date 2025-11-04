@@ -1,0 +1,32 @@
+line-length = 88
+target-version = "py311"
+
+[lint]
+select = [
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "I",  # isort
+  "B",  # flake8-bugbear
+  "UP", # pyupgrade
+  "N",  # pep8-naming
+]
+ignore = [
+  # Тимчасово не вимагаємо повну типізацію анотацій
+  "ANN",
+  # Довжина рядка контролюється Black; не блокуємо лінтерами
+  "E501",
+  # Поступова міграція до `X | Y` в isinstance; не блокуємо збірку
+  "UP038",
+]
+
+[lint.per-file-ignores]
+"test/**" = ["N", "E501"]
+"QDE/__init__.py" = ["N999"]
+"UI/__init__.py" = ["N999"]
+"config/config.py" = ["N815", "N805"]
+"config/TOP100_THRESHOLDS.py" = ["E501"]
+"stage1/asset_monitoring.py" = ["E501"]
+"stage1/asset_triggers/rsi_divergence_trigger.py" = ["E501"]
+"stage1/asset_triggers/vwap_deviation_trigger.py" = ["E501"]
+"stage2/qde_core.py" = ["E501"]
+"stage3/trade_manager_updater.py" = ["E501"]

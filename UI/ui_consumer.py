@@ -1,0 +1,1657 @@
+"""UI консюмер у режимі render-only: без локальних обчислень цін/ATR/RSI/TP-SL."""
+
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import datetime
+from typing import Any, Literal, cast
+
+import redis.asyncio as redis
+from rich.box import ROUNDED
+from rich.console import Console
+from rich.live import Live
+from rich.logging import RichHandler
+from rich.table import Table
+
+from config.config import (
+    K_STATS,
+    K_SYMBOL,
+    REDIS_CHANNEL_ASSET_STATE,
+    REDIS_CHANNEL_UI_ASSET_STATE,
+    REDIS_SNAPSHOT_KEY,
+    REDIS_SNAPSHOT_UI_KEY,
+    UI_USE_V2_NAMESPACE,
+)
+
+ui_console = Console(stderr=False)
+
+ui_logger = logging.getLogger("ui_consumer")
+ui_logger.setLevel(logging.INFO)
+ui_logger.handlers.clear()
+# ВАЖЛИВО: таблиця рендериться у stdout (ui_console), а логи мають іти у stderr,
+# щоб не псувати розмітку Live-таблиці. Тому RichHandler спрямовуємо на stderr.
+ui_logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+ui_logger.propagate = False
+
+
+class AlertAnimator:
+    def __init__(self) -> None:
+        self.active_alerts: dict[str, float] = {}
+
+    def add_alert(self, symbol: str) -> None:
+        self.active_alerts[symbol] = time.time()
+
+    def should_highlight(self, symbol: str) -> bool:
+        ts = self.active_alerts.get(symbol)
+        if ts is None:
+            return False
+        if (time.time() - ts) < 8.0:
+            return True
+        self.active_alerts.pop(symbol, None)
+        return False
+
+
+class UIConsumer:
+    def __init__(self, vol_z_threshold: float = 2.5, low_atr_threshold: float = 0.005):
+        self.vol_z_threshold = vol_z_threshold
+        self.low_atr_threshold = low_atr_threshold
+        self.alert_animator = AlertAnimator()
+        self.last_update_time: float = time.time()
+        # Послідовність останнього прийнятого снапшоту (для відсікання застарілих)
+        self._last_seq: int = -1
+        self._last_counters: dict[str, Any] = {}
+        self._display_results: list[dict[str, Any]] = (
+            []
+        )  # кеш останнього непорожнього списку
+        self._blink_state = False  # для миготіння pressure
+        self._pressure_alert_active = False
+        # Пер-символьний трекінг останнього часу/ts для м'якого мерджу оновлень (уникаємо «звуження» списку)
+        self._sym_last_ts: dict[str, float] = {}
+
+    # self._last_core_refresh: float = 0.0  # видалено: Core/Health більше не використовуються
+
+    # Render-only режим: UI не форматує та не обчислює значення — лише стилізує
+
+    def _get_rsi_color(self, rsi: float) -> str:
+        if rsi < 30:
+            return "green"
+        if rsi < 50:
+            return "light_green"
+        if rsi < 70:
+            return "yellow"
+        return "red"
+
+    def _get_atr_color(self, atr_pct: float) -> str:
+        if atr_pct < self.low_atr_threshold:
+            return "red"
+        if atr_pct > 0.02:
+            return "yellow"
+        return ""
+
+    def _get_signal_icon(self, signal: str) -> str:
+        icons = {
+            "ALERT": "🔴",
+            "NORMAL": "🟢",
+            "ALERT_BUY": "🟢↑",
+            "ALERT_SELL": "🔴↓",
+            "NONE": "⚪",
+        }
+        return icons.get(signal, "❓")
+
+    def _get_recommendation_icon(self, recommendation: str) -> str:
+        icons = {
+            # Стара логіка STRONG_BUY/BUY_IN_DIPS видалена; актуальні значення нижче
+            "SOFT_BUY": "🟢↑",
+            "SOFT_SELL": "�↓",
+            "HOLD": "🟡",
+            "SELL_ON_RALLIES": "🔴↓",
+            "STRONG_SELL": "🔴↓↓",
+            "AVOID": "⚫",
+            "WAIT": "⚪",
+        }
+        return icons.get(recommendation, "")
+
+    def _format_band_pct(self, asset: dict[str, Any]) -> str:
+        """Повертає рядок із Band% для відображення у таблиці."""
+
+        band_raw: float | None = None
+        try:
+            root_band = asset.get("band_pct")
+            if isinstance(root_band, (int, float)):
+                band_raw = float(root_band)
+            else:
+                analytics = asset.get("analytics")
+                if isinstance(analytics, dict):
+                    band_candidate = analytics.get("corridor_band_pct")
+                    if isinstance(band_candidate, (int, float)):
+                        band_raw = float(band_candidate)
+        except Exception:
+            band_raw = None
+
+        if band_raw is None or band_raw < 0:
+            return "-"
+
+        band_pct_val = band_raw * 100.0 if band_raw <= 1.0 else band_raw
+
+        try:
+            if band_pct_val < 0.3:
+                band_color = "red"
+            elif band_pct_val <= 1.5:
+                band_color = "yellow"
+            else:
+                band_color = "green"
+            return f"[{band_color}]{band_pct_val:.2f}%[/]"
+        except Exception:
+            return f"{band_pct_val:.2f}%"
+
+    async def redis_consumer(
+        self,
+        redis_url: str | None = None,
+        channel: str | None = None,
+        refresh_rate: float = 0.8,
+        loading_delay: float = 1.5,
+        smooth_delay: float = 0.05,
+    ) -> None:
+        """
+        Слухає канал Redis Pub/Sub, приймає payload {"meta","counters","assets"}
+        і рендерить таблицю.
+        """
+        # Підтримка конфігів з ENV, щоб не промахнутись по інстансу Redis
+        redis_url = (
+            redis_url
+            or os.getenv("REDIS_URL")
+            or f"redis://{os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}/0"
+        )
+
+        # Ініціалізація збереженого списку результатів (instance-level) з типом
+        if not hasattr(self, "_last_results"):
+            self._last_results: list[dict[str, Any]] = []
+
+        redis_client = redis.from_url(
+            redis_url, decode_responses=True, encoding="utf-8"
+        )
+        pubsub = redis_client.pubsub()
+
+        # Спроба початкового снапшоту перед підпискою (cold start only)
+        try:
+            primary_snapshot = (
+                REDIS_SNAPSHOT_UI_KEY if UI_USE_V2_NAMESPACE else REDIS_SNAPSHOT_KEY
+            )
+            fallback_snapshot = (
+                REDIS_SNAPSHOT_KEY if UI_USE_V2_NAMESPACE else REDIS_SNAPSHOT_UI_KEY
+            )
+            snapshot_raw = await redis_client.get(primary_snapshot)
+            if not snapshot_raw:
+                snapshot_raw = await redis_client.get(fallback_snapshot)
+            if snapshot_raw:
+                snap = json.loads(snapshot_raw)
+                if isinstance(snap, dict) and isinstance(snap.get("assets"), list):
+                    self._last_results = snap.get("assets") or []
+                    if self._last_results:
+                        self._display_results = self._last_results
+                    self._last_counters = snap.get("counters", {}) or {}
+                    meta_ts = snap.get("meta", {}).get("ts")
+                    meta_seq = snap.get("meta", {}).get("seq")
+                    if meta_ts:
+                        try:
+                            # Інтерпретуємо UTC-час коректно (Z → +00:00)
+                            self.last_update_time = datetime.fromisoformat(
+                                str(meta_ts).replace("Z", "+00:00")
+                            ).timestamp()
+                        except Exception:
+                            pass
+                    try:
+                        if meta_seq is not None:
+                            self._last_seq = int(meta_seq)
+                    except Exception:
+                        pass
+                    ui_logger.info(
+                        "📥 Завантажено початковий снапшот: %d активів",
+                        len(self._last_results),
+                    )
+        except Exception:  # broad-except: початковий снапшот не критичний
+            ui_logger.debug("Не вдалося завантажити початковий снапшот", exc_info=True)
+
+        await asyncio.sleep(loading_delay)
+        # Вибір каналу за namespace або явним аргументом
+        selected_channel: str = (
+            channel
+            if isinstance(channel, str) and channel
+            else (
+                REDIS_CHANNEL_UI_ASSET_STATE
+                if UI_USE_V2_NAMESPACE
+                else REDIS_CHANNEL_ASSET_STATE
+            )
+        )
+        await pubsub.subscribe(selected_channel)
+        ui_logger.info(
+            f"🔗 Підключено до Redis ({redis_url}), канал '{selected_channel}'..."
+        )
+
+        # Початкове відображення: якщо вже є снапшот, показуємо його одразу
+        initial_results = self._display_results if self._display_results else []
+        with Live(
+            self._build_signal_table(
+                initial_results, loading=not bool(initial_results)
+            ),
+            console=ui_console,
+            refresh_per_second=refresh_rate,
+            screen=False,
+            transient=False,
+            # Не перехоплюємо stdout/stderr у Live, щоб логи не «вбудовувались» у таблицю
+            # і не зникали під час перерисовок. Логи підуть у звичні потоки термінала.
+            redirect_stdout=False,
+            redirect_stderr=False,
+        ) as live:
+            while True:
+                try:
+                    # Periodic fallback snapshot reload — видалено.
+                    # Snapshot використовуємо лише при холодному старті або при gap у seq.
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0
+                    )
+                    if message:
+                        try:
+                            data = json.loads(message["data"])
+                        except Exception:
+                            ui_logger.error(
+                                "Невдача json.loads для отриманого повідомлення"
+                            )
+                            data = None
+
+                        # ✅ Очікуємо dict з 'assets' та коректною meta.seq
+                        if isinstance(data, dict) and "assets" in data:
+                            # Строгий контроль послідовності: приймаємо лише якщо seq монотонно зростає.
+                            try:
+                                meta_ts_raw = data.get("meta", {}).get("ts")
+                                meta_seq = data.get("meta", {}).get("seq")
+                                incoming_ts = None
+                                if meta_ts_raw:
+                                    incoming_ts = datetime.fromisoformat(
+                                        str(meta_ts_raw).replace("Z", "+00:00")
+                                    ).timestamp()
+                                incoming_seq = None
+                                try:
+                                    if meta_seq is not None:
+                                        incoming_seq = int(meta_seq)
+                                except Exception:
+                                    incoming_seq = None
+                                if incoming_seq is not None and isinstance(
+                                    self._last_seq, (int, float)
+                                ):
+                                    if incoming_seq == int(self._last_seq):
+                                        ui_logger.debug(
+                                            "Duplicate seq=%s — skip", incoming_seq
+                                        )
+                                        continue
+                                    if incoming_seq < int(self._last_seq):
+                                        seq_backward = (
+                                            int(self._last_seq) - incoming_seq
+                                        )
+                                        newer_ts = (
+                                            incoming_ts is not None
+                                            and incoming_ts
+                                            >= self.last_update_time + 0.5
+                                        )
+                                        reset_window = (
+                                            incoming_seq <= 5 and seq_backward > 20
+                                        )
+                                        if newer_ts or reset_window:
+                                            ui_logger.debug(
+                                                "Sequence reset detected: incoming_seq=%s last_seq=%s ts=%s — accepting new epoch",
+                                                incoming_seq,
+                                                self._last_seq,
+                                                meta_ts_raw,
+                                            )
+                                            self._last_seq = max(
+                                                int(incoming_seq) - 1, -1
+                                            )
+                                        else:
+                                            ui_logger.debug(
+                                                "Stale seq=%s < last_seq=%s — skip",
+                                                incoming_seq,
+                                                self._last_seq,
+                                            )
+                                            continue
+                                    if incoming_seq > int(self._last_seq) + 1:
+                                        # Gap detected: прибрано автоперезавантаження снапшоту, лише попередження.
+                                        if int(self._last_seq) < 0:
+                                            # На холодному старті фіксуємо як debug, щоб не шуміти.
+                                            ui_logger.debug(
+                                                "Gap detected on cold start: incoming_seq=%s last_seq=%s",
+                                                incoming_seq,
+                                                self._last_seq,
+                                            )
+                                        else:
+                                            ui_logger.debug(
+                                                "Gap detected: incoming_seq=%s last_seq=%s",
+                                                incoming_seq,
+                                                self._last_seq,
+                                            )
+                                        # Продовжуємо без reload, приймаємо поточне повідомлення як новий стан.
+                                elif (
+                                    incoming_ts is not None
+                                    and incoming_ts < self.last_update_time
+                                ):
+                                    # Якщо seq відсутній — зберігаємо захист за часом, щоб не відображати застаріле
+                                    ui_logger.debug(
+                                        "Stale by time skipped: ts_in=%s < last_ts=%.3f",
+                                        meta_ts_raw,
+                                        self.last_update_time,
+                                    )
+                                    continue
+                            except Exception:
+                                pass
+                            try:
+                                assets_field = data.get("assets")
+                                assets_len = (
+                                    len(assets_field)
+                                    if isinstance(assets_field, list)
+                                    else None
+                                )
+                                ui_logger.debug(
+                                    "UI recv keys=%s counters=%s assets_len=%s type=%s",
+                                    list(data.keys()),
+                                    data.get("counters"),
+                                    assets_len,
+                                    data.get("type"),
+                                )
+                                assets_dbg = data.get("assets")
+                                if (
+                                    isinstance(assets_dbg, list)
+                                    and assets_dbg
+                                    and isinstance(assets_dbg[0], dict)
+                                ):
+                                    ui_logger.debug(
+                                        "UI first asset keys=%s",
+                                        list(assets_dbg[0].keys()),
+                                    )
+                            except Exception:
+                                pass
+                            parsed_assets = data.get("assets") or []
+                            if isinstance(parsed_assets, list) and parsed_assets:
+
+                                def _normalize_ts(value: Any) -> float:
+                                    if value is None:
+                                        return 0.0
+                                    if isinstance(value, (int, float)):
+                                        try:
+                                            return float(value)
+                                        except Exception:
+                                            return 0.0
+                                    if isinstance(value, str) and value.strip():
+                                        try:
+                                            return datetime.fromisoformat(
+                                                value.replace("Z", "+00:00")
+                                            ).timestamp()
+                                        except Exception:
+                                            try:
+                                                return float(value)
+                                            except Exception:
+                                                return 0.0
+                                    return 0.0
+
+                                dedup_rows: dict[str, dict[str, Any]] = {}
+                                for row in parsed_assets:
+                                    if not isinstance(row, dict):
+                                        continue
+                                    sym_raw = row.get("symbol")
+                                    sym_key = (
+                                        str(sym_raw).upper()
+                                        if sym_raw is not None
+                                        else ""
+                                    )
+                                    if not sym_key:
+                                        sym_key = f"__UNNAMED__{len(dedup_rows)}"
+                                    stats = (
+                                        row.get("stats")
+                                        if isinstance(row.get("stats"), dict)
+                                        else {}
+                                    )
+                                    ts_candidate = None
+                                    if isinstance(stats, dict):
+                                        for key in ("ts", "timestamp", "price_ts"):
+                                            if stats.get(key) is not None:
+                                                ts_candidate = stats.get(key)
+                                                break
+                                    if ts_candidate is None:
+                                        ts_candidate = row.get(
+                                            "last_update_ts"
+                                        ) or row.get("ts")
+                                    ts_value = _normalize_ts(ts_candidate)
+                                    price_candidate = None
+                                    if isinstance(stats, dict):
+                                        price_candidate = stats.get("current_price")
+                                    if price_candidate is None:
+                                        price_candidate = row.get("price")
+                                    has_price = False
+                                    try:
+                                        if isinstance(price_candidate, (int, float)):
+                                            has_price = float(price_candidate) > 0
+                                        elif (
+                                            isinstance(price_candidate, str)
+                                            and price_candidate.strip()
+                                        ):
+                                            has_price = float(price_candidate) > 0
+                                    except Exception:
+                                        has_price = False
+
+                                    existing = dedup_rows.get(sym_key)
+                                    if existing is None:
+                                        dedup_rows[sym_key] = {
+                                            "row": row,
+                                            "ts": ts_value,
+                                            "has_price": has_price,
+                                        }
+                                        continue
+
+                                    prev_has_price = bool(existing.get("has_price"))
+                                    prev_ts = float(existing.get("ts", 0.0) or 0.0)
+                                    keep_new = False
+                                    if has_price and not prev_has_price:
+                                        keep_new = True
+                                    elif (
+                                        has_price == prev_has_price
+                                        and ts_value > prev_ts
+                                    ):
+                                        keep_new = True
+
+                                    if keep_new:
+                                        existing.update(
+                                            {
+                                                "row": row,
+                                                "ts": ts_value,
+                                                "has_price": has_price,
+                                            }
+                                        )
+
+                                if dedup_rows:
+                                    parsed_assets = [
+                                        info["row"] for info in dedup_rows.values()
+                                    ]
+                            # Якщо прийшов порожній список, але вже маємо попередні
+                            # дані — ігноруємо очищення
+                            if not parsed_assets and self._display_results:
+                                ui_logger.debug(
+                                    "Ignore empty assets update; keeping %d cached rows",
+                                    len(self._display_results),
+                                )
+                            else:
+                                # М'який мердж: якщо прийшов підсписок символів, не «викидаємо» решту одразу,
+                                # а об'єднуємо з поточним кешем; за замовчуванням TTL для рядка — 30 секунд.
+                                ttl_sec = 30.0
+                                now_ts = time.time()
+                                try:
+                                    # Побудова мапи існуючих рядків
+                                    existing_map: dict[str, dict[str, Any]] = {}
+                                    if isinstance(self._display_results, list):
+                                        for row in self._display_results:
+                                            if isinstance(row, dict):
+                                                sym = str(
+                                                    row.get("symbol") or ""
+                                                ).upper()
+                                                if not sym:
+                                                    continue
+                                                # оцінюємо ts існуючого рядка
+                                                stats = (
+                                                    row.get("stats")
+                                                    if isinstance(
+                                                        row.get("stats"), dict
+                                                    )
+                                                    else {}
+                                                )
+                                                ts_candidate = None
+                                                if isinstance(stats, dict):
+                                                    for key in (
+                                                        "ts",
+                                                        "timestamp",
+                                                        "price_ts",
+                                                    ):
+                                                        if stats.get(key) is not None:
+                                                            ts_candidate = stats.get(
+                                                                key
+                                                            )
+                                                            break
+                                                if ts_candidate is None:
+                                                    ts_candidate = row.get(
+                                                        "last_update_ts"
+                                                    ) or row.get("ts")
+                                                ts_val = _normalize_ts(ts_candidate)
+                                                if ts_val > 0:
+                                                    self._sym_last_ts[sym] = max(
+                                                        self._sym_last_ts.get(sym, 0.0),
+                                                        ts_val,
+                                                    )
+                                                existing_map[sym] = row
+
+                                    # Побудова мапи нових рядків
+                                    new_map: dict[str, dict[str, Any]] = {}
+                                    if isinstance(parsed_assets, list):
+                                        for row in parsed_assets:
+                                            if isinstance(row, dict):
+                                                sym = str(
+                                                    row.get("symbol") or ""
+                                                ).upper()
+                                                if not sym:
+                                                    continue
+                                                stats = (
+                                                    row.get("stats")
+                                                    if isinstance(
+                                                        row.get("stats"), dict
+                                                    )
+                                                    else {}
+                                                )
+                                                ts_candidate = None
+                                                if isinstance(stats, dict):
+                                                    for key in (
+                                                        "ts",
+                                                        "timestamp",
+                                                        "price_ts",
+                                                    ):
+                                                        if stats.get(key) is not None:
+                                                            ts_candidate = stats.get(
+                                                                key
+                                                            )
+                                                            break
+                                                if ts_candidate is None:
+                                                    ts_candidate = row.get(
+                                                        "last_update_ts"
+                                                    ) or row.get("ts")
+                                                ts_val = _normalize_ts(ts_candidate)
+                                                if ts_val > 0:
+                                                    self._sym_last_ts[sym] = max(
+                                                        self._sym_last_ts.get(sym, 0.0),
+                                                        ts_val,
+                                                    )
+                                                new_map[sym] = row
+
+                                    # Мердж: нові перекривають існуючі; зберігаємо існуючі, якщо не застаріли
+                                    merged: dict[str, dict[str, Any]] = dict(
+                                        existing_map
+                                    )
+                                    merged.update(new_map)
+                                    # Фільтр за TTL
+                                    pruned: list[dict[str, Any]] = []
+                                    for sym, row in merged.items():
+                                        last_ts = float(
+                                            self._sym_last_ts.get(sym) or 0.0
+                                        )
+                                        if last_ts <= 0:
+                                            pruned.append(row)
+                                        else:
+                                            if (now_ts - last_ts) <= ttl_sec:
+                                                pruned.append(row)
+
+                                    self._last_results = pruned
+                                    if pruned:
+                                        self._display_results = pruned
+                                except Exception:
+                                    # Фолбек: у разі помилки — старе поводження (повна заміна)
+                                    self._last_results = parsed_assets
+                                    if parsed_assets:
+                                        self._display_results = parsed_assets
+                            # meta.ts → час оновлення
+                            meta_obj = data.get("meta", {}) or {}
+                            meta_ts = meta_obj.get("ts")
+                            meta_seq = meta_obj.get("seq")
+                            if meta_ts:
+                                try:
+                                    incoming_ts = datetime.fromisoformat(
+                                        str(meta_ts).replace("Z", "+00:00")
+                                    ).timestamp()
+                                    # Оновлюємо лише якщо новіше значення (seq контроль вище)
+                                    if incoming_ts >= self.last_update_time:
+                                        self.last_update_time = incoming_ts
+                                except Exception:
+                                    pass
+                            else:
+                                # Heartbeat без meta.ts — оновлюємо час лише якщо
+                                # давно не оновлювалось (>5s)
+                                if time.time() - self.last_update_time > 5:
+                                    self.last_update_time = time.time()
+                            # Завершально оновлюємо last_seq, якщо присутній
+                            try:
+                                if meta_seq is not None:
+                                    self._last_seq = int(meta_seq)
+                            except Exception:
+                                pass
+                            # counters → для заголовку (мерджимо, щоб не губити core‑метрики)
+                            incoming_counters = data.get("counters", {}) or {}
+                            if isinstance(incoming_counters, dict):
+                                self._last_counters.update(incoming_counters)
+                            # Додатковий лог узгодженості
+                            ui_logger.debug(
+                                "Post-assign last_results_len=%d counters_assets=%s display_len=%d",
+                                len(self._last_results),
+                                self._last_counters.get("assets"),
+                                len(self._display_results),
+                            )
+                        # (сумісність зі старим форматом)
+                        elif isinstance(data, list):
+                            # Legacy format: whole message is just the assets list
+                            if data:
+                                self._last_results = data
+                                self._display_results = data
+                                self.last_update_time = time.time()
+                            else:
+                                ui_logger.debug(
+                                    "Legacy empty list ignored; keeping cached results"
+                                )
+
+                    # Підсвітка для всіх ALERT*
+                    for r in self._last_results:
+                        sig = str(r.get("signal", "")).upper()
+                        if sig.startswith("ALERT"):
+                            self.alert_animator.add_alert(r.get("symbol", ""))
+
+                    # Якщо counters каже >0, а список порожній — лог/діагностика
+                    # Вибір списку для відображення: або поточний, або останній непорожній
+                    results_for_render = (
+                        self._last_results
+                        if self._last_results
+                        else self._display_results
+                    )
+                    if (
+                        not self._last_results
+                        and self._last_counters.get("assets", 0) > 0
+                        and self._display_results
+                    ):
+                        ui_logger.warning(
+                            "Using cached results_for_render len=%d (last empty, "
+                            "counters.assets=%s)",
+                            len(self._display_results),
+                            self._last_counters.get("assets"),
+                        )
+                    elif not results_for_render:
+                        ui_logger.debug(
+                            "Render with empty results_for_render; counters.assets=%s",
+                            self._last_counters.get("assets"),
+                        )
+                    ui_logger.debug(
+                        "Render: last=%d cached=%d render=%d last_update_age=%.1fs",
+                        len(self._last_results),
+                        len(self._display_results),
+                        len(results_for_render),
+                        time.time() - self.last_update_time,
+                    )
+                    table = self._build_signal_table(results_for_render)
+                    live.update(table)
+                    await asyncio.sleep(smooth_delay)
+
+                except (ConnectionError, TimeoutError) as e:
+                    ui_logger.error(f"Помилка з'єднання: {e}")
+                    await asyncio.sleep(3)
+                    try:
+                        await pubsub.reset()
+                        # Повторно підписуємося на вже обраний канал (не None)
+                        await pubsub.subscribe(selected_channel)
+                        ui_logger.info("✅ Перепідключено до Redis")
+                    except Exception as reconnect_err:
+                        ui_logger.error(f"Помилка перепідключення: {reconnect_err}")
+                except Exception as e:
+                    ui_logger.error(f"Невідома помилка: {e}")
+                    await asyncio.sleep(1)
+
+    def _build_signal_table(
+        self, results: list[dict[str, Any]], loading: bool = False
+    ) -> Table:
+        """Побудова таблиці з сигналами та метриками системи."""
+        # Діагностичне логування для перевірки «застигання» значень
+        try:
+            if results:
+                sample = results[0]
+                ui_logger.debug(
+                    "Render sample symbol=%s price_str=%s rsi=%s ts=%s seq=%s",
+                    sample.get("symbol"),
+                    sample.get("price_str"),
+                    sample.get("rsi"),
+                    (sample.get("stats") or {}).get("timestamp"),
+                    (sample.get("meta") or {}).get("seq"),
+                )
+        except Exception:
+            pass
+        # counters з payloadу, якщо є
+        # Кількість активів: віддаємо перевагу counters['assets'] (з payload),
+        # щоб уникнути розсинхрону при використанні кешованого списку
+        total_assets = int(self._last_counters.get("assets") or len(results))
+        # ALERT беремо з counters якщо є, інакше перерахуємо локально
+        alert_count = self._last_counters.get("alerts")
+        if alert_count is None:
+            alert_count = sum(
+                1
+                for r in results
+                if str(r.get("signal", "")).upper().startswith("ALERT")
+            )
+
+        last_update = datetime.fromtimestamp(self.last_update_time).strftime("%H:%M:%S")
+
+        # Нові трейд-метрики з core (якщо були підвантажені)
+        active_trades = self._last_counters.get("active_trades")
+        closed_trades = self._last_counters.get("closed_trades")
+        skipped = self._last_counters.get("skipped")
+        skipped_ewma = self._last_counters.get("skipped_ewma")
+        drift_ratio = self._last_counters.get("drift_ratio")
+        dynamic_interval = self._last_counters.get("dynamic_interval")
+        pressure = self._last_counters.get("pressure")
+        pressure_norm = self._last_counters.get("pressure_norm")
+        th_drift_high = self._last_counters.get("th_drift_high")
+        th_drift_low = self._last_counters.get("th_drift_low")
+        th_pressure = self._last_counters.get("th_pressure")
+        consec_drift = self._last_counters.get("consec_drift_high")
+        consec_pressure = self._last_counters.get("consec_pressure_high")
+        alpha_val = self._last_counters.get("alpha")
+        skip_reasons = self._last_counters.get("skip_reasons")
+        avg_rr_counter = self._last_counters.get("avg_rr")
+        avg_unrealized_counter = self._last_counters.get("avg_unrealized")
+        trails_total_counter = self._last_counters.get("trails_total")
+        trails_armed_counter = self._last_counters.get("trails_armed")
+        # Нові агрегати Stage2-гейтів з publisher'а (best-effort)
+        htf_blocked = self._last_counters.get("htf_blocked")
+        lowatr_blocked = self._last_counters.get("lowatr_blocked")
+
+        # Форматуємо drift (якщо буде передаватися через stats:core у майбутньому)
+        if drift_ratio is not None:
+            try:
+                drift_val = float(drift_ratio)
+                # Якщо thresholds доступні – використовуємо їх
+                if th_drift_high is not None and th_drift_low is not None:
+                    if drift_val < float(th_drift_low):
+                        # занадто повільно / мало часу? (нижній поріг)
+                        drift_color = "yellow"
+                    elif drift_val > float(th_drift_high):
+                        drift_color = "red"
+                    else:
+                        drift_color = "green"
+                else:
+                    if drift_val < 0.9:
+                        drift_color = "green"
+                    elif drift_val <= 1.2:
+                        drift_color = "yellow"
+                    else:
+                        drift_color = "red"
+                drift_fragment = f" | Drift: [{drift_color}]{drift_val:.2f}[/]"
+            except Exception:
+                drift_fragment = ""
+        else:
+            drift_fragment = ""
+            # Плейсхолдер, якщо ключ існує, але значення наразі відсутнє
+            if "drift_ratio" in self._last_counters:
+                drift_fragment = " | Drift: -"
+
+        trades_fragment = ""
+        if active_trades is not None or closed_trades is not None:
+            trades_fragment = (
+                f" | Trades: 🟢{active_trades or 0}/🔴{closed_trades or 0}"
+            )
+        # Форматування skipped / ewma
+        if skipped is not None:
+            skipped_fragment = f" | Skipped: {skipped}"
+            if skipped_ewma is not None:
+                try:
+                    skipped_ewma_val = float(skipped_ewma)
+                    color = (
+                        "green"
+                        if skipped_ewma_val < 1
+                        else ("yellow" if skipped_ewma_val < 3 else "red")
+                    )
+                    skipped_fragment += f" (EWMA: [{color}]{skipped_ewma_val:.2f}[/])"
+                except Exception:
+                    pass
+        else:
+            skipped_fragment = ""
+            if "skipped" in self._last_counters:
+                skipped_fragment = " | Skipped: -"
+
+        if dynamic_interval is not None:
+            try:
+                dyn_val = float(dynamic_interval)
+                dyn_color = (
+                    "green"
+                    if dyn_val
+                    <= 1.1 * (self._last_counters.get("cycle_interval") or dyn_val)
+                    else (
+                        "yellow"
+                        if dyn_val
+                        <= 2.0 * (self._last_counters.get("cycle_interval") or dyn_val)
+                        else "red"
+                    )
+                )
+                dynamic_fragment = f" | ΔInterval: [{dyn_color}]{dyn_val:.1f}s[/]"
+            except Exception:
+                dynamic_fragment = f" | ΔInterval: {dynamic_interval}"
+        else:
+            dynamic_fragment = ""
+            if "dynamic_interval" in self._last_counters:
+                dynamic_fragment = " | ΔInterval: -"
+
+        blink_fragment = ""
+        if pressure is not None:
+            try:
+                p_val = float(pressure)
+                if th_pressure is not None:
+                    th_pressure_f = float(th_pressure)
+                    if p_val > th_pressure_f:
+                        p_color = "red"
+                        self._pressure_alert_active = True
+                    elif p_val > th_pressure_f * 0.7:
+                        p_color = "yellow"
+                        self._pressure_alert_active = False
+                    else:
+                        p_color = "green"
+                        self._pressure_alert_active = False
+                else:
+                    p_color = (
+                        "green" if p_val < 0.5 else ("yellow" if p_val < 1.5 else "red")
+                    )
+                    self._pressure_alert_active = p_color == "red"
+                pressure_fragment = f" | Pressure: [{p_color}]{p_val:.2f}[/]"
+                if pressure_norm is not None:
+                    try:
+                        pn = float(pressure_norm)
+                        pressure_fragment += f"(n={pn:.2f})"
+                    except Exception:
+                        pass
+                # Миготіння
+                if self._pressure_alert_active:
+                    self._blink_state = not self._blink_state
+                    if self._blink_state:
+                        blink_fragment = " [blink][red]⚠[/][/blink]"
+            except Exception:
+                pressure_fragment = f" | Pressure: {pressure}"
+        else:
+            pressure_fragment = ""
+            if "pressure" in self._last_counters:
+                pressure_fragment = " | Pressure: -"
+
+        consec_fragment = ""
+        if (consec_drift or consec_pressure) and (consec_drift or 0) + (
+            consec_pressure or 0
+        ) > 0:
+            consec_fragment = (
+                f" | Seq(drift/press): {consec_drift or 0}/{consec_pressure or 0}"
+            )
+        alpha_fragment = (
+            f" | α={alpha_val:.2f}" if isinstance(alpha_val, (int, float)) else ""
+        )
+        if not alpha_fragment and "alpha" in self._last_counters:
+            alpha_fragment = " | α=-"
+        skip_reasons_fragment = ""
+        if isinstance(skip_reasons, dict) and skip_reasons:
+            # take first 3 reasons for compact display
+            top_pairs = list(skip_reasons.items())[:3]
+            compact = ",".join(f"{k}:{v}" for k, v in top_pairs)
+            skip_reasons_fragment = f" | SkipReasons[{compact}]"
+
+        avg_rr_fragment = ""
+        if isinstance(avg_rr_counter, (int, float)):
+            try:
+                avg_rr_fragment = f" | AvgRR: {float(avg_rr_counter):.2f}R"
+            except Exception:
+                avg_rr_fragment = ""
+
+        avg_unreal_fragment = ""
+        if isinstance(avg_unrealized_counter, (int, float)):
+            try:
+                avg_unreal_fragment = f" | ΔPnL: {float(avg_unrealized_counter):+.2f}%"
+            except Exception:
+                avg_unreal_fragment = ""
+
+        trail_summary_fragment = ""
+        if (
+            isinstance(trails_total_counter, (int, float))
+            and int(trails_total_counter) > 0
+        ):
+            try:
+                armed_val = int(trails_armed_counter or 0)
+                total_val = int(trails_total_counter)
+                trail_summary_fragment = f" | Trail ARM: {armed_val}/{total_val}"
+            except Exception:
+                trail_summary_fragment = ""
+
+        # Видалено: Stage2 (QDE) counters з Redis (scenario/recommendation)
+        # UI більше не відображає ці фрагменти; логіку зібрано у Publisher
+
+        # Stage3 блокування з counters снапшоту (якщо доступні)
+        blocks_fragment = ""
+        try:
+            # Нові накопичувальні лічильники
+            b_lv = self._last_counters.get("blocked_alerts_lowvol") or 0
+            b_htf = self._last_counters.get("blocked_alerts_htf") or 0
+            b_lc = self._last_counters.get("blocked_alerts_lowconf") or 0
+            passed = self._last_counters.get("passed_alerts") or 0
+            downgraded = self._last_counters.get("downgraded_alerts") or 0
+            gen = self._last_counters.get("generated_signals")
+            skip = self._last_counters.get("skipped_signals")
+            # Blocks: lowvol|htf|lowconf|OK (OK = passed)
+            blocks_fragment = f" | Blocks: {b_lv}|{b_htf}|{b_lc}|{passed}"
+            # Додаємо у заголовок також Stage2-гейти (HTF/LowATR), якщо доступні
+            try:
+                if isinstance(htf_blocked, (int, float)) or isinstance(
+                    lowatr_blocked, (int, float)
+                ):
+                    htf_b = int(htf_blocked or 0)
+                    latr_b = int(lowatr_blocked or 0)
+                    blocks_fragment += f" | HTF×: {htf_b} | ATR×: {latr_b}"
+            except Exception:
+                pass
+            # Додаємо Gen/Skip якщо доступні
+            if isinstance(gen, int) or isinstance(skip, int):
+                blocks_fragment += f" | Gen: {int(gen or 0)} | Skip: {int(skip or 0)}"
+            # Показати скидкові даунгрейди (сума) якщо є
+            if downgraded:
+                blocks_fragment += f" | Downgraded: {downgraded}"
+            # Перф/система з core:stats → counters (якщо доступні)
+            try:
+                avg_wall = self._last_counters.get("avg_wall_ms")
+                sys_cpu = self._last_counters.get("sys_cpu_pct")
+                proc_cpu = self._last_counters.get("proc_cpu_pct")
+                mem_pct = self._last_counters.get("mem_pct")
+                perf_fragments: list[str] = []
+
+                # Допоміжне форматування з кольорами (Rich)
+                def _fmt_colored(
+                    label: str,
+                    value: float,
+                    unit: str,
+                    green_thr: float,
+                    yellow_thr: float,
+                ) -> str:
+                    try:
+                        v = float(value)
+                    except Exception:
+                        return f"{label}=-"
+                    color = (
+                        "green"
+                        if v <= green_thr
+                        else ("yellow" if v <= yellow_thr else "red")
+                    )
+                    return f"[{color}]{label}={v:.0f}{unit}[/{color}]"
+
+                if isinstance(avg_wall, (int, float)):
+                    # Target латентності <200мс/бар: зелений ≤200, жовтий ≤400, червоний >400
+                    perf_fragments.append(
+                        _fmt_colored("wall", float(avg_wall), "ms", 200.0, 400.0)
+                    )
+                if isinstance(sys_cpu, (int, float)):
+                    # Системний CPU: зелений <40%, жовтий <70%, червоний ≥70%
+                    perf_fragments.append(
+                        _fmt_colored("CPU", float(sys_cpu), "%", 40.0, 70.0)
+                    )
+                if isinstance(proc_cpu, (int, float)):
+                    # CPU процесу: зелений <50%, жовтий <80%, червоний ≥80%
+                    perf_fragments.append(
+                        _fmt_colored("Proc", float(proc_cpu), "%", 50.0, 80.0)
+                    )
+                if isinstance(mem_pct, (int, float)):
+                    # Пам'ять: зелений <70%, жовтий <85%, червоний ≥85%
+                    perf_fragments.append(
+                        _fmt_colored("MEM", float(mem_pct), "%", 70.0, 85.0)
+                    )
+                if perf_fragments:
+                    blocks_fragment += " | " + " ".join(perf_fragments)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Індикатори Core/Health повністю прибрані з заголовка
+
+        title = (
+            f"[bold]Система моніторингу AiOne_t[/bold] | "
+            f"Активи: [green]{total_assets}[/green] | "
+            f"ALERT: [red]{alert_count}[/red] | "
+            f"Оновлено: [cyan]{last_update}[/cyan]"
+            f"{trades_fragment}{skipped_fragment}{drift_fragment}{dynamic_fragment}{avg_rr_fragment}{avg_unreal_fragment}{trail_summary_fragment}{pressure_fragment}{consec_fragment}{alpha_fragment}{blocks_fragment}{skip_reasons_fragment}{blink_fragment}"
+        )
+
+        table = Table(
+            title=title,
+            box=ROUNDED,
+            show_header=True,
+            header_style="bold magenta",
+            expand=True,
+        )
+
+        # Таблиця v2 (компактна): ядро, напрям, кити, рішення
+        columns = [
+            ("Символ", "left"),
+            ("Ціна", "right"),
+            ("Оборот USD", "right"),
+            ("ATR%", "right"),
+            ("RSI", "right"),
+            ("Band%", "right"),
+            ("Edge", "left"),
+            ("VolZ", "right"),
+            ("Slope@ATR", "right"),
+            ("DVR", "right"),
+            ("CD", "right"),
+            ("HTF", "center"),
+            ("Phase", "left"),
+            ("Signal.v2", "left"),
+            ("Hint", "left"),
+            ("Dom", "center"),
+            ("Conf%", "right"),
+            ("Рекомендація", "left"),
+            ("TP/SL", "right"),
+            ("Картка", "left"),
+        ]
+        for header, justify in columns:
+            j = (
+                "left"
+                if justify == "left"
+                else "right" if justify == "right" else "center"
+            )
+            table.add_column(
+                header,
+                justify=cast(Literal["default", "left", "center", "right", "full"], j),
+            )
+
+        if loading or not results:
+            # Маркап Rich має відповідати: відкрили [cyan] — закрили [/cyan]
+            table.add_row(
+                "[cyan]🔄 Очікування даних...[/cyan]", *[""] * (len(columns) - 1)
+            )
+            return table
+
+        def priority_key(r: dict) -> tuple:
+            # v2 пріоритизація: HTF ok → наявність phase → |slope_atr| ↓ → presence ↓
+            stats = r.get(K_STATS, {}) or {}
+            meta = (r.get("market_context") or {}).get("meta", {})
+            htf_ok = r.get("htf_ok")
+            if not isinstance(htf_ok, bool):
+                htf_ok = (
+                    bool((meta or {}).get("htf_ok"))
+                    if isinstance((meta or {}).get("htf_ok"), bool)
+                    else False
+                )
+            phase_blk = (
+                stats.get("phase") if isinstance(stats.get("phase"), dict) else {}
+            )
+            has_phase = (
+                1
+                if (
+                    isinstance(phase_blk, dict)
+                    and (phase_blk.get("name") or phase_blk.get("phase"))
+                )
+                else 0
+            )
+            # slope_atr може бути у directional блоці або напряму у stats (паблішиться як K_PRICE_SLOPE_ATR або price_slope_atr)
+            slope_val = 0.0
+            try:
+                slope_val = float(
+                    stats.get("price_slope_atr")
+                    or stats.get("slope_atr")
+                    or stats.get("directional", {}).get("price_slope_atr")
+                    or 0.0
+                )
+            except Exception:
+                slope_val = 0.0
+            presence = 0.0
+            try:
+                whale_blk = (
+                    stats.get("whale") if isinstance(stats.get("whale"), dict) else {}
+                )
+                presence = float(whale_blk.get("presence") or 0.0)
+            except Exception:
+                presence = 0.0
+            # Категорія: HTF OK спочатку (0), далі наявність phase (0 для є/1 для нема)
+            cat0 = 0 if htf_ok else 1
+            cat1 = 0 if has_phase else 1
+            # Сортуємо: cat0, cat1, далі за спаданням |slope| і presence
+            return (cat0, cat1, -abs(slope_val), -presence)
+
+        try:
+            sorted_results = sorted(results, key=priority_key)
+        except Exception as e:
+            ui_logger.debug("Sorting failed: %s", e)
+            sorted_results = results
+
+        for asset in sorted_results:
+            # Фільтрація невидимих рядків
+            try:
+                if asset.get("visible") is False:
+                    continue
+            except Exception:
+                pass
+            symbol = str(asset.get(K_SYMBOL, "")).upper()
+            stats = asset.get(K_STATS, {}) or {}
+
+            # Render-only: беремо лише готовий price_str (без локальних розрахунків)
+            price_str = (
+                asset.get("price_str")
+                if isinstance(asset.get("price_str"), str)
+                else "-"
+            )
+
+            # Render-only: беремо лише готовий volume_str
+            volume_str = (
+                asset.get("volume_str")
+                if isinstance(asset.get("volume_str"), str)
+                else "-"
+            )
+            volume_z = stats.get("volume_z", 0.0) or 0.0
+            if volume_str != "-" and volume_z > self.vol_z_threshold:
+                volume_str = f"[bold magenta]{volume_str}[/]"
+
+            # Render-only: використовуємо лише готовий atr_pct
+            atr_pct_val = asset.get("atr_pct")
+            atr_pct = (
+                float(atr_pct_val) if isinstance(atr_pct_val, (int, float)) else None
+            )
+            if atr_pct is None:
+                atr_str = "-"
+            else:
+                atr_color = self._get_atr_color(float(atr_pct))
+                atr_str = (
+                    f"[{atr_color}]{float(atr_pct):.2f}%[/]"
+                    if atr_color
+                    else f"{float(atr_pct):.2f}%"
+                )
+
+            rsi_val = asset.get("rsi")
+            rsi_f = float(rsi_val) if isinstance(rsi_val, (int, float)) else None
+            if rsi_f is None:
+                rsi_str = "-"
+            else:
+                rsi_color = self._get_rsi_color(float(rsi_f))
+                if rsi_color:
+                    rsi_str = f"[{rsi_color}]{float(rsi_f):.1f}[/]"
+                else:
+                    rsi_str = f"{float(rsi_f):.1f}"
+
+            band_str = self._format_band_pct(asset)
+
+            # Edge (nearest/near/far + dist%) та VolZ
+            def _edge_str(a: dict[str, Any]) -> str:
+                try:
+                    analytics = (
+                        a.get("analytics")
+                        if isinstance(a.get("analytics"), dict)
+                        else {}
+                    )
+                    # primary: analytics.corridor_* keys
+                    near = analytics.get("corridor_near_edge") or analytics.get(
+                        "corridor_nearest_edge"
+                    )
+                    is_near = analytics.get("corridor_is_near_edge")
+                    dist = analytics.get("corridor_dist_to_edge_pct")
+                    # fallbacks: stats-level keys (some publishers put them there)
+                    if near is None:
+                        near = a.get("near_edge") or a.get("corridor_nearest_edge")
+                    if is_near is None:
+                        is_near = a.get("near_edge")
+                    if dist is None:
+                        dist = (
+                            a.get("dist_to_edge_pct")
+                            or a.get("corridor_dist_to_edge_pct")
+                            or a.get("dist_to_edge")
+                        )
+                    if isinstance(dist, (int, float)):
+                        dist_s = (
+                            f"{float(dist)*100.0:.1f}%"
+                            if abs(float(dist)) <= 1
+                            else f"{float(dist):.1f}%"
+                        )
+                    else:
+                        dist_s = "-"
+                    side = (
+                        str(near)
+                        if isinstance(near, str)
+                        else ("near" if is_near else "-")
+                    )
+                    return f"{side} {dist_s}" if side else "-"
+                except Exception:
+                    return "-"
+
+            edge_str = _edge_str(asset)
+
+            def _volz_str(s: dict[str, Any]) -> str:
+                # Accept multiple possible keys where vol z-score might be published
+                vz = None
+                for k in ("vol_z", "volume_z", "volume_z_score", "volz"):
+                    if isinstance(s.get(k), (int, float)):
+                        vz = s.get(k)
+                        break
+                    # sometimes strings
+                    if isinstance(s.get(k), str) and s.get(k).strip():
+                        try:
+                            vz = float(s.get(k))
+                            break
+                        except Exception:
+                            pass
+                try:
+                    v = float(vz) if vz is not None else None
+                except Exception:
+                    v = None
+                if v is None:
+                    return "-"
+                color = "magenta" if v >= 2.0 else ("yellow" if v >= 1.4 else "white")
+                style = "bold " + color if v >= 2.0 else color
+                return f"[{style}]{v:.2f}[/]"
+
+            volz_str = _volz_str(stats)
+
+            # Slope@ATR, DVR, CD, HTF, Phase
+            def _slope_str(s: dict[str, Any]) -> str:
+                try:
+                    v = float(
+                        s.get("price_slope_atr")
+                        or s.get("slope_atr")
+                        or (s.get("directional") or {}).get("price_slope_atr")
+                        or 0.0
+                    )
+                except Exception:
+                    v = 0.0
+                color = (
+                    "green"
+                    if v >= 1.5
+                    else (
+                        "red" if v <= -1.5 else ("grey70" if abs(v) < 0.5 else "white")
+                    )
+                )
+                return f"[{color}]{v:+.2f}[/]"
+
+            slope_atr_str = _slope_str(stats)
+
+            def _dvr_str(s: dict[str, Any]) -> str:
+                try:
+                    v = float(s.get("directional_volume_ratio"))
+                    color = "green" if v >= 0 else "red"
+                    return f"[{color}]{v:+.2f}[/]"
+                except Exception:
+                    return "-"
+
+            dvr_str = _dvr_str(stats)
+
+            def _cd_str(s: dict[str, Any]) -> str:
+                try:
+                    v = float(s.get("cumulative_delta"))
+                    color = "green" if v >= 0 else "red"
+                    return f"[{color}]{v:+.2f}[/]"
+                except Exception:
+                    return "-"
+
+            cd_str = _cd_str(stats)
+
+            def _htf_str(a: dict[str, Any]) -> str:
+                hov = a.get("htf_ok")
+                if not isinstance(hov, bool):
+                    meta = (a.get("market_context") or {}).get("meta", {})
+                    hov = (
+                        bool(meta.get("htf_ok"))
+                        if isinstance(meta.get("htf_ok"), bool)
+                        else None
+                    )
+                align = a.get("htf_alignment")
+                try:
+                    if isinstance(align, (int, float)):
+                        align_s = f"{float(align):.2f}"
+                    else:
+                        align_s = "-"
+                except Exception:
+                    align_s = "-"
+                if hov is True:
+                    return f"[green]✔[/] {align_s}"
+                if hov is False:
+                    return f"[red]×[/] {align_s}"
+                return f"- {align_s}"
+
+            htf_str = _htf_str(asset)
+
+            def _phase_str(s: dict[str, Any]) -> str:
+                blk = s.get("phase") if isinstance(s.get("phase"), dict) else {}
+                name = blk.get("name") or blk.get("phase")
+                return str(name) if isinstance(name, str) and name else "-"
+
+            phase_str = _phase_str(stats)
+            # SCN tag from market_context.meta
+            try:
+                meta_mc = (asset.get("market_context") or {}).get("meta", {})
+                scn = meta_mc.get("scenario_detected")
+                scn_conf = meta_mc.get("scenario_confidence")
+                scn_name = str(scn) if isinstance(scn, str) and scn else "none"
+                try:
+                    scn_cf = float(scn_conf) if scn_conf is not None else 0.0
+                except Exception:
+                    scn_cf = 0.0
+                phase_str = f"{phase_str} | SCN={scn_name} (conf={scn_cf:.2f})"
+            except Exception:
+                pass
+
+            # Нова колонка впевненості (confidence)
+            conf_val = asset.get("confidence")
+            if not isinstance(conf_val, (int, float)):
+                conf_val = 0.0
+            conf_str = f"{float(conf_val)*100:.1f}%"
+
+            # Нова колонка: Signal.v2 бейджі (з publish_full_state) або фолбек зі stats
+            def _sv2_str_from_asset(a: dict[str, Any]) -> str:
+                try:
+                    badges = (
+                        a.get("badges") if isinstance(a.get("badges"), dict) else {}
+                    )
+                    b = (
+                        badges.get("signal_v2")
+                        if isinstance(badges.get("signal_v2"), dict)
+                        else None
+                    )
+                    label = None
+                    severity = None
+                    conf_local = None
+                    if isinstance(b, dict):
+                        label = b.get("label")
+                        severity = b.get("severity")
+                        conf_local = b.get("conf")
+                    else:
+                        stats_blk = (
+                            a.get(K_STATS) if isinstance(a.get(K_STATS), dict) else {}
+                        )
+                        raw = stats_blk.get("signal_v2")
+                        if isinstance(raw, str) and raw:
+                            label = raw.replace("_", " ")
+                        conf_local = stats_blk.get("signal_v2_conf")
+                        severity = (
+                            "alert"
+                            if str(raw).upper() in ("ALERT_BUY", "ALERT_SELL")
+                            else (
+                                "soft"
+                                if str(raw).upper() in ("SOFT_BUY", "SOFT_SELL")
+                                else "neutral"
+                            )
+                        )
+                    if not isinstance(label, str) or not label:
+                        return "-"
+                    color = (
+                        "red"
+                        if severity == "alert"
+                        else ("yellow" if severity == "soft" else "grey50")
+                    )
+                    if isinstance(conf_local, (int, float)):
+                        return f"[{color}]{label} ({float(conf_local):.2f})[/]"
+                    return f"[{color}]{label}[/]"
+                except Exception:
+                    return "-"
+
+            sv2_str = _sv2_str_from_asset(asset)
+
+            # Нова колонка: Dominance (з asset.whale.dominance або stats.whale.dominance)
+            # Функція для форматування dominance (домінування китів) з підказкою впевненості
+            def _dominance_str(a: dict[str, Any], conf_hint: float | None) -> str:
+                """
+                Форматує dominance (BUY/SELL/BOTH/-) з урахуванням впевненості (conf_hint) та статусу stale.
+                Повертає рядок для відображення у таблиці.
+                """
+                try:
+                    dom = None
+                    stale_flag = False
+                    # Перевага — root whale
+                    whale_root = (
+                        a.get("whale") if isinstance(a.get("whale"), dict) else None
+                    )
+                    if whale_root:
+                        dom = whale_root.get("dominance")
+                        stale_flag = (
+                            bool(whale_root.get("stale"))
+                            if isinstance(whale_root.get("stale"), bool)
+                            else stale_flag
+                        )
+                    # Фолбек до stats.whale
+                    if dom is None:
+                        stats_blk = (
+                            a.get(K_STATS) if isinstance(a.get(K_STATS), dict) else {}
+                        )
+                        whale_blk = (
+                            stats_blk.get("whale")
+                            if isinstance(stats_blk.get("whale"), dict)
+                            else {}
+                        )
+                        if whale_blk:
+                            dom = whale_blk.get("dominance")
+                            stale_flag = (
+                                bool(whale_blk.get("stale"))
+                                if isinstance(whale_blk.get("stale"), bool)
+                                else stale_flag
+                            )
+                    # Фолбек до badges (деякі паблішери кладуть whale у badges)
+                    if dom is None:
+                        badges = (
+                            a.get("badges") if isinstance(a.get("badges"), dict) else {}
+                        )
+                        bd_whale = (
+                            badges.get("whale")
+                            if isinstance(badges.get("whale"), dict)
+                            else None
+                        )
+                        if bd_whale:
+                            dom = bd_whale.get("dominance")
+                            stale_flag = (
+                                bool(bd_whale.get("stale"))
+                                if isinstance(bd_whale.get("stale"), bool)
+                                else stale_flag
+                            )
+                        # іноді signal_v2 badge може містити dominance
+                        sv2 = (
+                            badges.get("signal_v2")
+                            if isinstance(badges.get("signal_v2"), dict)
+                            else None
+                        )
+                        if dom is None and sv2 is not None:
+                            dom = sv2.get("dominance") or sv2.get("dom")
+                            stale_flag = stale_flag or bool(sv2.get("stale"))
+
+                    # Обробка простих форматів: якщо dom — dict, інакше пробуємо інтерпретувати
+                    if isinstance(dom, dict):
+                        buy = bool(dom.get("buy"))
+                        sell = bool(dom.get("sell"))
+                    else:
+                        # обробка рядків типу 'buy' / 'sell' / 'both'
+                        buy = sell = False
+                        if isinstance(dom, str):
+                            dv = dom.strip().lower()
+                            buy = dv in ("buy", "b", "1", "true", "t") or "buy" in dv
+                            sell = dv in ("sell", "s", "-1", "false") or "sell" in dv
+                        else:
+                            return "-"
+                    label = "-"
+                    color = "grey50"
+                    if buy and not sell:
+                        label = "BUY"
+                        color = "green"
+                    elif sell and not buy:
+                        label = "SELL"
+                        color = "red"
+                    elif buy and sell:
+                        label = "BOTH"
+                        color = "magenta"
+                    # Інтенсивність за conf: ≥0.7 — жирний, <0.4 — приглушений
+                    if isinstance(conf_hint, (int, float)):
+                        c = float(conf_hint)
+                        if c >= 0.7:
+                            text = f"[bold {color}]{label}[/]"
+                        elif c < 0.4:
+                            text = f"[dim]{label}[/]"
+                        else:
+                            text = f"[{color}]{label}[/]" if label != "-" else "-"
+                    else:
+                        text = f"[{color}]{label}[/]" if label != "-" else "-"
+                    # Якщо whale.stale — приглушуємо бейдж
+                    if stale_flag and text != "-":
+                        return f"[dim]{text}[/]"
+                    return text
+                except Exception:
+                    return "-"
+
+            # Використаємо sv2_conf як підказку для інтенсивності dominance
+            stats_for_conf = (
+                asset.get(K_STATS) if isinstance(asset.get(K_STATS), dict) else {}
+            )
+            sv2_conf_hint = stats_for_conf.get("signal_v2_conf")
+            dominance_str = _dominance_str(
+                asset,
+                sv2_conf_hint if isinstance(sv2_conf_hint, (int, float)) else None,
+            )
+
+            # ✅ Рекомендація береться з кореня, а не з stage2_result
+            recommendation = str(asset.get("recommendation", "-"))
+            rec_icon = self._get_recommendation_icon(recommendation)
+            # Якщо рекомендація SOFT_* і htf_ok=False — приглушуємо (узагальнене правило)
+            if (
+                recommendation.upper().startswith("SOFT_")
+                and asset.get("htf_ok") is False
+            ):
+                rec_str = f"[dim]{rec_icon} {recommendation}[/]"
+            else:
+                rec_str = f"{rec_icon} {recommendation}"
+
+            # Render-only: TP/SL лише з готового поля tp_sl
+            tp_sl_str = asset.get("tp_sl") or "-"
+
+            # Підсвітка для ALERT* (з кореневого сигналу)
+            sig_text = str(asset.get("signal", "")).upper()
+            row_style = (
+                "bold red"
+                if sig_text.startswith("ALERT")
+                and self.alert_animator.should_highlight(symbol)
+                else ""
+            )
+
+            # Legacy trigger reasons (приховано у v2 компактній таблиці)
+
+            # Побудова компактної картки телеметрії (AssetStateCard‑lite)
+            # Тепер мінімальна: показує лише основну китову інформацію (presence, bias, zones)
+            # та позначку stale; дублі Band/Edge/Dom/vol видалено з картки.
+            def _build_card(stats_obj: dict[str, Any]) -> str:
+                try:
+                    whale = (
+                        stats_obj.get("whale")
+                        if isinstance(stats_obj.get("whale"), dict)
+                        else {}
+                    )
+                    zones = (
+                        whale.get("zones_summary")
+                        if isinstance(whale.get("zones_summary"), dict)
+                        else {}
+                    )
+                    presence = whale.get("presence")
+                    bias = whale.get("bias")
+                    stale_flag = bool(whale.get("stale"))
+                    za = zones.get("accum_cnt") if isinstance(zones, dict) else None
+                    zd = zones.get("dist_cnt") if isinstance(zones, dict) else None
+
+                    def _fmt_num(v: Any, fmt: str = ".2f") -> str:
+                        try:
+                            return format(float(v), fmt) if v is not None else "-"
+                        except Exception:
+                            return "-"
+
+                    pres_part = _fmt_num(presence)
+                    bias_part = (
+                        f"{float(bias):+.2f}" if isinstance(bias, (int, float)) else "-"
+                    )
+                    zones_part = (
+                        f"a{int(za)} d{int(zd)}"
+                        if isinstance(za, (int, float)) or isinstance(zd, (int, float))
+                        else "-"
+                    )
+
+                    parts: list[str] = [
+                        f"whale P={pres_part}",
+                        f"B={bias_part}",
+                        f"Z={zones_part}",
+                    ]
+
+                    if stale_flag:
+                        parts.append("W-stale")
+
+                    return " | ".join(parts)
+                except Exception:
+                    return "-"
+
+            card_str = _build_card(stats)
+
+            # Підсвітка символу при аномально високому vol_regime (не в картці)
+            try:
+                whale_root = (
+                    asset.get("whale") if isinstance(asset.get("whale"), dict) else {}
+                )
+                vol_reg_val = (
+                    stats.get("vol_regime_strict")
+                    or stats.get("vol_regime")
+                    or whale_root.get("vol_regime")
+                    or ""
+                )
+                vol_reg_norm = (
+                    str(vol_reg_val).lower() if vol_reg_val is not None else ""
+                )
+                # ключові маркери, які ми вважаємо «високими/аномальними»
+                if any(k in vol_reg_norm for k in ("high", "anom", "spike", "large")):
+                    symbol_display = f"[bold magenta]{symbol}[/]"
+                else:
+                    symbol_display = symbol
+            except Exception:
+                symbol_display = symbol
+
+            # Stage2-lite hint (dir/score)
+            def _hint_str(s: dict[str, Any]) -> str:
+                blk = (
+                    s.get("stage2_hint")
+                    if isinstance(s.get("stage2_hint"), dict)
+                    else {}
+                )
+                d = blk.get("dir") if isinstance(blk.get("dir"), str) else None
+                sc = (
+                    blk.get("score")
+                    if isinstance(blk.get("score"), (int, float))
+                    else None
+                )
+                if not d and sc is None:
+                    return "-"
+                color = (
+                    "green"
+                    if (isinstance(d, str) and d.upper() == "BUY")
+                    else (
+                        "red" if isinstance(d, str) and d.upper() == "SELL" else "white"
+                    )
+                )
+                if sc is None:
+                    return f"[{color}]{d}[/]" if d else "-"
+                return f"[{color}]{(d or '-')} {float(sc):.2f}[/]"
+
+            hint_str = _hint_str(stats)
+
+            table.add_row(
+                symbol_display,
+                price_str,
+                volume_str,
+                atr_str,
+                rsi_str,
+                band_str,
+                edge_str,
+                volz_str,
+                slope_atr_str,
+                dvr_str,
+                cd_str,
+                htf_str,
+                phase_str,
+                sv2_str,
+                hint_str,
+                dominance_str,
+                conf_str,
+                rec_str,
+                tp_sl_str,
+                card_str,
+                style=row_style,
+            )
+
+        return table
+
+
+async def main() -> None:
+    consumer = UIConsumer()
+    await consumer.redis_consumer()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

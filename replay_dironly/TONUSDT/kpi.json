@@ -1,0 +1,22 @@
+{
+  "symbol": "TONUSDT",
+  "interval": "1m",
+  "bars": 121,
+  "processed": 101,
+  "counts": {
+    "drift_trend": 0,
+    "pre_breakout": 0,
+    "post_breakout": 0,
+    "momentum": 0,
+    "exhaustion": 0,
+    "false_breakout": 10,
+    "none": 91
+  },
+  "breakout_like": 0,
+  "drift_trend": 0,
+  "ratios": {},
+  "avg_scores": {
+    "false_breakout": 0.7999999999999999,
+    "none": 0.0
+  }
+}

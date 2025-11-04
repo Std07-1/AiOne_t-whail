@@ -1,0 +1,23 @@
+rules:
+  - id: ton_relax_low_vol
+    priority: 90  # higher than base to override
+    when:
+      all:
+        - { metric: volatility.max_60bar_move, op: "<", value: 0.018 }
+        - { metric: volatility.max_30bar_move, op: "<", value: 0.012 }
+    actions:
+      stage1.volume_z_min: 2.0   # slightly more permissive on 1m
+      stage2.move_pct_up_factor: 0.88
+      stage2.move_pct_down_factor: 0.88
+  - id: ton_quiet_vlow_vol
+    priority: 95  # even higher to supersede relax when ultra-low vol
+    when:
+      all:
+        - { metric: volatility.max_30bar_move, op: "<", value: 0.008 }
+        - { metric: volatility.max_5bar_move, op: "<", value: 0.0035 }
+    actions:
+      stage1.volume_z_min: 1.6   # allow earlier volume-based signals
+      stage2.move_pct_up_factor: 0.85
+      stage2.move_pct_down_factor: 0.85
+
+default_actions: {}

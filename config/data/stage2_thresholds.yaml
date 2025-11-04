@@ -1,0 +1,155 @@
+# Приклад великих карт порогів для Stage2 (демо-структура)
+# На етапі 1 не підключено в runtime; лише як шаблон для подальшої міграції.
+phase_thresholds:
+  # Legacy-пороги для фазо-детектора Stage2 (міграційний YAML).
+  # У strict-профілі ігноруються на користь STRONG_REGIME.phase_thresholds.
+  pre_breakout:
+    band_max: 0.16
+    vol_z_min: 1.8
+    dvr_min: 0.8
+    cd_min: 0.35
+  post_breakout:
+    # Ключ near_edge використовується у strict; у legacy не обов'язковий.
+    near_edge: true
+    vol_z_max: 1.0
+    dvr_min: 0.6
+  post_breakdown:
+    vol_z_max: 1.2
+    dvr_min: 0.5
+  momentum:
+    slope_min: 0.5
+    rsi_lo: 45.0
+    rsi_hi: 65.0
+    cd_min: 0.2
+    vol_z_max: 1.2
+  exhaustion:
+    band_min: 0.45
+    vol_z_min: 2.0
+    rsi_hi: 72.0
+    # У legacy використовується alt_atr_mult (альтернатива до low_gate_effective)
+    alt_atr_mult: 1.75
+  false_breakout:
+    dvr_max: 0.4
+    cd_against_thresh: 0.0
+  impulse_down:
+    slope_min: 1.5
+    vwap_dev_max: -0.01
+    vol_z_max: 1.8
+  impulse_up:
+    slope_min: 1.5
+    vwap_dev_min: 0.01
+    vol_z_max: 1.8
+
+# Мульти‑профілі для legacy‑шляху. Використовується ключ
+# STAGE2_THRESHOLDS_YAML_PROFILE у config/flags.py.
+profiles:
+  legacy:
+    phase_thresholds:
+      pre_breakout:
+        band_max: 0.16
+        vol_z_min: 1.8
+        dvr_min: 0.8
+        cd_min: 0.35
+      post_breakout:
+        near_edge: true
+        vol_z_max: 1.0
+        dvr_min: 0.6
+      post_breakdown:
+        vol_z_max: 1.2
+        dvr_min: 0.5
+      momentum:
+        slope_min: 0.5
+        rsi_lo: 45.0
+        rsi_hi: 65.0
+        cd_min: 0.2
+        vol_z_max: 1.2
+      exhaustion:
+        band_min: 0.45
+        vol_z_min: 2.0
+        rsi_hi: 72.0
+        alt_atr_mult: 1.75
+      false_breakout:
+        dvr_max: 0.4
+        cd_against_thresh: 0.0
+      impulse_down:
+        slope_min: 1.5
+        vwap_dev_max: -0.01
+        vol_z_max: 1.8
+      impulse_up:
+        slope_min: 1.5
+        vwap_dev_min: 0.01
+        vol_z_max: 1.8
+  legacy_aggressive:
+    # Трохи ліберальніші пороги: більше кандидатів, вище чутливість.
+    phase_thresholds:
+      pre_breakout:
+        band_max: 0.18
+        vol_z_min: 1.4
+        dvr_min: 0.6
+        cd_min: 0.30
+      post_breakout:
+        near_edge: true
+        vol_z_max: 1.2
+        dvr_min: 0.5
+      post_breakdown:
+        vol_z_max: 1.4
+        dvr_min: 0.5
+      momentum:
+        slope_min: 0.45
+        rsi_lo: 44.0
+        rsi_hi: 66.0
+        cd_min: 0.15
+        vol_z_max: 1.4
+      exhaustion:
+        band_min: 0.42
+        vol_z_min: 1.8
+        rsi_hi: 73.0
+        alt_atr_mult: 1.65
+      false_breakout:
+        dvr_max: 0.45
+        cd_against_thresh: 0.0
+      impulse_down:
+        slope_min: 1.4
+        vwap_dev_max: -0.009
+        vol_z_max: 2.0
+      impulse_up:
+        slope_min: 1.4
+        vwap_dev_min: 0.009
+        vol_z_max: 2.0
+  legacy_conservative:
+    # Строгіші пороги: менше шуму, менше хибних спрацьовувань.
+    phase_thresholds:
+      pre_breakout:
+        band_max: 0.14
+        vol_z_min: 2.0
+        dvr_min: 0.9
+        cd_min: 0.40
+      post_breakout:
+        near_edge: true
+        vol_z_max: 0.9
+        dvr_min: 0.7
+      post_breakdown:
+        vol_z_max: 1.0
+        dvr_min: 0.7
+      momentum:
+        slope_min: 0.6
+        rsi_lo: 46.0
+        rsi_hi: 64.0
+        cd_min: 0.3
+        vol_z_max: 1.1
+      exhaustion:
+        band_min: 0.50
+        vol_z_min: 2.4
+        rsi_hi: 74.0
+        alt_atr_mult: 1.85
+      false_breakout:
+        dvr_max: 0.35
+        cd_against_thresh: 0.0
+      impulse_down:
+        slope_min: 1.6
+        vwap_dev_max: -0.012
+        vol_z_max: 1.6
+      impulse_up:
+        slope_min: 1.6
+        vwap_dev_min: 0.012
+        vol_z_max: 1.6

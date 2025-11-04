@@ -1,0 +1,233 @@
+# ───────────────────────────── ОС / загальне ─────────────────────────────
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+*.tmp
+*.temp
+
+# ───────────────────────────── Python ─────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.python-version
+
+# Віртуальні середовища
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+*.env
+
+# Пакетні менеджери / метадані
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+.pdm-python
+.pdm.toml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# Покриття / тести
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+hypothesis/
+.toml
+.ini
+.pyproject.toml
+# Jupyter
+.ipynb_checkpoints/
+
+# ───────────────────────────── Редактори ─────────────────────────────
+.vscode/
+.vscode-test/
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+*.swp
+*.swo
+
+# ───────────────────────────── Логи ─────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ───────────────────────────── Рантайм-дані ─────────────────────────────
+# Локальний снапшот даних (див. DATASTORE_BASE_DIR). Не комітимо артефакти.
+datastore/
+
+# Тимчасові файли даних
+*.parquet
+*.jsonl
+*.json.tmp
+*.parquet.tmp
+
+# ───────────────────────────── Локальні оверрайди конфігів ─────────────────────────────
+# Залишаємо приклади в репозиторії, але ігноруємо локальні модифікації/секрети.
+*.local.*
+*secret*.*
+
+# ───────────────────────────── Git / інші ─────────────────────────────
+.git-credentials
+.gitconfig
+.orig
+
+# ───────────────────────────── Додаткові ─────────────────────────────
+# Конфіги/звіти та службові каталоги, які не хочемо випадково додати в коміт
+pytest_report.txt
+ruff_report.txt
+TYPING_ROADMAP.md
+.pre-commit-config.yaml
+mypy_report.txt
+.markdownlint.json
+stage2_decisions.jsonl
+STYLE_GUIDE.md
+.rej
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.dll
+*.lib
+*.exe
+
+# Virtual environments
+venv/
+venv_aione_t/
+AiOne_t/venv_aione_t/
+
+.replay_bench/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+logs/
+
+# Editor / system files
+*.log
+*.txt
+!requirements.txt
+!runtime.txt
+!Procfile
+*.yml
+.env
+keys
+maps.md
+
+# Project-specific folders to ignore
+etc/
+logs/
+symbols/
+analytics/
+telemetry/
+!monitor/indicators/
+
+# Cache and intermediate data
+
+# Docker-related
+docker-compose
+Dockerfile
+*.dockerignore
+
+# Python project structure — internal
+datafetcher/__init__.py
+datafetcher/__pycache__/
+datafetcher/cache_handler.py
+datafetcher/websocket.py
+datafetcher/raw_data.py
+
+# Temporary scripts / testing
+tr4.py
+
+# ───────────────────────────── Додаткові ігнори для AiOne_t ─────────────────────────────
+# Динамічні логи та звіти (не комітити, якщо генеруються під час роботи)
+trade_log.jsonl
+summary_log.jsonl
+stage3_skips.jsonl
+
+# Локальні налаштування редакторів
+.vscode/settings.json
+.vscode/launch.json
+
+# Резервні копії та тимчасові файли
+*.bak
+*.backup
+*.orig
+*.rej
+
+# Історія Python REPL
+.python_history
+
+# Кеші та проміжні дані
+.cache/
+*.tmp
+*.temp
+
+# Секрети та API ключі
+secrets/
+*.key
+*.pem
+api_keys.json
+
+# Локальні оверрайди конфігів (розширення)
+.env.local
+.env.production
+.env.development
+config.local.py
+config.secret.py
+
+# Дані Redis або кешу (якщо локальні)
+.redis/
+*.rdb
+
+# Windows-специфічні
+desktop.ini
+$RECYCLE.BIN/
+
+# Інші тимчасові файли
+*.swp
+*.swo
+*~
+
+# Віртуальні середовища (додаткові варіанти)
+.venv_wsl/
+
+# ───────────────────────────── Локальні віртуальні середовища (додаткові) ─────────────────────────────
+.venv-1/
+.venv-2/
+.venv/
+
+# ───────────────────────────── Моніторингові артефакти (псевдострім/RT) ─────────────────────────────
+# Папки, які створює tools/monitor_strict_60min.py
+monitoring/rt_*/
+monitoring/**/t_*/
+
+# ───────────────────────────── Бенчі/епізоди (генеруються тулзами) ─────────────────────────────
+replay_bench/
+episodes_bench/
+
+# ───────────────────────────── Локальні снапшоти/дані, що можуть з’являтися у корені ─────────────────────────────
+*_bars_1m_snapshot.jsonl
+*_snapshot.jsonl
+
+# ───────────────────────────── UI/допоміжні збірки (якщо використовуються) ─────────────────────────────
+UI/node_modules/
+UI/dist/
+UI/build/
+UI/.cache/
+
+# ───────────────────────────── Опційно: ігнорувати локальні тести (не торкає вже закомічені) ─────────────────────────────
+# УВАГА: якщо тести вже відслідковуються git, цей патерн їх не прибере з історії.
+#tests/

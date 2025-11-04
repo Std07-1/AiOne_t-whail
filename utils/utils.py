@@ -1,0 +1,867 @@
+"""Універсальні утиліти (форматування, нормалізація, допоміжні хелпери).
+
+Призначення:
+    • Форматування числових метрик (ціна, обсяг, OI)
+    • Нормалізація TP/SL відповідно до напрямку угоди
+    • Маппінг рекомендацій Stage2 → сигнали UI
+    • Уніфікація та очищення часових колонок DataFrame
+    • Нормалізація назв тригерів до канонічних коротких ідентифікаторів
+
+Принципи:
+    • Відсутність побічних ефектів (чиста логіка)
+    • Українська мова для коментарів / докстрінгів
+    • Мінімальна залежність від решти системи (центральні константи з config)
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Iterable, Sequence
+from datetime import datetime, time
+from typing import Any
+
+import pandas as pd
+from rich.console import Console
+from rich.logging import RichHandler
+
+# ── Конфіг/константи проєкту ───────────────────────────────────────────────
+from config.config import (
+    ASSET_STATE,
+    BUY_SET,
+    INTERVAL_TTL_MAP,
+    SELL_SET,
+    STAGE2_STATUS,
+    TICK_SIZE_BRACKETS,
+    TICK_SIZE_DEFAULT,
+    TICK_SIZE_MAP,
+    TRIGGER_NAME_MAP,
+    TRIGGER_TP_SL_SWAP_LONG,
+    TRIGGER_TP_SL_SWAP_SHORT,
+)
+
+_HAS_RICH = True
+
+# ── Локальний логер модуля ────────────────────────────────────────────────────
+_logger = logging.getLogger("app.utils")
+if not _logger.handlers:  # захист від повторної ініціалізації
+    _logger.setLevel(logging.INFO)
+    if _HAS_RICH:
+        _logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    else:  # pragma: no cover - fallback без rich
+        _logger.addHandler(logging.StreamHandler())
+    _logger.propagate = False
+
+
+# ── Базові хелпери ───────────────────────────────────────────────────────────
+def safe_float(value: Any) -> float | None:
+    """Безпечно перетворює значення у float.
+
+    Повертає None, якщо значення не можна конвертувати або воно не є скінченним числом.
+
+    Args:
+        value: Будь-який об'єкт.
+
+    Returns:
+        Optional[float]: Коректний float або None.
+    """
+    try:
+        # Допомагаємо рядкам з комою як десятковим роздільником
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
+        f = float(value)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        _logger.debug("safe_float: не вдалося привести %r до float", value)
+        return None
+
+
+def first_not_none(seq: Sequence[Any | None] | None) -> Any | None:
+    """Повертає перший елемент, що не є None.
+
+    Args:
+        seq: Послідовність значень.
+
+    Returns:
+        Optional[Any]: Перший не-None, або None (якщо таких немає).
+    """
+    if not seq:
+        return None
+    for x in seq:
+        if x is not None:
+            return x
+    return None
+
+
+def safe_number(value: Any, default: float = 0.0) -> float:
+    """Безпечне приведення до float з перевіркою finiteness.
+
+    Args:
+        value: Вхідне значення будь-якого типу.
+        default: Значення за замовчуванням, якщо конверсія неможлива або не скінченна.
+
+    Returns:
+        float: Скінченне число або default.
+    """
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+# ── Timestamp / DataFrame ────────────────────────────────────────────────────
+def ensure_timestamp_column(
+    df: pd.DataFrame,
+    *,
+    as_index: bool = False,
+    drop_duplicates: bool = True,
+    sort: bool = True,
+    logger_obj: logging.Logger | None = None,
+    min_rows: int = 1,
+    log_prefix: str = "",
+) -> pd.DataFrame:
+    """Уніфікує колонку/індекс `timestamp` у DataFrame.
+
+    Можливості:
+      - гарантує наявність `timestamp: datetime64[ns, UTC]`;
+      - за потреби перетворює у колонку/індекс;
+      - видаляє дублі та `NaT`;
+      - стабільно сортує за часом;
+      - повертає порожній DataFrame, якщо після обробки рядків < `min_rows`.
+
+    Args:
+        df: Вхідний DataFrame.
+        as_index: Якщо True — встановити `timestamp` індексом.
+        drop_duplicates: Видаляти дублі `timestamp`.
+        sort: Сортувати за `timestamp`.
+        logger_obj: Логер для детальніших повідомлень.
+        min_rows: Мінімальна кількість рядків після обробки.
+        log_prefix: Префікс до діагностичних повідомлень.
+
+    Returns:
+        pd.DataFrame: Очищена/уніфікована таблиця або порожній DataFrame.
+    """
+
+    def _log(msg: str) -> None:
+        if logger_obj:
+            logger_obj.debug("%s%s", log_prefix, msg)
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        _log("[ensure_timestamp_column] DataFrame порожній або невалідний.")
+        return pd.DataFrame()
+
+    # Якщо timestamp є індексом — переносимо у колонку
+    if "timestamp" not in df.columns and df.index.name == "timestamp":
+        df = df.reset_index()
+        _log("[ensure_timestamp_column] Перенесено timestamp з індексу у колонку.")
+
+    # Нормалізація колонки
+    if "timestamp" in df.columns:
+
+        ts = df["timestamp"]
+
+        # 1) Якщо dtype не datetime → як і було:
+        if not pd.api.types.is_datetime64_any_dtype(ts):
+            if pd.api.types.is_integer_dtype(ts):
+                v = ts.astype("int64")
+                try:
+                    med = float(v.median())
+                except Exception:
+                    med = float(v.iloc[0]) if len(v) else 0.0
+                # Автовизначення одиниць часу за порядком величини
+                if 1e11 <= med < 1e14:
+                    unit = "ms"
+                elif 1e9 <= med < 1e11:
+                    unit = "s"
+                elif 1e14 <= med < 1e17:
+                    unit = "us"
+                elif 1e17 <= med < 1e20:
+                    unit = "ns"
+                else:
+                    unit = "ms"  # дефолт безпечний для Binance
+                df["timestamp"] = pd.to_datetime(
+                    v, unit=unit, errors="coerce", utc=True
+                )
+                _log(f"[ensure_timestamp_column] int→datetime(unit={unit}).")
+            else:
+                df["timestamp"] = pd.to_datetime(ts, errors="coerce", utc=True)
+                _log("[ensure_timestamp_column] to_datetime(auto).")
+        else:
+            # 2) Уже datetime, але схоже на епоху → спробуємо відновити з сирих колонок
+            try:
+                years = ts.dt.year
+                if years.max() <= 1971:
+                    # спроба відновлення з альтернативних сирих полів
+                    candidates = ["open_time", "openTime", "time", "t", "close_time"]
+                    raw_col = None
+                    for c in candidates:
+                        if c in df.columns:
+                            raw_col = c
+                            break
+                    if raw_col is not None:
+                        raw = df[raw_col]
+
+                        if pd.api.types.is_integer_dtype(raw):
+                            v = raw.astype("int64")
+                            med = float(v.median())
+                            # Вибір одиниць:
+                            # ~1e9..1e10 → секунди, ~1e11..1e13 → мілісекунди,
+                            # ~1e14..1e16 → мікросекунди, ~1e17..1e19 → наносекунди
+                            if 1e11 <= med < 1e14:
+                                unit = "ms"
+                            elif 1e9 <= med < 1e11:
+                                unit = "s"
+                            elif 1e14 <= med < 1e17:
+                                unit = "us"
+                            elif 1e17 <= med < 1e20:
+                                unit = "ns"
+                            else:
+                                unit = None
+                            if unit:
+                                df["timestamp"] = pd.to_datetime(v, unit=unit, utc=True)
+                                _log(
+                                    f"[ensure_timestamp_column] Відновлено з '{raw_col}' (unit={unit})."
+                                )
+                            else:
+                                _log(
+                                    f"[ensure_timestamp_column] '{raw_col}' має нетипову шкалу (median={med:.3g})."
+                                )
+                        else:
+                            _log(
+                                f"[ensure_timestamp_column] '{raw_col}' не є цілочисельним."
+                            )
+                    else:
+                        _log(
+                            "[ensure_timestamp_column] Нема сирої колонки часу для відновлення."
+                        )
+
+            except Exception:
+                pass
+        if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+            _log("[ensure_timestamp_column] Конвертовано 'timestamp' у datetime (UTC).")
+
+        before = len(df)
+        df = df.dropna(subset=["timestamp"]).copy()
+        removed = before - len(df)
+        if removed > 0:
+            _log(
+                f"[ensure_timestamp_column] Видалено {removed} рядків із NaT у 'timestamp'."
+            )
+
+        if drop_duplicates:
+            before = len(df)
+            df = df.drop_duplicates(subset=["timestamp"])
+            dups = before - len(df)
+            if dups > 0:
+                _log(
+                    f"[ensure_timestamp_column] Видалено {dups} дублікатів по 'timestamp'."
+                )
+
+        if sort:
+            df = df.sort_values("timestamp", kind="stable")
+            _log("[ensure_timestamp_column] Відсортовано за 'timestamp' (stable).")
+
+        if as_index and df.index.name != "timestamp":
+            df = df.set_index("timestamp")
+            _log("[ensure_timestamp_column] Встановлено 'timestamp' як індекс.")
+        elif not as_index and df.index.name == "timestamp":
+            df = df.reset_index()
+            _log(
+                "[ensure_timestamp_column] Переведено 'timestamp' з індексу у колонку."
+            )
+    else:
+        _log("[ensure_timestamp_column] Відсутня колонка 'timestamp' у DataFrame.")
+
+    # Діагностика прикладу
+    if len(df) > 0:
+        if "timestamp" in df.columns:
+            _log(f"[ensure_timestamp_column] Приклад: {df['timestamp'].iloc[0]!r}")
+        elif df.index.name == "timestamp":
+            _log(f"[ensure_timestamp_column] Приклад (індекс): {df.index[0]!r}")
+
+    if len(df) < min_rows:
+        _log(
+            f"[ensure_timestamp_column] Після обробки залишилось {len(df)} рядків (<{min_rows}). "
+            "Повертаю порожній DataFrame."
+        )
+        return pd.DataFrame()
+
+    return df
+
+
+def sanitize_ohlcv_numeric(
+    df: pd.DataFrame,
+    *,
+    columns: tuple[str, ...] = ("open", "high", "low", "close", "volume"),
+    drop_incomplete: bool = True,
+    logger_obj: logging.Logger | None = None,
+    log_prefix: str = "",
+) -> pd.DataFrame:
+    """Приводить OHLCV-колонки до числових значень і прибирає рядки з NaN."""
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    sanitized = df.copy()
+    for col in columns:
+        if col in sanitized.columns:
+            sanitized[col] = pd.to_numeric(sanitized[col], errors="coerce")
+
+    if drop_incomplete:
+        subset = [col for col in columns if col in sanitized.columns]
+        if subset:
+            before = len(sanitized)
+            sanitized = sanitized.dropna(subset=subset)
+            removed = before - len(sanitized)
+            if logger_obj and removed > 0:
+                logger_obj.debug(
+                    "%ssanitize_ohlcv_numeric: dropped %d rows due to NaN in %s",
+                    log_prefix,
+                    removed,
+                    subset,
+                )
+
+    return sanitized
+
+
+def ensure_epoch_ms_columns(
+    df: pd.DataFrame,
+    *,
+    columns: Sequence[str] = ("open_time", "close_time"),
+    drop_out_of_range: bool = True,
+    future_drift_sec: int = 300,
+    logger_obj: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Призводить часові колонки до int64 мс від epoch та (опційно) фільтрує аномалії.
+
+    Дії:
+      - Для кожної колонки з `columns`, якщо вона існує:
+        • авто-визначення одиниць (s/ms/us/ns) за медіаною;
+        • конвертація у мілісекунди (int64);
+      - (опційно) видаляє рядки з майбутнім часом (далі ніж `future_drift_sec`) і
+        підозріло малими значеннями (< 2009-01-01).
+
+    Args:
+        df: Вхідний DataFrame.
+        columns: Список часових колонок для нормалізації.
+        drop_out_of_range: Видаляти рядки з аномальним часом.
+        future_drift_sec: Допустимий дрейф у майбутнє (секунди).
+        logger_obj: Необов'язковий логер для діагностики.
+
+    Returns:
+        pd.DataFrame: Новий DataFrame з узгодженими часовими колонками.
+    """
+
+    def _log(msg: str) -> None:
+        if logger_obj:
+            logger_obj.debug(msg)
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    out = df.copy()
+    changed = False
+
+    for name in columns:
+        if name not in out.columns:
+            continue
+        s = pd.to_numeric(out[name], errors="coerce").astype("Int64")
+        if len(s) == 0 or s.isna().all():
+            continue
+        try:
+            med = float(s.dropna().astype("int64").median())
+        except Exception:
+            med = float(s.dropna().iloc[0]) if (~s.isna()).any() else 0.0
+        unit = "ms"
+        if 1e11 <= med < 1e14:
+            unit = "ms"
+            conv = s.astype("int64")
+        elif 1e9 <= med < 1e11:
+            unit = "s"
+            conv = s.astype("int64") * 1000
+        elif 1e14 <= med < 1e17:
+            unit = "us"
+            conv = s.astype("int64") // 1000
+        elif 1e17 <= med < 1e20:
+            unit = "ns"
+            conv = s.astype("int64") // 1_000_000
+        else:
+            unit = "unknown"
+            conv = s.astype("int64")
+        if unit != "ms":
+            _log(
+                f"[ensure_epoch_ms_columns] {name}: coerced {unit} → ms (median={med:.3g})"
+            )
+        out[name] = conv
+        changed = True
+
+    if drop_out_of_range and any(c in out.columns for c in columns):
+        # Перевіряємо лише за open_time, якщо він присутній, інакше шукаємо перший наявний
+        ref_col: str | None
+        if columns[0] in out.columns:
+            ref_col = columns[0]
+        else:
+            ref_col = None
+            for c in columns:
+                if c in out.columns:
+                    ref_col = c
+                    break
+        if ref_col is not None:
+            try:
+                now_ms = int(datetime.utcnow().timestamp() * 1000)
+                low_ms = int(datetime(2009, 1, 1).timestamp() * 1000)
+                hi_ms = now_ms + int(max(0, future_drift_sec) * 1000)
+                before = len(out)
+                mask = (
+                    pd.to_numeric(out[ref_col], errors="coerce")
+                    .astype("Int64")
+                    .astype("int64")
+                    .between(low_ms, hi_ms)
+                )
+                filtered = out[mask].copy()
+                removed = before - len(filtered)
+                if removed > 0:
+                    _log(
+                        f"[ensure_epoch_ms_columns] Відфільтровано {removed} рядків поза діапазоном [{low_ms},{hi_ms}] по {ref_col}."
+                    )
+                if before > 0 and len(filtered) == 0:
+                    # Оцінимо медіану як евристичний індикатор «майбутнього»
+                    try:
+                        med_ms = int(
+                            pd.to_numeric(out[ref_col], errors="coerce")
+                            .dropna()
+                            .astype("int64")
+                            .median()
+                        )
+                    except Exception:
+                        med_ms = hi_ms + 1  # змусити політику «future» за замовчуванням
+                    if med_ms > hi_ms:
+                        # Дані в майбутньому (наприклад, 2030 рік) — краще відкинути, ніж пускати далі
+                        _log(
+                            "[ensure_epoch_ms_columns] Усі рядки в майбутньому (med > hi) — відкидаємо набір (без fallback)."
+                        )
+                        out = filtered  # порожньо
+                    else:
+                        # Амбівалентний випадок — залишаємо fallback, щоб не губити можливі коректні дані
+                        _log(
+                            "[ensure_epoch_ms_columns] Весь набір випав, але медіана не в майбутньому — повертаємо без фільтрації (fallback)."
+                        )
+                        # залишаємо out без змін (але вже у ms одиницях)
+                else:
+                    out = filtered
+            except Exception:
+                pass
+
+    return out if changed else df
+
+
+# ── Map / Normalize (рекомендації, TP/SL, тригери) ───────────────────────────
+def map_reco_to_signal(recommendation: str | None) -> str:
+    """Перетворює Stage2-рекомендацію у тип сигналу для UI.
+
+    Args:
+        recommendation: Рекомендація (наприклад, 'BUY_IN_DIPS').
+
+    Returns:
+        str: 'ALERT_BUY' | 'ALERT_SELL' | 'NORMAL'
+    """
+    reco = (recommendation or "").upper()
+    if reco in BUY_SET:
+        return "ALERT_BUY"
+    if reco in SELL_SET:
+        return "ALERT_SELL"
+    return "NORMAL"
+
+
+def normalize_tp_sl(
+    tp: float | None,
+    sl: float | None,
+    recommendation: str | None,
+    current_price: float | None = None,
+) -> tuple[float | None, float | None, bool, str | None]:
+    """Гарантує логічний порядок TP/SL відповідно до напрямку угоди.
+
+    Args:
+        tp: Ціль (Take Profit).
+        sl: Стоп (Stop Loss).
+        recommendation: Рекомендація Stage2 (визначає напрям).
+        current_price: Поточна ціна (опційно, для додаткових перевірок).
+
+    Returns:
+        Tuple[tp, sl, swapped, note_tag]:
+            tp (Optional[float]): Можливо змінене TP.
+            sl (Optional[float]): Можливо змінений SL.
+            swapped (bool): Чи були місця TP/SL переставлені.
+            note_tag (Optional[str]): Тег примітки (наприклад, 'tp_sl_swapped_long').
+    """
+    swapped = False
+    note: str | None = None
+
+    if not isinstance(tp, (int, float)) or not isinstance(sl, (int, float)):
+        return tp, sl, swapped, note
+
+    reco = (recommendation or "").upper()
+    if reco in BUY_SET:
+        if sl >= tp:
+            tp, sl = sl, tp
+            swapped = True
+            note = TRIGGER_TP_SL_SWAP_LONG
+    elif reco in SELL_SET:
+        if tp >= sl:
+            tp, sl = sl, tp
+            swapped = True
+            note = TRIGGER_TP_SL_SWAP_SHORT
+
+    return tp, sl, swapped, note
+
+
+def normalize_trigger_reasons(reasons: Iterable[str] | None) -> list[str]:
+    """Нормалізує список причин-тригерів до канонічних коротких імен.
+
+    Операції:
+      - trim + lower для кожного елементу,
+      - мапінг через TRIGGER_NAME_MAP,
+      - унікалізація зі збереженням порядку.
+
+    Args:
+        reasons: Список/кортеж сирих назв тригерів.
+
+    Returns:
+        list[str]: Впорядкований список уніфікованих імен.
+    """
+    if not reasons:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in reasons:
+        key = str(raw).strip().lower()
+        std = TRIGGER_NAME_MAP.get(key, key)
+        if std and std not in seen:
+            out.append(std)
+            seen.add(std)
+    _logger.debug("normalize_trigger_reasons: in=%r → out=%r", list(reasons), out)
+    return out
+
+
+# ── Форматування (обсяг, OI, ціна) ──────────────────────────────────────────
+def format_volume_usd(volume: float | str) -> str:
+    """Форматує оборот у USD (K/M/G/T).
+
+    Args:
+        volume: float або вже відформатований рядок.
+
+    Returns:
+        str: Відформатований рядок.
+    """
+    if isinstance(volume, str):
+        return volume
+    try:
+        v = float(volume)
+    except (TypeError, ValueError):
+        return "-"
+    if v >= 1e12:
+        return f"{v / 1e12:.2f}T USD"
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}G USD"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f}M USD"
+    if v >= 1e3:
+        return f"{v / 1e3:.2f}K USD"
+    return f"{v:.2f} USD"
+
+
+def format_open_interest(oi: float | str) -> str:
+    """Форматує Open Interest у коротку форму (K/M/B).
+
+    Args:
+        oi: Значення OI.
+
+    Returns:
+        str: Відформатоване значення або "-".
+    """
+    try:
+        val = float(oi)
+    except (ValueError, TypeError):
+        return "-"
+    if val >= 1e9:
+        return f"{val / 1e9:.2f}B"
+    if val >= 1e6:
+        return f"{val / 1e6:.2f}M"
+    if val >= 1e3:
+        return f"{val / 1e3:.2f}K"
+    return f"{val:.2f} USD"
+
+
+def get_tick_size(
+    symbol: str,
+    price_hint: float | None = None,
+    overrides: dict[str, float] | None = None,
+) -> float:
+    """Єдина функція визначення tick_size.
+
+    Пріоритет:
+        1) overrides
+        2) TICK_SIZE_MAP
+        3) TICK_SIZE_BRACKETS (перший поріг де ціна < limit)
+        4) TICK_SIZE_DEFAULT
+    """
+    sym = (symbol or "").lower()
+    if overrides and sym in overrides:
+        try:
+            v = float(overrides[sym])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    tick_conf = TICK_SIZE_MAP.get(sym) or TICK_SIZE_MAP.get(sym.upper())
+    if isinstance(tick_conf, (int, float)) and tick_conf > 0:
+        return float(tick_conf)
+    if price_hint is not None and TICK_SIZE_BRACKETS:
+        try:
+            p = float(price_hint)
+            for limit_price, tick in TICK_SIZE_BRACKETS:
+                if p < limit_price:
+                    return float(tick)
+        except Exception:
+            pass
+    return float(TICK_SIZE_DEFAULT)
+
+
+def _infer_decimals_for_symbol(symbol: str, price: float) -> int:
+    """Визначає кількість знаків після коми, відштовхуючись від tick_size.
+
+    Логіка:
+        - Отримати tick_size через get_tick_size(price_hint=price)
+        - Якщо >0 → кількість знаків у дробовій частині тіку
+        - Інакше (неможливо) — fallback стара евристика
+    """
+    tick = get_tick_size(symbol, price_hint=price)
+    if tick > 0:
+        s = f"{tick:.16f}".rstrip("0").rstrip(".")
+        return len(s.split(".")[1]) if "." in s else 0
+    sym = symbol.lower()
+    if "btc" in sym or "eth" in sym or price >= 100:
+        return 2
+    if price < 1:
+        return 4 if price >= 0.01 else 6
+    return 4
+
+
+def format_price(price: float, symbol: str) -> str:
+    """Форматує ціну відповідно до специфіки активу.
+
+    Args:
+        price: Поточна ціна.
+        symbol: Тікер (використовується для евристик та TICK_SIZE_MAP).
+
+    Returns:
+        str: Відформатована ціна (з розділювачем тисяч для великих чисел).
+    """
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return "-"
+    decimals = _infer_decimals_for_symbol(symbol, p)
+    # Гарантія точності при зворотному парсингу у тестах: принаймні 6 знаків
+    if decimals < 6:
+        decimals = 6
+    if p < 1000:
+        return f"{p:.{decimals}f}"
+    return f"{p:,.{decimals}f}"
+
+
+# ── Cache / TTL helpers (мапа в config.INTERVAL_TTL_MAP) ─────────────────────
+def get_ttl_for_interval(interval: str) -> int:
+    """Повертає рекомендований TTL (сек) для кешу свічок таймфрейму.
+
+    Логіка:
+      1. Використовує попередньо визначене значення з `_INTERVAL_TTL_MAP`.
+      2. Якщо інтервал не відомий (наприклад, '7m'), намагається:
+         - якщо закінчується на 'm' → множимо хвилини * 90% (у сек) * 1.5 запасу
+         - якщо закінчується на 'h' → години * 3600 * 1.1
+         - якщо закінчується на 'd' → дні * 86400 * 1.05
+         - інакше повертаємо дефолт 3600
+
+    Args:
+        interval: Рядок таймфрейму ("1m", "1h", "1d", ...).
+
+    Returns:
+        int: TTL у секундах (завжди > 0).
+    """
+    iv = interval.strip().lower()
+    ttl = INTERVAL_TTL_MAP.get(iv)
+    if ttl is not None:
+        return int(ttl)
+    try:
+        if iv.endswith("m"):
+            mins = float(iv[:-1])
+            return int(mins * 60 * 1.5)  # 150% довжини інтервалу
+        if iv.endswith("h"):
+            hrs = float(iv[:-1])
+            return int(hrs * 3600 * 1.1)
+        if iv.endswith("d"):
+            days = float(iv[:-1])
+            return int(days * 86400 * 1.05)
+        if iv.endswith("w"):
+            weeks = float(iv[:-1])
+            return int(weeks * 7 * 86400 * 1.02)
+    except ValueError:
+        pass
+    # Фолбек: година
+    return 3600
+
+
+# ── Сесії / Календар ─────────────────────────────────────────────────────────
+def is_us_session(current_time: datetime) -> bool:
+    """Перевіряє, чи поточний час входить у робочі години US-сесії (NYSE, 09:30–16:00 ET).
+
+    Args:
+        current_time: Час у будь-якому часовому поясі (aware).
+
+    Returns:
+        bool: True, якщо зараз робочі години біржі (пн–пт, 09:30–16:00 ET).
+    """
+    try:
+        from zoneinfo import ZoneInfo  # stdlib з Python 3.9+
+
+        eastern = current_time.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        # Якщо tz недоступний — поводимось консервативно
+        return False
+    start = time(9, 30)
+    end = time(16, 0)
+    return eastern.weekday() < 5 and start <= eastern.time() <= end
+
+
+# ── Нормалізація результатів ────────────────────────────────────────────────
+def normalize_result_types(result: dict) -> dict:
+    """Нормалізує типи даних та додає стан для UI"""
+    numeric_fields = [
+        "confidence",
+        "tp",
+        "sl",
+        "current_price",
+        "atr",
+        "rsi",
+        "volume",
+        "volume_mean",
+        "volume_usd",
+        "volume_z",
+        "open_interest",
+        "btc_dependency_score",
+    ]
+
+    if "calibrated_params" in result:
+        result["calibrated_params"] = {
+            k: float(v) for k, v in result["calibrated_params"].items()
+        }
+
+    for field in numeric_fields:
+        if field in result:
+            result[field] = safe_float(result[field])
+        elif "stats" in result and field in result["stats"]:
+            result["stats"][field] = safe_float(result["stats"][field])
+
+    # Визначення стану сигналу
+    signal_type = result.get("signal", "NONE").upper()
+    if signal_type == "ALERT" or signal_type.startswith("ALERT_"):
+        result["state"] = "alert"
+    elif signal_type == "NORMAL":
+        result["state"] = "normal"
+    else:
+        result["state"] = "no_trade"
+
+    result["visible"] = True
+    return result
+
+
+def make_serializable_safe(data) -> Any:
+    """Робить вкладені структури JSON-сумісними."""
+    if isinstance(data, pd.DataFrame):
+        return data.to_dict(orient="records")
+    if hasattr(data, "to_dict") and not isinstance(data, dict):
+        return data.to_dict()
+    if isinstance(data, dict):
+        return {k: make_serializable_safe(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [make_serializable_safe(x) for x in data]
+    return data
+
+
+# ── Signal helpers (раніше в screening_producer) ─────────────────────────────
+def create_no_data_signal(symbol: str) -> dict:
+    """Формує стандартний сигнал відсутності даних для активу.
+
+    Args:
+        symbol: Ідентифікатор активу.
+
+    Returns:
+        dict: Нормалізований сигнал без даних.
+    """
+    base = {
+        "symbol": symbol,
+        "signal": "NONE",
+        "trigger_reasons": ["no_data"],
+        "confidence": 0.0,
+        "hints": ["Недостатньо даних для аналізу"],
+        "state": ASSET_STATE["NO_DATA"],
+        "stage2_status": STAGE2_STATUS["SKIPPED"],
+    }
+    return normalize_result_types(base)
+
+
+def create_error_signal(symbol: str, error: str) -> dict:
+    """Формує стандартний сигнал помилки для активу.
+
+    Args:
+        symbol: Актив.
+        error: Текст помилки.
+
+    Returns:
+        dict: Нормалізований сигнал помилки.
+    """
+    base = {
+        "symbol": symbol,
+        "signal": "NONE",
+        "trigger_reasons": ["processing_error"],
+        "confidence": 0.0,
+        "hints": [f"Помилка: {error}"],
+        "state": ASSET_STATE["ERROR"],
+        "stage2_status": STAGE2_STATUS["ERROR"],
+    }
+    return normalize_result_types(base)
+
+
+# ── Публічний API модуля ────────────────────────────────────────────────────
+__all__ = [
+    # базові
+    "safe_float",
+    "first_not_none",
+    # dataframe/timestamp
+    "ensure_timestamp_column",
+    # mapping/normalize
+    "map_reco_to_signal",
+    "normalize_tp_sl",
+    "normalize_trigger_reasons",
+    "sanitize_ohlcv_numeric",
+    # форматування
+    "format_volume_usd",
+    "format_open_interest",
+    "format_price",
+    # tick size
+    "get_tick_size",
+    # cache ttl
+    "get_ttl_for_interval",
+    # сесії
+    "is_us_session",
+    # screening helpers (extracted)
+    # (примітка: create_no_data_signal / create_error_signal наразі залишаються в producer)
+    "create_no_data_signal",
+    "create_error_signal",
+]

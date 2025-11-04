@@ -1,0 +1,13 @@
+{
+    "typeCheckingMode": "off",
+    "useLibraryCodeForTypes": true,
+    "reportMissingTypeStubs": "none",
+    "reportGeneralTypeIssues": "none",
+    "exclude": [
+        "**/.venv",
+        "**/.env",
+        "**/__pycache__",
+        "**/.mypy_cache",
+        "**/.pytest_cache"
+    ]
+}

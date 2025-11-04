@@ -1,0 +1,3 @@
+symbol,scenario,activations,mean_conf,p75_conf,mean_time_to_stabilize_s,btc_gate_effect_rate,explain_coverage_rate,explain_latency_ms,reject_top1,reject_top1_rate,reject_top2,reject_top2_rate,reject_top3,reject_top3_rate,in_zone,compression_level,persist_score,btc_regime_at_activation,quality_proxy
+TONUSDT,breakout_confirmation,2,0.165,0.0,0.0,0.0,0.0,0,,0.0,,0.0,,0.0,0,0.0,0.0,,-
+BTCUSDT,pullback_continuation,1,0.44,0.44,0.0,0.0,0.0,0,,0.0,,0.0,,0.0,0,0.0,0.0,,-

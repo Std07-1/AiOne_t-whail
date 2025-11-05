@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Збір ранкового підсумку: p95 латентності Stage1 із Prometheus‑знімків та опційно
 агрегація якості/forward. Виводить короткий Markdown‑звіт із авто‑GO/NO‑GO.
@@ -21,15 +19,14 @@ from __future__ import annotations
 Безпечний: працює з частково пошкодженими файлами, пропускає помилки.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
-import json
 import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
 
 HIST_NAME = "ai_one_stage1_latency_ms"
 
@@ -38,7 +35,7 @@ HIST_NAME = "ai_one_stage1_latency_ms"
 class HistStats:
     count: int
     total: float
-    buckets: Dict[float, int]  # cumulative per le
+    buckets: dict[float, int]  # cumulative per le
 
     @property
     def mean(self) -> float:
@@ -47,7 +44,7 @@ class HistStats:
         except Exception:
             return 0.0
 
-    def p_quantile(self, q: float) -> Optional[float]:
+    def p_quantile(self, q: float) -> float | None:
         if not self.buckets or self.count <= 0:
             return None
         try:
@@ -63,9 +60,7 @@ class HistStats:
         return best
 
 
-def parse_histogram_from_text(
-    text: str, metric: str = HIST_NAME
-) -> Optional[HistStats]:
+def parse_histogram_from_text(text: str, metric: str = HIST_NAME) -> HistStats | None:
     # Збираємо останні значення: у форматі Prometheus текст експозиції останні рядки
     # вже містять найсвіжіші cumulative значення
     bucket_re = re.compile(
@@ -73,7 +68,7 @@ def parse_histogram_from_text(
     )
     sum_re = re.compile(rf"^{re.escape(metric)}_sum\s+([-+]?[0-9]*\.?[0-9]+)", re.M)
     cnt_re = re.compile(rf"^{re.escape(metric)}_count\s+(\d+)", re.M)
-    buckets: Dict[float, int] = {}
+    buckets: dict[float, int] = {}
     total = None
     count = None
     for line in text.splitlines():
@@ -108,7 +103,7 @@ def parse_histogram_from_text(
     return HistStats(count=count, total=total, buckets=buckets)
 
 
-def _split_snapshots(text: str) -> List[str]:
+def _split_snapshots(text: str) -> list[str]:
     """Грубе розбиття concat‑файла метрик на знімки за маркером HIST_NAME.
 
     Повертає список блоків (можуть перетинатися за HELP/TYPE), але цього достатньо
@@ -117,7 +112,7 @@ def _split_snapshots(text: str) -> List[str]:
     marker = f"# TYPE {HIST_NAME} histogram"
     parts = text.split(marker)
     # parts[0] — шапка перед першим; знімки — це наступні шматки з доданим маркером
-    snaps: List[str] = []
+    snaps: list[str] = []
     for i in range(1, len(parts)):
         snaps.append(marker + parts[i])
     return snaps
@@ -153,22 +148,22 @@ def _compute_switch_rate_per_min(all_text: str, scrape_sec: int = 15) -> float:
 
 def read_text(path: str) -> str:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
     except Exception:
         try:
-            with open(path, "r", encoding="cp1251") as f:
+            with open(path, encoding="cp1251") as f:
                 return f.read()
         except Exception:
             return ""
 
 
-def parse_quality_csv(path: Optional[str]) -> Optional[Dict[str, float]]:
+def parse_quality_csv(path: str | None) -> dict[str, float] | None:
     if not path or not os.path.exists(path):
         return None
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     try:
-        with open(path, "r", newline="", encoding="utf-8") as f:
+        with open(path, newline="", encoding="utf-8") as f:
             r = csv.DictReader(f)
             # беремо перший рядок агрегованого підсумку, якщо є
             for row in r:
@@ -210,7 +205,7 @@ def main() -> int:
     fb_total = _sum_counter(snaps[-1], "ai_one_false_breakout_total") if snaps else 0
 
     verdict = "UNKNOWN"
-    recs: List[str] = []
+    recs: list[str] = []
     quality = parse_quality_csv(args.quality) if args.quality else None
     exp_cov = None
     chop_rate = None
@@ -240,7 +235,7 @@ def main() -> int:
                 "ExpCov<0.60: підвищити покриття explain або розслабити gray‑gate для контексту"
             )
 
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("# Нічний підсумок")
     lines.append("")
     lines.append("## Stage1 latency")

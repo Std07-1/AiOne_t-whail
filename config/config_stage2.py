@@ -584,51 +584,56 @@ def validate_stage2_config() -> list[str]:
     try:
         import config.config as _cfg
 
-        _S2_ON = bool(getattr(_cfg, "STAGE2_ENABLED", False))
-        _S2_PROFILE = str(getattr(_cfg, "STAGE2_PROFILE", "strict"))
-        _YAML_ON = bool(getattr(_cfg, "FEATURE_STAGE2_THRESHOLDS_YAML", False))
-        _YAML_PROFILE = str(
-            getattr(_cfg, "STAGE2_THRESHOLDS_YAML_PROFILE", _S2_PROFILE)
+        _s2_on = bool(getattr(_cfg, "STAGE2_ENABLED", False))
+        _s2_profile = str(getattr(_cfg, "STAGE2_PROFILE", "strict"))
+        _yaml_on = bool(getattr(_cfg, "FEATURE_STAGE2_THRESHOLDS_YAML", False))
+        _yaml_profile = str(
+            getattr(_cfg, "STAGE2_THRESHOLDS_YAML_PROFILE", _s2_profile)
         )
-        _PROF_ENGINE = bool(getattr(_cfg, "PROFILE_ENGINE_ENABLED", False))
-        _QDE_ON = bool(getattr(_cfg, "STAGE2_QDE_ENABLED", False))
+        _prof_engine = bool(getattr(_cfg, "PROFILE_ENGINE_ENABLED", False))
+        _qde_on = bool(getattr(_cfg, "STAGE2_QDE_ENABLED", False))
     except Exception:
         try:
             from config.flags import (
-                FEATURE_STAGE2_THRESHOLDS_YAML as _YAML_ON,
-                STAGE2_ENABLED as _S2_ON,
-                STAGE2_PROFILE as _S2_PROFILE,
-                STAGE2_THRESHOLDS_YAML_PROFILE as _YAML_PROFILE,
-                PROFILE_ENGINE_ENABLED as _PROF_ENGINE,
+                FEATURE_STAGE2_THRESHOLDS_YAML,
+                PROFILE_ENGINE_ENABLED,
+                STAGE2_ENABLED,
+                STAGE2_PROFILE,
+                STAGE2_THRESHOLDS_YAML_PROFILE,
             )
 
-            _QDE_ON = bool(globals().get("STAGE2_QDE_ENABLED", False))
+            _yaml_on = FEATURE_STAGE2_THRESHOLDS_YAML
+            _prof_engine = PROFILE_ENGINE_ENABLED
+            _s2_on = STAGE2_ENABLED
+            _s2_profile = STAGE2_PROFILE
+            _yaml_profile = STAGE2_THRESHOLDS_YAML_PROFILE
+            _qde_on = bool(globals().get("STAGE2_QDE_ENABLED", False))
         except Exception:
             # Якщо flags також недоступні у середовищі, повертаємо порожній список
             return hints
 
     # 1) Профіль strict як канон
-    if bool(_S2_ON) and str(_S2_PROFILE).lower() != "strict":
+    if bool(_s2_on) and str(_s2_profile).lower() != "strict":
         hints.append(
             "Stage2-lite увімкнено, але STAGE2_PROFILE!='strict'. Рекомендовано strict як канон для signal_v2."
         )
 
     # 2) YAML пороги vs активний профіль
-    if bool(_YAML_ON):
-        if str(_YAML_PROFILE).lower() != str(_S2_PROFILE).lower():
+    if bool(_yaml_on):
+        if str(_yaml_profile).lower() != str(_s2_profile).lower():
             hints.append(
                 "Увімкнено YAML-пороги, але STAGE2_THRESHOLDS_YAML_PROFILE не співпадає зі STAGE2_PROFILE — вирівняйте профілі."
             )
 
     # 3) Профільний двигун vs джерела порогів
-    if bool(_PROF_ENGINE) and bool(_YAML_ON):
-        if str(_YAML_PROFILE).lower() != str(_S2_PROFILE).lower():
+    if bool(_prof_engine) and bool(_yaml_on):
+        if str(_yaml_profile).lower() != str(_s2_profile).lower():
             hints.append(
                 "PROFILE_ENGINE_ENABLED=True разом із YAML-порогами різних профілів — можливе накладання. Уніфікуйте на один профіль."
             )
 
     # 4) Історичний QDE флаг
-    if bool(_QDE_ON):
+    if bool(_qde_on):
         hints.append(
             "STAGE2_QDE_ENABLED=True — історичний режим; рекомендовано вимкнути."
         )

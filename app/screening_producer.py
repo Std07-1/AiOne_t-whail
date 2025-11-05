@@ -22,7 +22,6 @@ from config.config import (
     K_SIGNAL,
     K_STATS,
     MIN_READY_PCT,
-    NAMESPACE as _NS,
     PREFILTER_STRICT_PROFILES,
     SCREENING_BATCH_SIZE,
     SCREENING_LEVELS_UPDATE_EVERY,
@@ -31,12 +30,25 @@ from config.config import (
     STAGE1_SYMBOL_SNAPSHOT_INTERVAL_SEC,
     TRADE_REFRESH_INTERVAL,
 )
+from config.config import (
+    NAMESPACE as _NS,
+)
 from config.flags import (
     STAGE1_MONITOR_LIMIT_TO_STRICT_PREFILTER as _USE_STRICT_FILTER,
+)
+from config.flags import (
     STAGE1_PREFILTER_STRICT_AUTHORITATIVE_IF_PRESENT as _AUTHORITATIVE,
+)
+from config.flags import (
     STAGE1_PREFILTER_STRICT_BG_INTERVAL_SEC as _BG_INTERVAL,
+)
+from config.flags import (
     STAGE1_PREFILTER_STRICT_BG_REFRESH_ENABLED as _BG_ENABLED,
+)
+from config.flags import (
     STAGE1_PREFILTER_STRICT_ENABLED as _STRICT_ENABLED,
+)
+from config.flags import (
     STAGE1_PREFILTER_STRICT_SOFT_PROFILE as _SOFT_PROFILE,
 )
 from config.keys import build_key as _k

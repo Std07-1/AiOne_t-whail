@@ -28,7 +28,7 @@ stage2_hint і market_context.meta.profile (spying-only) під фіче-фла�
 
 from __future__ import annotations
 
-from typing import Any, TypedDict, Tuple
+from typing import Any, TypedDict
 
 
 class ProfileThresholds(TypedDict, total=False):
@@ -275,7 +275,7 @@ SYMBOL_OVERRIDES: dict[str, dict[str, dict[str, float | int]]] = {
 
 def apply_symbol_overrides(
     base: dict[str, Any] | None, symbol: str, profile: str
-) -> Tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool]:
     """Застосовує символьні оверрайди до базових порогів профілю.
 
     Підтримувані ключі у overrides[SYMBOL][profile]:

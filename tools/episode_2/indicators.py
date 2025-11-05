@@ -33,7 +33,6 @@
         Немає перевірки часових прогалин; очікується рівномірний DatetimeIndex.
 """
 import logging
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -293,7 +292,7 @@ def segment_data(df: pd.DataFrame, start_idx: int, end_idx: int) -> pd.DataFrame
 
 def calculate_max_runup_drawdown(
     close_prices: pd.Series, direction: str
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Максимальний runup та drawdown у напрямку.
 
     Args:
@@ -441,12 +440,15 @@ def find_impulse_peak(segment: pd.DataFrame, direction: str) -> pd.Timestamp:
 
 # Допоміжні аналітичні функції
 def analyze_data_volatility(
-    df: pd.DataFrame, window_sizes: List[int] = [5, 30, 60]
-) -> Dict[str, float]:
+    df: pd.DataFrame, window_sizes: list[int] | None = None
+) -> dict[str, float]:
     """Максимальні returns та intra-window рухи для набору вікон.
 
     Returns dict ключів: max_{w}bar_return, max_{w}bar_move.
     """
+    if window_sizes is None:
+        window_sizes = [5, 30, 60]
+
     close = df["close"].astype(float)
     results = {}
 

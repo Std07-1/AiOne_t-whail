@@ -882,51 +882,6 @@ async def publish_full_state(
 
             serialized_assets.append(asset)
 
-        if telemetry_map:
-            stage3_summary: dict[str, Any] = {"active": int(len(telemetry_map))}
-            if stage3_rr_samples:
-                try:
-                    stage3_summary["rr_avg"] = round(
-                        sum(stage3_rr_samples) / len(stage3_rr_samples), 3
-                    )
-                    stage3_summary["rr_max"] = round(max(stage3_rr_samples), 3)
-                    stage3_summary["rr_min"] = round(min(stage3_rr_samples), 3)
-                except Exception:
-                    pass
-            if stage3_unrealized_samples:
-                try:
-                    stage3_summary["unrealized_avg"] = round(
-                        sum(stage3_unrealized_samples) / len(stage3_unrealized_samples),
-                        3,
-                    )
-                    stage3_summary["unrealized_max"] = round(
-                        max(stage3_unrealized_samples), 3
-                    )
-                    stage3_summary["unrealized_min"] = round(
-                        min(stage3_unrealized_samples), 3
-                    )
-                except Exception:
-                    pass
-            if stage3_mfe_samples:
-                try:
-                    stage3_summary["mfe_avg"] = round(
-                        sum(stage3_mfe_samples) / len(stage3_mfe_samples), 3
-                    )
-                except Exception:
-                    pass
-            if stage3_mae_samples:
-                try:
-                    stage3_summary["mae_avg"] = round(
-                        sum(stage3_mae_samples) / len(stage3_mae_samples), 3
-                    )
-                except Exception:
-                    pass
-            if stage3_trail_total:
-                stage3_summary["trails_total"] = int(stage3_trail_total)
-                stage3_summary["trails_armed"] = int(stage3_trail_armed)
-            if stage3_summary:
-                analytics_summary["stage3"] = stage3_summary
-
         # counters для хедера (+ базові агрегати Stage3‑гейтів)
         alerts_list = [
             a

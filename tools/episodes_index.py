@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Індексатор епізодів реплею: збирає короткий CSV з JSONL/логів під коренем.
 
@@ -14,12 +12,15 @@ from __future__ import annotations
 ПРИМІТКА: Скрипт толерантний до відсутніх полів і неоднорідних рядків JSONL.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import glob
 import json
 import os
-from typing import Any, Dict, Iterable, List, Optional
+from collections.abc import Iterable
+from typing import Any
 
 
 def _iter_jsonl_files(root: str) -> Iterable[str]:
@@ -27,11 +28,10 @@ def _iter_jsonl_files(root: str) -> Iterable[str]:
         os.path.join(root, "**", "*.jsonl"),
     ]
     for pat in patterns:
-        for p in glob.glob(pat, recursive=True):
-            yield p
+        yield from glob.glob(pat, recursive=True)
 
 
-def _extract_row(obj: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_row(obj: dict[str, Any]) -> dict[str, Any]:
     sym = str(obj.get("symbol") or obj.get("sym") or obj.get("pair") or "").upper()
     ts = obj.get("ts") or obj.get("timestamp") or obj.get("time") or obj.get("t")
     kind = (
@@ -86,10 +86,10 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="Файл CSV для запису")
     args = ap.parse_args()
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for path in _iter_jsonl_files(args.root):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:

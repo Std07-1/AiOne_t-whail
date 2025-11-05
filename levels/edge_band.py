@@ -63,7 +63,7 @@ def edge_features(bars: list[Bar], band: tuple[float, float]) -> dict[str, float
 
     for b in window:
         h = _sf(b.get("high") or b.get("h"))
-        l = _sf(b.get("low") or b.get("l"))
+        low = _sf(b.get("low") or b.get("l"))
         c = _sf(b.get("close") or b.get("c"))
         if h >= hi:
             edge_hits += 1
@@ -72,7 +72,7 @@ def edge_features(bars: list[Bar], band: tuple[float, float]) -> dict[str, float
             pb = max(0.0, hi - c)
             if pb > max_pullback:
                 max_pullback = pb
-        if (l >= lo) and (h <= hi):
+        if (low >= lo) and (h <= hi):
             squeeze_cnt += 1
 
     return {

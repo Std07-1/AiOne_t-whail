@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 RE_WHALE = re.compile(
@@ -45,7 +45,7 @@ def main() -> int:
             dir_counter[m.group("dir")] += 1
             raw = m.group("reasons")
             # відрізати потенційні крапки в кінці рядка
-            raw = raw.strip().rstrip("…").rstrip("...")
+            raw = raw.strip().removesuffix("…").removesuffix("...")
             parts = [p.strip() for p in raw.split(",") if p.strip()]
             for p in parts:
                 by_key[p] += 1

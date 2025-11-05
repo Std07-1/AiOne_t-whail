@@ -39,10 +39,10 @@ def _parse_ts_ms(ln: str) -> int | None:
     m3 = re.search(r"\[(\d{2})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})\]", ln)
     if m3:
         try:
-            mm, dd, yy, HH, MM, SS = map(int, m3.groups())
+            mm, dd, yy, hh, mm_time, ss = map(int, m3.groups())
             # yy у форматі 25 → 2025
             year = 2000 + yy
-            dt = datetime(year, mm, dd, HH, MM, SS, tzinfo=UTC)
+            dt = datetime(year, mm, dd, hh, mm_time, ss, tzinfo=UTC)
             return int(dt.timestamp() * 1000)
         except Exception:
             return None

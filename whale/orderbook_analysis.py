@@ -219,7 +219,7 @@ class OrderbookAnalysis:
 
             # Перевірка "сходинок" між сусідніми рівнями (ratio heuristic)
             sizes = []
-            for level in enumerate(window):
+            for _, level in enumerate(window):
                 try:
                     sizes.append(float(level.get("size", 0.0)))
                 except Exception:
@@ -405,3 +405,49 @@ class OrderbookAnalysis:
                 "estimate_whale_size: cannot cast total to float, returning 0.0"
             )
             return 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Легкий експорт бінарних прапорців для alt‑confirm без I/O
+def alt_flags_from_stats(stats: dict[str, Any] | None) -> dict[str, bool]:
+    """Обчислює прості alt‑прапорці з вже наявних stats.
+
+    Повертає dict з ключами:
+      - iceberg: якщо InstitutionalEntryMethods вже додав "iem.iceberg_orders" у stats
+      - vol_spike: якщо у trap/trigger_reasons є volume_spike (або за порогом volume_z)
+      - zones_dist: якщо у whale.zones_summary.dist_cnt > 0
+    """
+    s = stats or {}
+    iceberg = bool(((s.get("iem") or {}) or {}).get("iceberg_orders", False))
+    # vol_spike: пріоритет — явний тег у reasons
+    reasons = []
+    try:
+        reasons = list((s.get("trap") or {}).get("reasons") or [])
+    except Exception:
+        reasons = []
+    vol_spike = any(
+        r in ("volume_spike", "bull_volume_spike", "bear_volume_spike") for r in reasons
+    )
+    if not vol_spike:
+        try:
+            # fallback за порогом volume_z, якщо присутній у stats.ratios або напряму
+            ratios = (s.get("trap") or {}).get("ratios") or {}
+            volz = float(s.get("volume_z") or ratios.get("volume_z") or 0.0)
+            from config.config_stage2 import STAGE2_CRISIS_MODE as _CR
+
+            thr = float((_CR or {}).get("vol_spike_threshold", 2.5))
+            vol_spike = volz >= thr
+        except Exception:
+            vol_spike = False
+    try:
+        wh = s.get("whale") or {}
+        zones = (wh.get("zones_summary") or {}) if isinstance(wh, dict) else {}
+        dist_cnt = int(zones.get("dist_cnt") or 0)
+        zones_dist = dist_cnt > 0
+    except Exception:
+        zones_dist = False
+    return {
+        "iceberg": bool(iceberg),
+        "vol_spike": bool(vol_spike),
+        "zones_dist": bool(zones_dist),
+    }

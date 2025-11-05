@@ -10,9 +10,9 @@
 - type: рядок (назва каналу)
 - meta: { ts: ISO8601Z, seq: int, schema_version: "v2" }
 - counters: агрегати (alerts, active_trades, системні метрики тощо)
-- analytics: узагальнення по вибірці (band%, dist_to_edge, low_volatility тощо)
-- confidence_stats: перцентилі довіри (best‑effort)
 - assets: список активів (див. нижче)
+
+Примітка: починаючи з v2 (спрощений payload), поля `analytics` і `confidence_stats` вилучено, щоб зменшити навантаження та трафік. Ключові метрики для UI лишаються у кореневих полях активів і counters.
 
 ## Актив (assets[])
 Мінімальні ключі для UI‑таблиці (флет):
@@ -66,6 +66,8 @@
 
 ## stage2_hint (телеметрія → SOFT_ рекомендації в UI)
 - `stats.stage2_hint`: { dir: "BUY"|"SELL", score: 0..1, reasons?: [...], ttl?: sec }
+- Причини (reasons) можуть містити компактні коди профільного двигуна:
+  - `profile=<name>`, `dom_ok=0|1`, `alt_ok=0|1`, `hysteresis=0|1`, `cooldown=0|1`, `stale=0|1`, а також базові `presence_ok`, `bias_ok`, `vwap_dev_ok`.
 - Легка логіка SOFT_ рекомендацій у UI‑publisher (за фіче‑флагом `SOFT_RECOMMENDATIONS_ENABLED`):
   - умови: `htf_ok=True`, не hyper‑волатильність, `score ≥ SOFT_RECO_SCORE_THR`
   - результат: `recommendation = SOFT_BUY|SOFT_SELL` (не перезаписуємо "жорсткі" рекомендації)
@@ -83,8 +85,8 @@
 Просимо розширювати цей розділ у PR, якщо додаються нові теги/поля.
 
 ## Зміни у версіях
-- v2: додано flatten‑поля, analytics.*, stage3 з trail‑метриками, SOFT_ рекомендації (за флагом).
-- Сумісність: UI спирається на `schema_version` і має fallback на ключові поля (price, signal, band_pct, confidence).
+- v2: додано flatten‑поля, stage3 з trail‑метриками, SOFT_ рекомендації (за флагом), спрощено payload — видалено `analytics` і `confidence_stats` з кореня.
+- Сумісність: UI спирається на `schema_version` і має fallback на ключові поля (price, signal, band_pct, confidence). Якщо споживач очікує `analytics`/`confidence_stats`, потрібно оновити логіку під новий payload.
 
 ```text
 Контакти схеми та правила:

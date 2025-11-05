@@ -10,8 +10,8 @@
 
 from __future__ import annotations
 
-# ── Stage1 trigger control (QDE shutdown / structural prioritize-only) ─────
-# Якщо True — вимикає додавання причин для «QDE»-тригерів у Stage1
+# ── Stage1 trigger control (історичні тригери / structural prioritize-only) ─────
+# Якщо True — вимикає додавання причин для історичних тригерів у Stage1
 # (RSI/дивергенції, VWAP-відхилення, сплеск волатильності).
 # Тригери залишаються у телеметрії (context-only), але не впливають на ALERT.
 STAGE1_QDE_TRIGGERS_DISABLED: bool = True
@@ -41,9 +41,9 @@ VOLZ_PROXY_ALLOWED_FOR_EXHAUSTION: bool = True
 # За замовчуванням False, Stage1 виставляє "real".
 VOLZ_SOURCE_PROXY_MODE: bool = True
 
-# If True — skip the "full" (heavy) filtering stage in Stage1 and return
-# results immediately after the base prefilter (quoteVolume/priceChange).
-# Useful for running monitoring directly on post-basic-filter symbols.
+# Якщо True — пропускаємо "повний" (важкий) етап фільтрації у Stage1 і повертаємо
+# результати одразу після базового пре-фільтра (quoteVolume/priceChange).
+# Корисно для запуску моніторингу безпосередньо на символах після базового фільтра.
 STAGE1_SKIP_FULL_FILTER: bool = False
 
 # Stage2-lite керування (телеметрія/алерти/гейти)
@@ -234,6 +234,9 @@ STRICT_SCENARIO_HYSTERESIS_ENABLED: bool = True
 # Контракти Stage1/Stage2 не змінюються; ЗА ЗАМОВЧУВАННЯМ ВИМКНЕНО (канарейка завершена).
 SCENARIO_CANARY_PUBLISH_CANDIDATE: bool = False
 
+# Профільний двигун (Stage1 профілі порогів для hint'ів) — телеметрія‑only
+PROFILE_ENGINE_ENABLED: bool = False
+
 __all__ = [
     "STAGE1_QDE_TRIGGERS_DISABLED",
     "STAGE1_STRUCTURAL_PRIORITIZE_ONLY",
@@ -301,4 +304,5 @@ __all__ = [
     "SCENARIO_TRACE_ENABLED",
     "STRICT_SCENARIO_HYSTERESIS_ENABLED",
     "SCENARIO_CANARY_PUBLISH_CANDIDATE",
+    "PROFILE_ENGINE_ENABLED",
 ]

@@ -2,7 +2,7 @@
 
 Мета:
 - Винести Stage2-параметри у окремий модуль із чітким API.
-- Створити основу для подальшої міграції фазових порогів, strict-профілю та QDE.
+- Створити основу для подальшої міграції фазових порогів і strict‑профілю (без історичного QDE).
 
 Примітка:
 - Публічні імена експортуються через ``config.config`` (re-export).
@@ -162,7 +162,7 @@ INSIGHT_LAYER_ENABLED: Final[bool] = True
 PROCESSOR_INSIGHT_WIREUP: Final[bool] = True
 VOLZ_PROXY_ALLOWED_FOR_EXHAUSTION: Final[bool] = False
 
-# Головний фіче-флаг QDE Core
+# Головний фіче‑флаг історичного QDE Core (залишено для зворотної сумісності)
 STAGE2_QDE_ENABLED: Final[bool] = False
 # Тег версії порогів Stage2
 USED_THRESH_TAG: Final[str] = "strict:v1"
@@ -387,20 +387,20 @@ STAGE2_PHASE_THRESHOLDS: Final[dict[str, dict[str, float]]] = {
     },
 }
 
-# Participation-light ("quiet mode") thresholds for soft drift_trend classification
-# Used only when FEATURE_PARTICIPATION_LIGHT flag is enabled.
+# Participation-light ("тихий режим") пороги для м'якої класифікації drift_trend
+# Використовується лише при увімкненому прапорі FEATURE_PARTICIPATION_LIGHT.
 PARTICIPATION_LIGHT_THRESHOLDS: Final[dict[str, float | bool]] = {
-    # Minimal absolute volume z-score to consider a gentle push
+    # Мінімальний абсолютний volume z-score для розгляду м'якого поштовху
     "vol_z_min": 1.0,
-    # Upper cap for DVR to remain in "light" participation (avoid strong breakouts)
+    # Верхня межа DVR для збереження "легкої" участі (уникнення сильних пробоїв)
     "dvr_max": 0.8,
-    # Allow slightly positive bias; if data missing, treat as permissive
+    # Дозволити трохи позитивний bias; якщо дані відсутні, трактувати як дозвільне
     "cd_min": 0.0,
-    # Minimal slope in ATR-units indicating trend drift
+    # Мінімальний нахил в ATR-одиницях, що вказує на дрейф тренду
     "slope_min": 0.4,
-    # Band should not be excessively wide (keep within consolidation-to-trend context)
+    # Смуга не повинна бути надмірно широкою (зберігати контекст консолідація-тренд)
     "band_max": 0.35,
-    # Whether HTF confirmation is required (False keeps this telemetry-only and permissive)
+    # Чи потрібне HTF підтвердження (False зберігає це як телеметрія-only і дозвільне)
     "htf_required": False,
 }
 
@@ -541,7 +541,8 @@ STRONG_REGIME: Final[StrongRegimeConfig] = {
     },
 }
 
-
+# Суворі теги спостереження для Stage2 (використовуються у phase_detector та інших модулях)
+# Визначають умови для активації спостереження за певними ринковими умовами
 STRICT_WATCH_TAGS: Final[dict[str, object]] = {
     "momentum_overbought_watch": {
         "enabled": True,
@@ -566,7 +567,77 @@ STRICT_WATCH_TAGS: Final[dict[str, object]] = {
 }
 
 
+def validate_stage2_config() -> list[str]:
+    """Повертає список попереджень щодо можливих конфліктів конфігурації Stage2‑lite.
+
+    Без побічних ефектів: нічого не змінює, лише аналізує поточні прапори/профілі.
+    Мета — допомогти уникнути накладання профілів і джерел порогів.
+
+    Перевірки (best‑effort):
+    - Якщо STAGE2_PROFILE не "strict" при STAGE2_ENABLED=True — попередження.
+    - Якщо ввімкнено YAML‑джерело порогів і профіль YAML != STAGE2_PROFILE — попередження.
+    - Якщо PROFILE_ENGINE_ENABLED=True одночасно з YAML‑джерелом, але профілі не узгоджені — попередження.
+    - Якщо історичний STAGE2_QDE_ENABLED=True — попередження.
+    """
+    hints: list[str] = []
+    # Перевага config.config (run_window застосовує --set саме туди), фолбек — config.flags
+    try:
+        import config.config as _cfg
+
+        _S2_ON = bool(getattr(_cfg, "STAGE2_ENABLED", False))
+        _S2_PROFILE = str(getattr(_cfg, "STAGE2_PROFILE", "strict"))
+        _YAML_ON = bool(getattr(_cfg, "FEATURE_STAGE2_THRESHOLDS_YAML", False))
+        _YAML_PROFILE = str(
+            getattr(_cfg, "STAGE2_THRESHOLDS_YAML_PROFILE", _S2_PROFILE)
+        )
+        _PROF_ENGINE = bool(getattr(_cfg, "PROFILE_ENGINE_ENABLED", False))
+        _QDE_ON = bool(getattr(_cfg, "STAGE2_QDE_ENABLED", False))
+    except Exception:
+        try:
+            from config.flags import (
+                FEATURE_STAGE2_THRESHOLDS_YAML as _YAML_ON,
+                STAGE2_ENABLED as _S2_ON,
+                STAGE2_PROFILE as _S2_PROFILE,
+                STAGE2_THRESHOLDS_YAML_PROFILE as _YAML_PROFILE,
+                PROFILE_ENGINE_ENABLED as _PROF_ENGINE,
+            )
+
+            _QDE_ON = bool(globals().get("STAGE2_QDE_ENABLED", False))
+        except Exception:
+            # Якщо flags також недоступні у середовищі, повертаємо порожній список
+            return hints
+
+    # 1) Профіль strict як канон
+    if bool(_S2_ON) and str(_S2_PROFILE).lower() != "strict":
+        hints.append(
+            "Stage2-lite увімкнено, але STAGE2_PROFILE!='strict'. Рекомендовано strict як канон для signal_v2."
+        )
+
+    # 2) YAML пороги vs активний профіль
+    if bool(_YAML_ON):
+        if str(_YAML_PROFILE).lower() != str(_S2_PROFILE).lower():
+            hints.append(
+                "Увімкнено YAML-пороги, але STAGE2_THRESHOLDS_YAML_PROFILE не співпадає зі STAGE2_PROFILE — вирівняйте профілі."
+            )
+
+    # 3) Профільний двигун vs джерела порогів
+    if bool(_PROF_ENGINE) and bool(_YAML_ON):
+        if str(_YAML_PROFILE).lower() != str(_S2_PROFILE).lower():
+            hints.append(
+                "PROFILE_ENGINE_ENABLED=True разом із YAML-порогами різних профілів — можливе накладання. Уніфікуйте на один профіль."
+            )
+
+    # 4) Історичний QDE флаг
+    if bool(_QDE_ON):
+        hints.append(
+            "STAGE2_QDE_ENABLED=True — історичний режим; рекомендовано вимкнути."
+        )
+
+    return hints
+
+
 __all__ = [
+    "validate_stage2_config",
     "Stage2InsightConfig",
     "Stage2InsightFallbackConfig",
     "STAGE2_INSIGHT",

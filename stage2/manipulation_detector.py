@@ -38,7 +38,7 @@ from utils.utils import safe_float
 # ── Логування (RichHandler у stdout) ───────────────────────────────────────────
 logger = logging.getLogger("manipulation_detector")
 if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     # Пишемо у stdout, щоб tee у tools.run_window коректно дзеркалив у файл UTF-8
     logger.addHandler(RichHandler(console=Console(file=sys.stdout), show_path=True))
     logger.propagate = False

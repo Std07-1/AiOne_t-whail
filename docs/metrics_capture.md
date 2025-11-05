@@ -36,6 +36,14 @@
   Select-String -SimpleMatch -Pattern 'htf_strength{symbol=', 'presence{symbol=', 'ai_one_phase{phase=', 'ai_one_scn_reject_total{'
 ```
 
+Додаткові профільні метрики (за `PROM_GAUGES_ENABLED=true` і ввімкненим профільним двигуном):
+
+- `ai_one_profile_active{symbol,profile,market_class}` — one‑hot індикатор активного профілю.
+- `ai_one_profile_confidence{symbol}` — остання впевненість профілю (0..1).
+- `ai_one_profile_switch_total{from,to}` — лічильник перемикань профілю (очікувана частота ≤ 1 раз/30с).
+- `ai_one_profile_hint_emitted_total{dir}` — кількість емітованих хінтів за напрямом (`long`/`short`/`neutral`).
+- `ai_one_stage1_latency_ms{symbol}` — латентність гарячого шляху (ціль p95 ≤ 200 мс).
+
 ## Крок 3. Звіт якості (quality.csv)
 
 Після прогона згенеруйте звіт якості за останні N годин логів:

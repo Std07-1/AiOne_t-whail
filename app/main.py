@@ -116,6 +116,18 @@ if not logger.handlers:  # захист від повторної ініціал
     logger.addHandler(RichHandler(console=Console(file=sys.stdout), show_path=True))
     logger.propagate = False  # Не пропагувати далі, щоб уникнути дублювання логів
 
+# ───────────────────────────── Санітарна перевірка конфігурації Stage2‑lite ─────────
+try:
+    from config.config_stage2 import validate_stage2_config
+
+    _cfg_hints = validate_stage2_config()
+    for _h in _cfg_hints or []:
+        # Легкі попередження на старті процесу; не блокують запуск
+        logger.warning("[STRICT_SANITY] Stage2-lite config hint: %s", _h)
+except Exception:
+    # Best-effort: у середовищах без повного конфігу пропускаємо
+    pass
+
 
 # (FastAPI вилучено) — якщо потрібен REST інтерфейс у майбутньому,
 # повернемо створення app/router

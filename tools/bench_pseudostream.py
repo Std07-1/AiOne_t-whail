@@ -91,13 +91,18 @@ class BenchResult:
 
 
 async def _run_for_symbol(
-    symbol: str, *, limit: int, out_dir: Path, interval: str = "1m"
+    symbol: str,
+    *,
+    limit: int,
+    out_dir: Path,
+    interval: str = "1m",
+    source: str = "snapshot",
 ) -> BenchResult:
     dump_dir = out_dir / f"dump_{symbol.lower()}_{interval}_{limit}"
     cfg = ReplayConfig(
         symbol=symbol,
         interval=interval,
-        source="snapshot",
+        source=source,
         limit=limit,
         dump_dir=dump_dir,
     )
@@ -105,9 +110,19 @@ async def _run_for_symbol(
     try:
         stats = await run_replay(cfg)
     except FileNotFoundError:
-        # Фолбек на live Binance, якщо немає snapshot
-        cfg.source = "binance"
-        stats = await run_replay(cfg)
+        # Якщо обрали snapshot, але його немає — фолбек на live Binance
+        if source == "snapshot":
+            cfg.source = "binance"
+            stats = await run_replay(cfg)
+        else:
+            raise
+    except Exception:
+        # Якщо обрали binance і сталася помилка мережі — спробуємо snapshot як бекап
+        if source == "binance":
+            cfg.source = "snapshot"
+            stats = await run_replay(cfg)
+        else:
+            raise
     dt = time.perf_counter() - t0
     # зчитати stage1_events.jsonl для оцінки підказок
     s1e = _read_jsonl(dump_dir / "stage1_events.jsonl")
@@ -206,7 +221,11 @@ async def _amain(args: argparse.Namespace) -> int:
     results: list[BenchResult] = []
     for s in symbols:
         res = await _run_for_symbol(
-            s, limit=int(args.limit), out_dir=out_dir, interval=str(args.interval)
+            s,
+            limit=int(args.limit),
+            out_dir=out_dir,
+            interval=str(args.interval),
+            source=str(args.source),
         )
         results.append(res)
     # Загальний JSON

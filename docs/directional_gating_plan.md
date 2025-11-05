@@ -56,7 +56,7 @@
 ## 6. Інтеграційні точки
 
 - Stage1: `asset_monitoring.py` — обчислення вікон/метрик; `breakout_level_trigger.py` — доповнення `stats` після формування сигналу.
-- Stage2: `processor.py` — вставка directional gating/re‑weighting перед фінальним `recommendation`; `qde_core.py` — поверхневі хуки для `dir_score` (без зміни API); серіалізація нових полів у `confidence_metrics`/`market_context`.
+- Stage2: `processor.py` — вставка directional gating/re‑weighting перед фінальним `recommendation`; серіалізація нових полів у `confidence_metrics`/`market_context`.
 - Stage3: `open_trades.py` / `trade_manager.py` — `pre-open guard`.
 
 ## 7. Параметри за замовчуванням (у config)

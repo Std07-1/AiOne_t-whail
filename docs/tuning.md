@@ -162,7 +162,7 @@ C:\Users\vikto\Desktop\AiOne_t_v2-main\venv\Scripts\python.exe -m tools.analyze_
 
 ## NEW • Нормалізація *_IN_* у підтриману стратегію виконання
 
-Сигнали `BUY_IN_DIPS` / `SELL_ON_RALLIES` мапляться на ф’ючерсну стратегію виконання `momentum_pullback`.
+Сигнали типу "pullback" мапляться на ф’ючерсну стратегію виконання `momentum_pullback`.
 
 - Якщо селектор стратегії не задав `market_context.meta.strategy`, процесор встановлює fallback `"momentum_pullback"`.
 - Це значення дублюється у `trade_intent.hints.strategy` для Stage3, який підключає профіль з `STAGE3_STRATEGY_PROFILES`.

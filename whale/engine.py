@@ -3,7 +3,7 @@
 Призначення:
 - Централізує всю логіку розрахунку китових метрик (presence, whale_bias,
     dominance flags, vwap_deviation тощо).
-- Stage2/QDE не мають власної «китової» логіки; інтеграція відбувається через
+- Stage2 (історичний QDE) не мають власної «китової» логіки; інтеграція відбувається через
     цей модуль (див. Stage2TelemetryEnricher у `stage2/processor_v2/apply_telemetry_and_enrich.py`).
 
 Політики:

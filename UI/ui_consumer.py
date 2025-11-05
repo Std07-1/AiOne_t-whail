@@ -67,8 +67,19 @@ class UIConsumer:
         )  # кеш останнього непорожнього списку
         self._blink_state = False  # для миготіння pressure
         self._pressure_alert_active = False
-        # Пер-символьний трекінг останнього часу/ts для м'якого мерджу оновлень (уникаємо «звуження» списку)
-        self._sym_last_ts: dict[str, float] = {}
+
+    def _apply_assets_update(self, assets_field: Any) -> None:
+        """Застосувати оновлення assets за актуальною політикою.
+
+        Поточна політика: якщо assets — список, приймаємо як є;
+        інакше очищаємо поточні результати (display + last).
+        """
+        if isinstance(assets_field, list):
+            self._last_results = assets_field
+            self._display_results = assets_field
+        else:
+            self._last_results = []
+            self._display_results = []
 
     # self._last_core_refresh: float = 0.0  # видалено: Core/Health більше не використовуються
 
@@ -102,7 +113,7 @@ class UIConsumer:
 
     def _get_recommendation_icon(self, recommendation: str) -> str:
         icons = {
-            # Стара логіка STRONG_BUY/BUY_IN_DIPS видалена; актуальні значення нижче
+            # Актуальні значення нижче
             "SOFT_BUY": "🟢↑",
             "SOFT_SELL": "�↓",
             "HOLD": "🟡",
@@ -370,228 +381,8 @@ class UIConsumer:
                                     )
                             except Exception:
                                 pass
-                            parsed_assets = data.get("assets") or []
-                            if isinstance(parsed_assets, list) and parsed_assets:
-
-                                def _normalize_ts(value: Any) -> float:
-                                    if value is None:
-                                        return 0.0
-                                    if isinstance(value, (int, float)):
-                                        try:
-                                            return float(value)
-                                        except Exception:
-                                            return 0.0
-                                    if isinstance(value, str) and value.strip():
-                                        try:
-                                            return datetime.fromisoformat(
-                                                value.replace("Z", "+00:00")
-                                            ).timestamp()
-                                        except Exception:
-                                            try:
-                                                return float(value)
-                                            except Exception:
-                                                return 0.0
-                                    return 0.0
-
-                                dedup_rows: dict[str, dict[str, Any]] = {}
-                                for row in parsed_assets:
-                                    if not isinstance(row, dict):
-                                        continue
-                                    sym_raw = row.get("symbol")
-                                    sym_key = (
-                                        str(sym_raw).upper()
-                                        if sym_raw is not None
-                                        else ""
-                                    )
-                                    if not sym_key:
-                                        sym_key = f"__UNNAMED__{len(dedup_rows)}"
-                                    stats = (
-                                        row.get("stats")
-                                        if isinstance(row.get("stats"), dict)
-                                        else {}
-                                    )
-                                    ts_candidate = None
-                                    if isinstance(stats, dict):
-                                        for key in ("ts", "timestamp", "price_ts"):
-                                            if stats.get(key) is not None:
-                                                ts_candidate = stats.get(key)
-                                                break
-                                    if ts_candidate is None:
-                                        ts_candidate = row.get(
-                                            "last_update_ts"
-                                        ) or row.get("ts")
-                                    ts_value = _normalize_ts(ts_candidate)
-                                    price_candidate = None
-                                    if isinstance(stats, dict):
-                                        price_candidate = stats.get("current_price")
-                                    if price_candidate is None:
-                                        price_candidate = row.get("price")
-                                    has_price = False
-                                    try:
-                                        if isinstance(price_candidate, (int, float)):
-                                            has_price = float(price_candidate) > 0
-                                        elif (
-                                            isinstance(price_candidate, str)
-                                            and price_candidate.strip()
-                                        ):
-                                            has_price = float(price_candidate) > 0
-                                    except Exception:
-                                        has_price = False
-
-                                    existing = dedup_rows.get(sym_key)
-                                    if existing is None:
-                                        dedup_rows[sym_key] = {
-                                            "row": row,
-                                            "ts": ts_value,
-                                            "has_price": has_price,
-                                        }
-                                        continue
-
-                                    prev_has_price = bool(existing.get("has_price"))
-                                    prev_ts = float(existing.get("ts", 0.0) or 0.0)
-                                    keep_new = False
-                                    if has_price and not prev_has_price:
-                                        keep_new = True
-                                    elif (
-                                        has_price == prev_has_price
-                                        and ts_value > prev_ts
-                                    ):
-                                        keep_new = True
-
-                                    if keep_new:
-                                        existing.update(
-                                            {
-                                                "row": row,
-                                                "ts": ts_value,
-                                                "has_price": has_price,
-                                            }
-                                        )
-
-                                if dedup_rows:
-                                    parsed_assets = [
-                                        info["row"] for info in dedup_rows.values()
-                                    ]
-                            # Якщо прийшов порожній список, але вже маємо попередні
-                            # дані — ігноруємо очищення
-                            if not parsed_assets and self._display_results:
-                                ui_logger.debug(
-                                    "Ignore empty assets update; keeping %d cached rows",
-                                    len(self._display_results),
-                                )
-                            else:
-                                # М'який мердж: якщо прийшов підсписок символів, не «викидаємо» решту одразу,
-                                # а об'єднуємо з поточним кешем; за замовчуванням TTL для рядка — 30 секунд.
-                                ttl_sec = 30.0
-                                now_ts = time.time()
-                                try:
-                                    # Побудова мапи існуючих рядків
-                                    existing_map: dict[str, dict[str, Any]] = {}
-                                    if isinstance(self._display_results, list):
-                                        for row in self._display_results:
-                                            if isinstance(row, dict):
-                                                sym = str(
-                                                    row.get("symbol") or ""
-                                                ).upper()
-                                                if not sym:
-                                                    continue
-                                                # оцінюємо ts існуючого рядка
-                                                stats = (
-                                                    row.get("stats")
-                                                    if isinstance(
-                                                        row.get("stats"), dict
-                                                    )
-                                                    else {}
-                                                )
-                                                ts_candidate = None
-                                                if isinstance(stats, dict):
-                                                    for key in (
-                                                        "ts",
-                                                        "timestamp",
-                                                        "price_ts",
-                                                    ):
-                                                        if stats.get(key) is not None:
-                                                            ts_candidate = stats.get(
-                                                                key
-                                                            )
-                                                            break
-                                                if ts_candidate is None:
-                                                    ts_candidate = row.get(
-                                                        "last_update_ts"
-                                                    ) or row.get("ts")
-                                                ts_val = _normalize_ts(ts_candidate)
-                                                if ts_val > 0:
-                                                    self._sym_last_ts[sym] = max(
-                                                        self._sym_last_ts.get(sym, 0.0),
-                                                        ts_val,
-                                                    )
-                                                existing_map[sym] = row
-
-                                    # Побудова мапи нових рядків
-                                    new_map: dict[str, dict[str, Any]] = {}
-                                    if isinstance(parsed_assets, list):
-                                        for row in parsed_assets:
-                                            if isinstance(row, dict):
-                                                sym = str(
-                                                    row.get("symbol") or ""
-                                                ).upper()
-                                                if not sym:
-                                                    continue
-                                                stats = (
-                                                    row.get("stats")
-                                                    if isinstance(
-                                                        row.get("stats"), dict
-                                                    )
-                                                    else {}
-                                                )
-                                                ts_candidate = None
-                                                if isinstance(stats, dict):
-                                                    for key in (
-                                                        "ts",
-                                                        "timestamp",
-                                                        "price_ts",
-                                                    ):
-                                                        if stats.get(key) is not None:
-                                                            ts_candidate = stats.get(
-                                                                key
-                                                            )
-                                                            break
-                                                if ts_candidate is None:
-                                                    ts_candidate = row.get(
-                                                        "last_update_ts"
-                                                    ) or row.get("ts")
-                                                ts_val = _normalize_ts(ts_candidate)
-                                                if ts_val > 0:
-                                                    self._sym_last_ts[sym] = max(
-                                                        self._sym_last_ts.get(sym, 0.0),
-                                                        ts_val,
-                                                    )
-                                                new_map[sym] = row
-
-                                    # Мердж: нові перекривають існуючі; зберігаємо існуючі, якщо не застаріли
-                                    merged: dict[str, dict[str, Any]] = dict(
-                                        existing_map
-                                    )
-                                    merged.update(new_map)
-                                    # Фільтр за TTL
-                                    pruned: list[dict[str, Any]] = []
-                                    for sym, row in merged.items():
-                                        last_ts = float(
-                                            self._sym_last_ts.get(sym) or 0.0
-                                        )
-                                        if last_ts <= 0:
-                                            pruned.append(row)
-                                        else:
-                                            if (now_ts - last_ts) <= ttl_sec:
-                                                pruned.append(row)
-
-                                    self._last_results = pruned
-                                    if pruned:
-                                        self._display_results = pruned
-                                except Exception:
-                                    # Фолбек: у разі помилки — старе поводження (повна заміна)
-                                    self._last_results = parsed_assets
-                                    if parsed_assets:
-                                        self._display_results = parsed_assets
+                            parsed_assets = data.get("assets")
+                            self._apply_assets_update(parsed_assets)
                             # meta.ts → час оновлення
                             meta_obj = data.get("meta", {}) or {}
                             meta_ts = meta_obj.get("ts")
@@ -910,7 +701,7 @@ class UIConsumer:
             except Exception:
                 trail_summary_fragment = ""
 
-        # Видалено: Stage2 (QDE) counters з Redis (scenario/recommendation)
+        # Видалено: Stage2 counters з Redis (scenario/recommendation)
         # UI більше не відображає ці фрагменти; логіку зібрано у Publisher
 
         # Stage3 блокування з counters снапшоту (якщо доступні)

@@ -55,6 +55,8 @@ else:
 from rich.console import Console
 from rich.logging import RichHandler
 
+from .supply_demand_zones import SupplyDemandZones as _SupplyDemandZones
+
 logger = logging.getLogger("whale_detection")
 if not logger.handlers:  # guard
     logger.setLevel(logging.DEBUG)
@@ -312,7 +314,7 @@ class BlockTradeAnalyzer:
         return float(total)
 
 
-class SupplyDemandZones:
+class _DeprecatedSupplyDemandZones:
     """Визначення зон попиту/пропозиції (каркас) з детальним логуванням.
 
     Призначення:
@@ -387,7 +389,8 @@ class SupplyDemandZones:
                 - key_levels_enriched: dict як key_levels, але збагачений volume для зон (dict із ключами {low, high, volume})
                 - probable_targets: list[float]
                 - risk_levels: dict з оцінками якості зон (0..1)
-        """
+    """
+
     def identify_institutional_levels(
         self, historical_data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -549,43 +552,6 @@ class SupplyDemandZones:
             return zones
         except Exception as exc:  # pragma: no cover
             logger.exception("find_accumulation_zones: помилка під час пошуку: %s", exc)
-            return []
-
-        try:
-            try:
-                window = int(ZONE_WINDOW_SHORT or 10)
-            except Exception:
-                window = 10
-            window = max(3, window)
-            stride = max(1, window // 2)
-            zones_raw: list[tuple[float, float]] = []
-            avg_vol = (sum(vols) / len(vols)) if vols else 0.0
-            for i in range(0, max(1, len(prices) - window + 1), stride):
-                segment = prices[i : i + window]
-                if len(segment) < 3:
-                    continue
-                seg_vol = sum(vols[i : i + window]) if vols else 0.0
-                seg_mean = sum(segment) / len(segment)
-                price_range = max(segment) - min(segment)
-                rel_amp = (price_range / seg_mean) if seg_mean > 0 else 0.0
-                if rel_amp >= 0.008 and seg_vol >= avg_vol:
-                    low, high = float(min(segment)), float(max(segment))
-                    zones_raw.append((low, high))
-
-            zones: list[tuple[float, float]] = []
-            for lo, hi in sorted(zones_raw):
-                if not zones:
-                    zones.append((lo, hi))
-                    continue
-                plo, phi = zones[-1]
-                if lo <= phi * 1.001:
-                    zones[-1] = (min(plo, lo), max(phi, hi))
-                else:
-                    zones.append((lo, hi))
-            logger.info("find_distribution_zones: знайдено %d зон", len(zones))
-            return zones
-        except Exception as exc:  # pragma: no cover
-            logger.exception("find_distribution_zones: помилка під час пошуку: %s", exc)
             return []
 
     def identify_stop_hunt_zones(
@@ -844,3 +810,8 @@ class SupplyDemandZones:
                 "assess_zone_quality: помилка при оцінці якості зон: %s", exc
             )
             return {"accumulation": 0.0, "distribution": 0.0, "risk_from_zones": 1.0}
+
+
+# Backward-compat: експортуємо канонічну реалізацію як SupplyDemandZones
+# Єдиним джерелом істини має бути whale/supply_demand_zones.py
+SupplyDemandZones = _SupplyDemandZones

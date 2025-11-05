@@ -256,3 +256,23 @@ class InstitutionalEntryMethods:
         except Exception as exc:
             logger.exception("detect_iceberg_orders: помилка під час аналізу: %s", exc)
             return False
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # Легкий експорт прапорців alt‑confirm з результатів IEM (без I/O)
+    def alt_flags_from_iem(data: dict[str, Any] | None) -> dict[str, bool]:
+        """Мапить результат detect_vwap_twap_strategies() у бінарні alt‑прапорці.
+
+        Ключі:
+            - iceberg: data["iceberg_orders"]
+            - vol_spike: TWAP/VWAP активність як проксі підтвердження обсягом
+
+        Примітка: це легка евристика для телеметрії, не виконує жодних запитів/обчислень.
+        """
+        d = data or {}
+        iceberg = bool(d.get("iceberg_orders", False))
+        vol_spike = bool(
+            d.get("twap_accumulation", False)
+            or d.get("vwap_buying", False)
+            or d.get("vwap_selling", False)
+        )
+        return {"iceberg": iceberg, "vol_spike": vol_spike, "zones_dist": False}

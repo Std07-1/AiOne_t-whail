@@ -21,6 +21,12 @@
 - Пайплайн Stage1 → Stage2 → Stage3 та телеметрія описані у `docs/ARCHITECTURE.md`.
 - Контракти даних стабільні; нові поля — тільки у `market_context.meta.*`.
 
+### Профільний двигун (T0)
+- Увімкнення: `PROFILE_ENGINE_ENABLED=true` (без зміни контрактів — хінт у `stats.stage2_hint`).
+- Гейтинг і стабілізація: `require_dominance`, `alt_confirm_min`, гістерезис, кулдаун (best‑effort Redis TTL≈120с).
+- Профіль у meta: `market_context.meta.profile = {name, conf, k_range}`; у reasons — компактні коди `profile=...,dom_ok,alt_ok,hysteresis,cooldown,stale`.
+- Пер‑класне масштабування `score`: BTC=1.0, ETH=0.95, ALTS=0.85. Метрики див. `docs/metrics_capture.md`.
+
 ## Телеметрія й реплей
 - Аналізатор телеметрії: `docs/TELEMETRY.md`.
 - Історичний реплей і KPI: `docs/README_historical_replay.md`.

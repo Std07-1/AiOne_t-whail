@@ -34,6 +34,15 @@
   - `INSIGHT_LAYER_ENABLED`, `PROCESSOR_INSIGHT_WIREUP` — дозволи на інсайт‑шар та відповідну маршрутизацію.
   - Нотатка: «soft» рекомендації/сигнали формуються тонким адаптером поверх `whale.insight_builder` без дублювання логіки. Усі пороги/ваги беруться з конфігів (див. `config/config_whale.py`). Rollback = вимкнути відповідні фіче‑флаги — контракти не змінюються.
 
+- Profile Engine v2 (T0):
+  - `PROFILE_ENGINE_ENABLED` — вмикає профільні сигнали у Stage2‑lite під телеметрійний хінт `stats.stage2_hint` (контракти незмінні).
+  - Семантика (коротко): `require_dominance`, `alt_confirm_min`, `hysteresis`, `cooldown`, `atr_scale`, `k_range(meta)`.
+  - Причини у `reasons`: компактні коди `profile=...,dom_ok=0/1,alt_ok=0/1,hysteresis=0/1,cooldown=0/1,stale=0/1` + базові `presence_ok,bias_ok,vwap_dev_ok`.
+  - Персист кулдауну (необовʼязково): `ai_one:ctx:{symbol}:cooldown` TTL≈120 с, best‑effort.
+  - Пер‑класне масштабування `score` (консервативніше для ALTS): BTC=1.0, ETH=0.95, ALTS=0.85.
+  - Метрики Prometheus (best‑effort): `ai_one_profile_active{symbol,profile,market_class}`, `ai_one_profile_confidence{symbol}`,
+    `ai_one_profile_switch_total{from,to}`, `ai_one_profile_hint_emitted_total{dir}`.
+
 ## Rollback
 - Вимкніть відповідний прапор у `config/flags.py` — вплив зникне негайно, без зміни кодової бази.
 - Для телеметрійних інсайтів (напр., `quiet_mode`) — відсутність поля в UI означає «неактивно/вимкнено».

@@ -27,3 +27,28 @@
 - Єдиний /metrics експортер — у пайплайні; паблішери не стартують HTTP.
 - Продуктивність — без регресії; логи explain рейт‑обмежені та безпечні.
 - Всі зміни підлягають вимкненню прапорами (rollback‑friendly).
+
+---
+
+# Профільний двигун (T0) — 2025-11-05
+
+Мета: керовані профільні сигнали в Stage2‑lite без зміни контрактів, під фіче‑флагом.
+
+## Нове
+
+- Прапор `PROFILE_ENGINE_ENABLED` — вмикає телеметрійні Stage2‑хінти на базі профілів (контракти стабільні).
+- Гейтинг: `require_dominance`, `alt_confirm_min`, `hysteresis`, `cooldown`, `atr_scale`; у `market_context.meta.profile` зберігаємо `name`, `conf`, `k_range`.
+- Dedup alt‑прапорців: обʼєднання з кількох джерел у множину; `alt_confirms_count=len(set)`.
+- Причини у hint: компактні коди `profile=...,dom_ok=0/1,alt_ok=0/1,hysteresis=0/1,cooldown=0/1,stale=0/1` + базові `presence_ok,bias_ok,vwap_dev_ok`.
+- Персист кулдауну (best‑effort): `ai_one:ctx:{symbol}:cooldown` із TTL≈120 с; фолбек — ін‑меморі.
+- Пер‑класне масштабування `score`: BTC=1.0, ETH=0.95, ALTS=0.85.
+- Метрики Prometheus: `ai_one_profile_active{symbol,profile,market_class}`, `ai_one_profile_confidence{symbol}`, `ai_one_profile_switch_total{from,to}`, `ai_one_profile_hint_emitted_total{dir}`; а також `ai_one_stage1_latency_ms` для латентності.
+
+## Документація
+
+- Оновлено: `docs/FEATURE_FLAGS.md`, `docs/REDIS_KEYS.md`, `docs/metrics_capture.md`, `docs/ui_payload_schema_v2.md`.
+
+## Примітки
+
+- Контракти Stage1/Stage2/Stage3 не змінено — усі нові дані лише у `market_context.meta.*` і телеметрії.
+- Усі write‑/read‑операції Redis для кулдаунів — best‑effort; збої не впливають на гарячий шлях.

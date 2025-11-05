@@ -65,7 +65,7 @@
 3) `MultiTimeframeTrend.calculate_trend_confluence()`
 4) `detect_volatility_regime()`
 5) `CrisisModeManager.activate_crisis_mode()` + (опційно) `DynamicRiskManager.adjust_parameters_crisis()`
-6) QDE/фаза/стратегія (поточний пайплайн) з умовним перекиданням у кризові профілі
+6) Фаза/стратегія (поточний пайплайн) з умовним перекиданням у кризові профілі
 
 Гейти: при `crisis_mode=True` допустиме тимчасове послаблення `low_rr_stage2`/`low_atr_ratio`/`proxy_volz_policy` (лише за фіче‑флагами).
 

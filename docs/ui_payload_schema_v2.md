@@ -10,8 +10,6 @@
 - type: рядок (назва каналу)
 - meta: { ts: ISO8601Z, seq: int, schema_version: "v2" }
 - counters: агрегати (alerts, active_trades, системні метрики тощо)
-- analytics: узагальнення по вибірці (band%, dist_to_edge, low_volatility тощо)
-- confidence_stats: перцентилі довіри (best‑effort)
 - assets: список активів (див. нижче)
 
 ## Актив (assets[])

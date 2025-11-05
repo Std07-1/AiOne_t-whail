@@ -29,7 +29,6 @@ import hashlib
 import json
 import logging
 import time
-from collections import Counter
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -230,19 +229,12 @@ async def publish_full_state(
             all_assets = [entry["asset"] for entry in dedup_assets.values()]
 
         serialized_assets: list[dict[str, Any]] = []
-        band_samples: list[float] = []
-        dist_edge_samples: list[float] = []
-        edge_ratio_samples: list[float] = []
-        low_gate_samples: list[float] = []
-        atr_meta_samples: list[float] = []
-        atr_vs_low_gate_samples: list[float] = []
-        near_edge_counter: Counter[str] = Counter()
-        near_edge_alerts = 0
-        near_edge_total = 0
-        within_true = 0
-        within_false = 0
-        low_vol_assets = 0
-        low_vol_alerts = 0
+        stage3_rr_samples: list[float] = []
+        stage3_unrealized_samples: list[float] = []
+        stage3_mfe_samples: list[float] = []
+        stage3_mae_samples: list[float] = []
+        stage3_trail_armed = 0
+        stage3_trail_total = 0
 
         # Попередньо завантажимо core:trades для TP/SL таргетів (best-effort)
         core_stats: dict[str, Any] | None = None
@@ -307,13 +299,6 @@ async def publish_full_state(
                         telemetry_map[k.upper()] = v
         except Exception:
             telemetry_map = {}
-
-        stage3_rr_samples: list[float] = []
-        stage3_unrealized_samples: list[float] = []
-        stage3_mfe_samples: list[float] = []
-        stage3_mae_samples: list[float] = []
-        stage3_trail_armed = 0
-        stage3_trail_total = 0
 
         for asset in all_assets:
             # Захист: stats має бути dict
@@ -583,18 +568,13 @@ async def publish_full_state(
                 if isinstance(km, dict):
                     corridor_meta = km
 
-            signal_upper = str(asset.get("signal", "")).upper()
-            was_near_edge_asset = False
-
             low_gate_val = safe_float(meta.get("low_gate"))
             if low_gate_val is not None:
                 analytics_bucket["low_gate"] = low_gate_val
-                low_gate_samples.append(low_gate_val)
 
             atr_meta_val = safe_float(meta.get("atr_pct"))
             if atr_meta_val is not None:
                 analytics_bucket["atr_pct_stage2"] = atr_meta_val
-                atr_meta_samples.append(atr_meta_val)
 
             atr_vs_low_gate = None
             if (
@@ -604,31 +584,23 @@ async def publish_full_state(
             ):
                 atr_vs_low_gate = atr_meta_val / low_gate_val
                 analytics_bucket["atr_vs_low_gate_ratio"] = atr_vs_low_gate
-                atr_vs_low_gate_samples.append(atr_vs_low_gate)
 
             low_vol_flag: bool | None = None
             if atr_meta_val is not None and low_gate_val is not None:
                 low_vol_flag = atr_meta_val < low_gate_val
-                if low_vol_flag:
-                    low_vol_assets += 1
-                    if signal_upper.startswith("ALERT"):
-                        low_vol_alerts += 1
                 analytics_bucket["low_volatility_flag"] = low_vol_flag
 
             band_val = safe_float(corridor_meta.get("band_pct"))
             if band_val is not None:
                 analytics_bucket["corridor_band_pct"] = band_val
-                band_samples.append(band_val)
 
             dist_edge_pct = safe_float(corridor_meta.get("dist_to_edge_pct"))
             if dist_edge_pct is not None:
                 analytics_bucket["corridor_dist_to_edge_pct"] = dist_edge_pct
-                dist_edge_samples.append(dist_edge_pct)
 
             dist_edge_ratio = safe_float(corridor_meta.get("dist_to_edge_ratio"))
             if dist_edge_ratio is not None:
                 analytics_bucket["corridor_dist_to_edge_ratio"] = dist_edge_ratio
-                edge_ratio_samples.append(dist_edge_ratio)
 
             nearest_edge = corridor_meta.get("nearest_edge")
             if isinstance(nearest_edge, str):
@@ -637,27 +609,14 @@ async def publish_full_state(
             near_edge_val = corridor_meta.get("near_edge")
             if isinstance(near_edge_val, str):
                 analytics_bucket["corridor_near_edge"] = near_edge_val
-                near_edge_counter[near_edge_val] += 1
-                was_near_edge_asset = True
 
             is_near_edge = corridor_meta.get("is_near_edge")
             if isinstance(is_near_edge, bool):
                 analytics_bucket["corridor_is_near_edge"] = is_near_edge
-                if is_near_edge:
-                    was_near_edge_asset = True
 
             within_corridor = corridor_meta.get("within_corridor")
             if isinstance(within_corridor, bool):
                 analytics_bucket["corridor_within"] = within_corridor
-                if within_corridor:
-                    within_true += 1
-                else:
-                    within_false += 1
-
-            if was_near_edge_asset:
-                near_edge_total += 1
-                if signal_upper.startswith("ALERT"):
-                    near_edge_alerts += 1
 
             # ── Легка проєкція ключових метрик у корінь для UI колонок ──
             try:
@@ -912,122 +871,6 @@ async def publish_full_state(
 
             serialized_assets.append(asset)
 
-        analytics_summary: dict[str, Any] = {}
-        total_assets = len(serialized_assets)
-        if band_samples:
-            analytics_summary["corridor_band_pct"] = {
-                "avg": round(sum(band_samples) / len(band_samples), 5),
-                "min": round(min(band_samples), 5),
-                "max": round(max(band_samples), 5),
-                "count": len(band_samples),
-            }
-        if dist_edge_samples:
-            analytics_summary["corridor_dist_to_edge_pct"] = {
-                "avg": round(sum(dist_edge_samples) / len(dist_edge_samples), 5),
-                "min": round(min(dist_edge_samples), 5),
-                "max": round(max(dist_edge_samples), 5),
-                "count": len(dist_edge_samples),
-            }
-        if edge_ratio_samples:
-            analytics_summary["corridor_dist_to_edge_ratio"] = {
-                "avg": round(sum(edge_ratio_samples) / len(edge_ratio_samples), 5),
-                "min": round(min(edge_ratio_samples), 5),
-                "max": round(max(edge_ratio_samples), 5),
-                "count": len(edge_ratio_samples),
-            }
-        if low_gate_samples:
-            analytics_summary["low_gate"] = {
-                "avg": round(sum(low_gate_samples) / len(low_gate_samples), 5),
-                "min": round(min(low_gate_samples), 5),
-                "max": round(max(low_gate_samples), 5),
-                "count": len(low_gate_samples),
-            }
-        if atr_meta_samples:
-            analytics_summary["atr_pct_stage2"] = {
-                "avg": round(sum(atr_meta_samples) / len(atr_meta_samples), 5),
-                "min": round(min(atr_meta_samples), 5),
-                "max": round(max(atr_meta_samples), 5),
-                "count": len(atr_meta_samples),
-            }
-        if atr_vs_low_gate_samples:
-            analytics_summary["atr_vs_low_gate_ratio"] = {
-                "avg": round(
-                    sum(atr_vs_low_gate_samples) / len(atr_vs_low_gate_samples), 5
-                ),
-                "min": round(min(atr_vs_low_gate_samples), 5),
-                "max": round(max(atr_vs_low_gate_samples), 5),
-                "count": len(atr_vs_low_gate_samples),
-            }
-        if near_edge_counter:
-            analytics_summary["near_edge_counts"] = dict(near_edge_counter)
-        if near_edge_total:
-            analytics_summary["near_edge_assets"] = int(near_edge_total)
-            if total_assets:
-                analytics_summary["near_edge_assets_share"] = round(
-                    near_edge_total / total_assets, 3
-                )
-        if near_edge_alerts:
-            analytics_summary["near_edge_alerts"] = int(near_edge_alerts)
-        if within_true or within_false:
-            analytics_summary["within_corridor"] = {
-                "true": int(within_true),
-                "false": int(within_false),
-            }
-        if low_vol_assets or low_vol_alerts:
-            summary_block: dict[str, float | int] = {
-                "assets": int(low_vol_assets),
-            }
-            if total_assets:
-                summary_block["assets_share"] = round(low_vol_assets / total_assets, 3)
-            if low_vol_alerts:
-                summary_block["alerts"] = int(low_vol_alerts)
-            analytics_summary["low_volatility"] = summary_block
-
-        if telemetry_map:
-            stage3_summary: dict[str, Any] = {"active": int(len(telemetry_map))}
-            if stage3_rr_samples:
-                try:
-                    stage3_summary["rr_avg"] = round(
-                        sum(stage3_rr_samples) / len(stage3_rr_samples), 3
-                    )
-                    stage3_summary["rr_max"] = round(max(stage3_rr_samples), 3)
-                    stage3_summary["rr_min"] = round(min(stage3_rr_samples), 3)
-                except Exception:
-                    pass
-            if stage3_unrealized_samples:
-                try:
-                    stage3_summary["unrealized_avg"] = round(
-                        sum(stage3_unrealized_samples) / len(stage3_unrealized_samples),
-                        3,
-                    )
-                    stage3_summary["unrealized_max"] = round(
-                        max(stage3_unrealized_samples), 3
-                    )
-                    stage3_summary["unrealized_min"] = round(
-                        min(stage3_unrealized_samples), 3
-                    )
-                except Exception:
-                    pass
-            if stage3_mfe_samples:
-                try:
-                    stage3_summary["mfe_avg"] = round(
-                        sum(stage3_mfe_samples) / len(stage3_mfe_samples), 3
-                    )
-                except Exception:
-                    pass
-            if stage3_mae_samples:
-                try:
-                    stage3_summary["mae_avg"] = round(
-                        sum(stage3_mae_samples) / len(stage3_mae_samples), 3
-                    )
-                except Exception:
-                    pass
-            if stage3_trail_total:
-                stage3_summary["trails_total"] = int(stage3_trail_total)
-                stage3_summary["trails_armed"] = int(stage3_trail_armed)
-            if stage3_summary:
-                analytics_summary["stage3"] = stage3_summary
-
         # counters для хедера (+ базові агрегати Stage3‑гейтів)
         alerts_list = [
             a
@@ -1234,36 +1077,6 @@ async def publish_full_state(
             counters["trails_total"] = int(stage3_trail_total)
             counters["trails_armed"] = int(stage3_trail_armed)
 
-        # Confidence перцентилі (best-effort) — окремо від counters (щоб counters залишались int-only для сумісності)
-        confidence_stats: dict[str, float] | None = None
-        try:
-            samples = getattr(state_manager, "conf_samples", [])
-            if isinstance(samples, list) and len(samples) >= 5:
-                import math
-
-                sorted_vals = [v for v in samples if isinstance(v, (int, float))]
-                sorted_vals.sort()
-                if sorted_vals:
-
-                    def _pct(p: float) -> float:
-                        k = (len(sorted_vals) - 1) * p
-                        f = math.floor(k)
-                        c = math.ceil(k)
-                        if f == c:
-                            return float(sorted_vals[int(k)])
-                        d0 = sorted_vals[f] * (c - k)
-                        d1 = sorted_vals[c] * (k - f)
-                        return float(d0 + d1)
-
-                    confidence_stats = {
-                        "p50": round(_pct(0.50), 3),
-                        "p75": round(_pct(0.75), 3),
-                        "p90": round(_pct(0.90), 3),
-                        "count": float(len(sorted_vals)),  # для дебагу/контексту
-                    }
-        except Exception:
-            confidence_stats = None
-
         # Нормалізуємо символи для UI (єдиний формат UPPER)
         for a in serialized_assets:
             if isinstance(a, dict) and "symbol" in a:
@@ -1286,10 +1099,6 @@ async def publish_full_state(
             "counters": counters,
             "assets": serialized_assets,
         }
-        if analytics_summary:
-            payload["analytics"] = analytics_summary
-        if confidence_stats:
-            payload["confidence_stats"] = confidence_stats
 
         try:
             if serialized_assets:

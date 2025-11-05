@@ -216,6 +216,7 @@ inc_liq_sweep_total = None  # type: ignore[assignment]
 inc_sweep_then_breakout = None  # type: ignore[assignment]
 inc_sweep_reject = None  # type: ignore[assignment]
 set_retest_ok = None  # type: ignore[assignment]
+record_stage1_latency_ms = None  # type: ignore[assignment]
 try:
     from config.config import PROM_GAUGES_ENABLED  # noqa: F401
 except Exception:  # pragma: no cover - захисний фолбек
@@ -384,6 +385,21 @@ else:
         except Exception:  # pragma: no cover - відсутній пакет або помилка імпорту
             # Залишаємо no-op
             pass
+
+# Латентність Stage1: експорт опційної функції спостереження гістограми
+try:
+    from config.config import PROM_GAUGES_ENABLED as _PROM_ENABLED  # type: ignore
+except Exception:
+    _PROM_ENABLED = True  # type: ignore[assignment]
+if _PROM_ENABLED:
+    try:
+        from telemetry.prom_gauges import (  # type: ignore
+            record_stage1_latency_ms as _rec_stage1_latency_ms,
+        )
+
+        record_stage1_latency_ms = _rec_stage1_latency_ms  # type: ignore[assignment]
+    except Exception:
+        record_stage1_latency_ms = None  # type: ignore[assignment]
 
 # Опційний JSONL‑дамп рішень (best‑effort)
 write_decision_trace = None  # type: ignore[assignment]
@@ -1001,7 +1017,16 @@ class ProcessAssetBatchv1:
                         last_ts_val = None
 
                 logger.debug("[STAGE1] %s: anomaly check", lower_symbol)
-                signal = await monitor.check_anomalies(symbol, df)
+                _t0_ms = time.perf_counter()
+                try:
+                    signal = await monitor.check_anomalies(symbol, df)
+                finally:
+                    try:
+                        if "record_stage1_latency_ms" in globals() and record_stage1_latency_ms is not None:  # type: ignore[name-defined]
+                            dt_ms = (time.perf_counter() - _t0_ms) * 1000.0
+                            record_stage1_latency_ms(float(dt_ms))  # type: ignore[misc]
+                    except Exception:
+                        pass
                 if not isinstance(signal, dict):
                     logger.warning("[STAGE1] %s: повернув не dict", lower_symbol)
                     signal = {"symbol": lower_symbol, "signal": "NONE", "stats": {}}
@@ -1517,6 +1542,7 @@ class ProcessAssetBatchv1:
                                     from config.config_whale_profiles import (
                                         market_class_for_symbol as _mc,
                                         get_profile_thresholds as _thr,
+                                        apply_symbol_overrides as _apply_thr_ov,
                                     )
                                     from whale.orderbook_analysis import (
                                         alt_flags_from_stats as _alt_from_stats,
@@ -1606,6 +1632,48 @@ class ProcessAssetBatchv1:
                                             vdev_min *= scale
                                         except Exception:
                                             pass
+                                    # ── HTF: alt_confirm_min полегшення при up+confluence для BTC/ETH ──
+                                    try:
+                                        from config.flags import HTF_CONTEXT_ENABLED as _HTF_ON  # type: ignore
+                                    except Exception:
+                                        _HTF_ON = False  # type: ignore[assignment]
+                                    last_h1 = None
+                                    try:
+                                        st_local = normalized.get("stats") or {}
+                                        for kk in ("h1", "agg_h1", "last_h1"):
+                                            v = (
+                                                (st_local.get("htf") or {}).get(kk)
+                                                if isinstance(st_local.get("htf"), dict)
+                                                else st_local.get(kk)
+                                            )
+                                            if isinstance(v, dict):
+                                                last_h1 = v
+                                                break
+                                    except Exception:
+                                        last_h1 = None
+                                    try:
+                                        if isinstance(thr, dict) and thr:
+                                            thr = _htf_adjust_alt_min(
+                                                mc, last_h1, thr, enabled=bool(_HTF_ON)
+                                            )
+                                    except Exception:
+                                        pass
+                                    # Символьні оверрайди профільних порогів (телеметрія‑only)
+                                    try:
+                                        thr2, _ov_applied = _apply_thr_ov(
+                                            thr if isinstance(thr, dict) else {},
+                                            lower_symbol,
+                                            str(profile_name or ""),
+                                        )
+                                        if isinstance(thr2, dict) and thr2:
+                                            thr = thr2
+                                        if _ov_applied:
+                                            try:
+                                                reasons_prof.append("override=1")  # type: ignore[arg-type]
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
                                     logger.info(
                                         "[PROFILE] %s profile=%s conf=%.2f | thr(p=%.2f b=%.2f v=%.3f dom=%s alt_min=%d cool=%ds) reasons=%s",
                                         lower_symbol,

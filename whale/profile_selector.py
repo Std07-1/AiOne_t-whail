@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Tuple, List
+from utils.utils import safe_float
 
 # Мінімальна інтеграція false_breakout (Stage A): pure‑виклик від stats
 try:
@@ -113,14 +114,6 @@ def apply_hysteresis(
     return new_profile
 
 
-def _safe_float(x: Any, default: float | None = None) -> float | None:
-    try:
-        v = float(x)
-        return v
-    except Exception:
-        return default
-
-
 def select_profile(
     stats: Mapping[str, Any] | None,
     whale: Mapping[str, Any] | None,
@@ -142,20 +135,20 @@ def select_profile(
         return ("range_fade", 0.5, ["no_whale"])
 
     # Безпечне зчитування базових метрик
-    bias = _safe_float(whale.get("bias"), 0.0) or 0.0
-    vdev = _safe_float(whale.get("vwap_dev"), 0.0) or 0.0
-    pres = _safe_float(whale.get("presence"), 0.0) or 0.0
-    band_pct = _safe_float((stats or {}).get("band_pct"), None)
+    bias = safe_float(whale.get("bias"), 0.0) or 0.0
+    vdev = safe_float(whale.get("vwap_dev"), 0.0) or 0.0
+    pres = safe_float(whale.get("presence"), 0.0) or 0.0
+    band_pct = safe_float((stats or {}).get("band_pct"), None)
     near_edge = (stats or {}).get("near_edge")
     near_upper = bool(near_edge is True or str(near_edge).lower() == "upper")
     near_lower = bool(near_edge is True or str(near_edge).lower() == "lower")
-    wick_u = _safe_float((stats or {}).get("wick_upper_q"), 0.0) or 0.0
-    wick_l = _safe_float((stats or {}).get("wick_lower_q"), 0.0) or 0.0
+    wick_u = safe_float((stats or {}).get("wick_upper_q"), 0.0) or 0.0
+    wick_l = safe_float((stats or {}).get("wick_lower_q"), 0.0) or 0.0
     acc_ok = bool((stats or {}).get("acceptance_ok", False))
     # slope_atr (за наявності) для діагностики невідповідностей edge/slope
-    slope = _safe_float((stats or {}).get("price_slope_atr"))
+    slope = safe_float((stats or {}).get("price_slope_atr"))
     if slope is None:
-        slope = _safe_float((stats or {}).get("slope_atr"))
+        slope = safe_float((stats or {}).get("slope_atr"))
 
     def _augment_mismatch(rs: List[str]) -> List[str]:
         try:
@@ -201,16 +194,16 @@ def select_profile(
         (thr_band or {}).get("max_pullback_in_band_ratio_max", 0.7) or 0.7
     )
     # Джерела band: atr_pct і tick із stats; база — остання ціна (stats.last_price/close)
-    atr_pct = _safe_float((stats or {}).get("atr_pct"), 0.01) or 0.01
+    atr_pct = safe_float((stats or {}).get("atr_pct"), 0.01) or 0.01
     tick = (
-        _safe_float((stats or {}).get("tick") or (stats or {}).get("tick_size"), 0.0001)
+        safe_float((stats or {}).get("tick") or (stats or {}).get("tick_size"), 0.0001)
         or 0.0001
     )
     base_price = (
-        _safe_float((stats or {}).get("last_price"))
-        or _safe_float((stats or {}).get("close"))
-        or _safe_float((stats or {}).get("price"))
-        or _safe_float((whale or {}).get("last_price"))
+        safe_float((stats or {}).get("last_price"))
+        or safe_float((stats or {}).get("close"))
+        or safe_float((stats or {}).get("price"))
+        or safe_float((whale or {}).get("last_price"))
         or 0.0
     ) or 0.0
     w = _band_width(float(atr_pct), float(tick), float(band_k))

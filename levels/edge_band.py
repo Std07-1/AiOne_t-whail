@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
-
-Bar = Dict[str, float]
+Bar = dict[str, float]
 
 
 def _sf(x: float | int | None, default: float = 0.0) -> float:
@@ -31,7 +29,7 @@ def band_width(atr_pct: float, tick: float, k: float) -> float:
     return float(max(0.0, w))
 
 
-def edge_features(bars: List[Bar], band: Tuple[float, float]) -> Dict[str, float]:
+def edge_features(bars: list[Bar], band: tuple[float, float]) -> dict[str, float]:
     """Оцінює прості фічі відносно band=(lo, hi) для останніх 15 барів.
 
     Повертає:

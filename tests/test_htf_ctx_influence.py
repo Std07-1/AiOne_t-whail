@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from context.htf_context import h1_ctx, d1_bias
+from context.htf_context import d1_bias, h1_ctx
 
 
 def test_alt_confirm_min_reduces_for_btc_eth_only(monkeypatch):

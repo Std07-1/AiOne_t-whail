@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Оркестратор нічного комплекту: запускає live‑вікно, паралельно скрейпить /metrics,
 а по завершенні формує пакет артефактів (quality, forward, summary, episodes index).
@@ -9,15 +7,14 @@ from __future__ import annotations
     --namespace ai_one_night --out-dir reports/night_pack
 """
 
+from __future__ import annotations
+
 import argparse
-import os
 import subprocess
 import sys
 import threading
-import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 
 def _append_metrics(
@@ -39,7 +36,7 @@ def _append_metrics(
         stop_flag.wait(interval_s)
 
 
-def _run_py_module(module: str, args: list[str], cwd: Optional[Path] = None) -> int:
+def _run_py_module(module: str, args: list[str], cwd: Path | None = None) -> int:
     cmd = [sys.executable, "-m", module] + args
     try:
         res = subprocess.run(cmd, cwd=str(cwd) if cwd else None)
@@ -188,13 +185,13 @@ def main() -> int:
         "\n",
         f"- Log: [{log_path.name}]({log_path.name})\n",
         f"- Metrics: [{metrics_path.name}]({metrics_path.name})\n",
-        f"- Quality CSV: [quality_night.csv](quality_night.csv)\n",
-        f"- Quality Snapshot: [quality_snapshot_night.md](quality_snapshot_night.md)\n",
-        f"- Forward: [forward_night.md](forward_night.md)\n",
-        f"- Summary: [night_summary.md](night_summary.md)\n",
+        "- Quality CSV: [quality_night.csv](quality_night.csv)\n",
+        "- Quality Snapshot: [quality_snapshot_night.md](quality_snapshot_night.md)\n",
+        "- Forward: [forward_night.md](forward_night.md)\n",
+        "- Summary: [night_summary.md](night_summary.md)\n",
     ]
     if (out_dir / "episodes_index.csv").exists():
-        readme.append(f"- Episodes Index: [episodes_index.csv](episodes_index.csv)\n")
+        readme.append("- Episodes Index: [episodes_index.csv](episodes_index.csv)\n")
     (out_dir / "README.md").write_text("".join(readme), encoding="utf-8")
 
     return 0

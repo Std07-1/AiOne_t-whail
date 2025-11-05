@@ -12,12 +12,13 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from config.config import (
-    INTERVAL_TTL_MAP,
+    CONTEXT_SNAPSHOTS_ENABLED,
     K_CUMULATIVE_DELTA,
     K_DIRECTIONAL_VOLUME_RATIO,
     K_PRICE_SLOPE_ATR,
     K_SIGNAL,
     K_STATS,
+    NAMESPACE,
     SCEN_EXPLAIN_ENABLED,  # type: ignore
     SCEN_EXPLAIN_VERBOSE_EVERY_N,  # type: ignore
     STAGE1_TRAP,
@@ -25,12 +26,9 @@ from config.config import (
     STAGE2_SIGNAL_V2_PROFILES,
     TELEM_ENRICH_PHASE_PAYLOAD,
 )
-from config.config_stage2 import STRONG_REGIME  # strict overrides/whitelist
+
+# strict overrides/whitelist were previously used for heavy-compute gating; now unused
 from config.flags import (
-    ENABLE_LEVEL_QUALITY_FILTER,
-    ENABLE_ORDERBOOK_DETECTORS,
-    ENABLE_WHALE_BEHAVIOR_PREDICTOR,
-    HEAVY_COMPUTE_GATING_ENABLED,
     ROUTER_ALERT_REQUIRE_DOMINANCE,
     SCENARIO_CANARY_PUBLISH_CANDIDATE,
     SCENARIO_TRACE_ENABLED,
@@ -50,9 +48,6 @@ from utils.utils import (
     normalize_result_types,
     sanitize_ohlcv_numeric,
 )
-from whale.institutional_entry_methods import InstitutionalEntryMethods
-from whale.supply_demand_zones import SupplyDemandZones
-from whale.whale_telemetry_scoring import WhaleTelemetryScoring
 
 from .asset_state_manager import AssetStateManager
 
@@ -263,13 +258,13 @@ else:
                 _inc_chop_hits_total = None  # type: ignore[assignment]
             try:
                 from telemetry.prom_gauges import (  # type: ignore
-                    inc_hypothesis_open as _inc_hyp_open,
-                )
-                from telemetry.prom_gauges import (  # type: ignore
                     inc_hypothesis_confirm as _inc_hyp_confirm,
                 )
                 from telemetry.prom_gauges import (  # type: ignore
                     inc_hypothesis_expired as _inc_hyp_expired,
+                )
+                from telemetry.prom_gauges import (  # type: ignore
+                    inc_hypothesis_open as _inc_hyp_open,
                 )
             except Exception:
                 _inc_hyp_open = None  # type: ignore[assignment]
@@ -348,17 +343,17 @@ else:
                 inc_hypothesis_expired = None  # type: ignore[assignment]
             # Профільні метрики
             try:
+                from telemetry.prom_gauges import (
+                    inc_profile_hint_emitted as _inc_profile_hint_emitted,
+                )
+                from telemetry.prom_gauges import (
+                    inc_profile_switch as _inc_profile_switch,
+                )
                 from telemetry.prom_gauges import (  # type: ignore
                     set_profile_active as _set_profile_active,
                 )
                 from telemetry.prom_gauges import (
                     set_profile_confidence as _set_profile_confidence,
-                )
-                from telemetry.prom_gauges import (
-                    inc_profile_switch as _inc_profile_switch,
-                )
-                from telemetry.prom_gauges import (
-                    inc_profile_hint_emitted as _inc_profile_hint_emitted,
                 )
 
                 # False breakout лічильник (опційно)
@@ -1122,170 +1117,11 @@ class ProcessAssetBatchv1:
                             sym_for_keys = str(symbol).upper()
                             w = await jget("whale", sym_for_keys, "1m", default=None)
                         if not isinstance(w, dict):
-                            logger.debug(
-                                "[STRICT_WHALE] %s: whale-метрики не знайдено в Redis, локальний fallback",
+                            logger.info(
+                                "[STRICT_WHALE] %s: whale-метрики не знайдено в Redis, очікуємо оновлення від воркера",
                                 lower_symbol,
                             )
-                            # Heavy-compute whitelist: дозволяємо локальний fallback лише за умов із конфіга
-                            hvy = (
-                                (STRONG_REGIME or {})
-                                .get("overrides", {})
-                                .get("heavy_compute_whitelist", {})
-                            )
-                            try:
-                                slope_atr_val = float(
-                                    (normalized.get("stats") or {}).get(
-                                        K_PRICE_SLOPE_ATR
-                                    )
-                                    or 0.0
-                                )
-                            except Exception:
-                                slope_atr_val = 0.0
-                            near_edge_flag = bool(
-                                (normalized.get("stats") or {}).get("near_edge")
-                                in (True, "upper", "lower")
-                            )
-                            slope_thr = float(hvy.get("slope_atr_min", 1.5))
-                            near_req = bool(hvy.get("near_edge_required", False))
-                            allowed = (slope_atr_val >= slope_thr) or (
-                                near_req and near_edge_flag
-                            )
-                            # Додатковий whitelist‑override за легкими умовами
-                            try:
-                                if HEAVY_COMPUTE_GATING_ENABLED and not allowed:
-                                    if _is_heavy_compute_override(
-                                        normalized.get("stats") or {}
-                                    ):
-                                        logger.info(
-                                            "[STRICT_SANITY] %s: heavy_compute override allow (near_edge, band_pct, dvr)",
-                                            lower_symbol,
-                                        )
-                                        allowed = True
-                            except Exception:
-                                pass
-                            if not allowed:
-                                logger.info(
-                                    "[STRICT_SANITY] %s: heavy_compute_whitelist skip (slope_atr=%.2f, near_edge=%s)",
-                                    lower_symbol,
-                                    slope_atr_val,
-                                    near_edge_flag,
-                                )
-                            else:
-                                detectors_requested = bool(
-                                    ENABLE_WHALE_BEHAVIOR_PREDICTOR
-                                    or ENABLE_ORDERBOOK_DETECTORS
-                                    or ENABLE_LEVEL_QUALITY_FILTER
-                                )
-                                if detectors_requested:
-                                    closes = list(df["close"].astype(float).tail(200))
-                                    vols = list(df["volume"].astype(float).tail(200))
-                                else:
-                                    closes = []
-                                    vols = []
-
-                                if detectors_requested and closes and vols:
-                                    strats: dict[str, Any] | None = None
-                                    if ENABLE_WHALE_BEHAVIOR_PREDICTOR:
-                                        iem = InstitutionalEntryMethods()
-                                        strats = iem.detect_vwap_twap_strategies(
-                                            closes, vols
-                                        )
-
-                                    zones: dict[str, Any] | None = None
-                                    if (
-                                        ENABLE_ORDERBOOK_DETECTORS
-                                        or ENABLE_LEVEL_QUALITY_FILTER
-                                    ):
-                                        sdz = SupplyDemandZones()
-                                        zones = sdz.identify_institutional_levels(
-                                            {"prices": closes, "volumes": vols}
-                                        )
-
-                                    presence = (
-                                        WhaleTelemetryScoring.presence_score_from(
-                                            (
-                                                strats
-                                                if isinstance(strats, dict)
-                                                else None
-                                            ),
-                                            zones,
-                                        )
-                                    )
-                                    vdev = (
-                                        strats.get("vwap_deviation")
-                                        if isinstance(strats, dict)
-                                        else None
-                                    )
-                                    bias = 0.0
-                                    if isinstance(vdev, (int, float)):
-                                        mag = min(1.0, abs(float(vdev)) / 0.02)
-                                        bias = mag if float(vdev) > 0 else -mag
-                                    key_levels = (zones or {}).get("key_levels") or {}
-                                    zones_summary = {
-                                        "accum_cnt": len(
-                                            key_levels.get("accumulation_zones", [])
-                                        ),
-                                        "dist_cnt": len(
-                                            key_levels.get("distribution_zones", [])
-                                        ),
-                                    }
-                                    w = {
-                                        "ts": int(time.time() * 1000),
-                                        "presence_score": presence,
-                                        "bias": bias,
-                                        "vwap_deviation": vdev,
-                                        "explain": {},
-                                        "zones": {
-                                            "accum": zones_summary["accum_cnt"],
-                                            "dist": zones_summary["dist_cnt"],
-                                        },
-                                    }
-                                    logger.info(
-                                        "[STRICT_WHALE] %s presence=%.3f bias=%.2f vwap_dev=%s zones=%s",
-                                        lower_symbol,
-                                        (
-                                            float(presence)
-                                            if isinstance(presence, (int, float))
-                                            else 0.0
-                                        ),
-                                        (
-                                            float(bias)
-                                            if isinstance(bias, (int, float))
-                                            else 0.0
-                                        ),
-                                        str(vdev),
-                                        zones_summary,
-                                    )
-                                    # Write-through cache to Redis with TTL to avoid recomputation within window
-                                    try:
-                                        jset = getattr(store.redis, "jset", None)
-                                        if callable(jset):
-                                            ttl_sec = int(
-                                                (INTERVAL_TTL_MAP or {}).get("1m", 180)
-                                            )
-                                            await jset(
-                                                "whale",
-                                                sym_for_keys,
-                                                "1m",
-                                                value=w,
-                                                ttl=ttl_sec,
-                                            )
-                                    except Exception:
-                                        logger.debug(
-                                            "[STRICT_WHALE] %s: не вдалося закешувати whale у Redis (write-through)",
-                                            lower_symbol,
-                                            exc_info=True,
-                                        )
-                                elif detectors_requested:
-                                    logger.debug(
-                                        "[STRICT_WHALE] %s: локальний fallback пропущено (недостатньо даних)",
-                                        lower_symbol,
-                                    )
-                                else:
-                                    logger.debug(
-                                        "[STRICT_WHALE] %s: локальний fallback вимкнено фіче-флагами",
-                                        lower_symbol,
-                                    )
+                            w = None
 
                         if isinstance(w, dict):
                             ts_ms = (
@@ -1524,31 +1360,40 @@ class ProcessAssetBatchv1:
                             k_range: tuple[int, int] | None = None
 
                             # Профільний двигун (телеметрія‑only, під фіче‑флагом), не змінює контракти
+                            _prof_enabled = False
                             try:
-                                from config.flags import (
-                                    PROFILE_ENGINE_ENABLED as _PROF_ENABLED,
+                                import config.flags as _flags  # type: ignore
+
+                                _prof_enabled = bool(
+                                    getattr(_flags, "PROFILE_ENGINE_ENABLED", False)
                                 )
                             except Exception:
-                                _PROF_ENABLED = False
+                                _prof_enabled = False
 
                             profile_name = None
                             profile_conf = None
-                            if _PROF_ENABLED:
+                            if _prof_enabled:
                                 try:
-                                    from whale.profile_selector import (
-                                        select_profile as _select_profile,
-                                        apply_hysteresis as _apply_hysteresis,
+                                    from config.config_whale_profiles import (
+                                        apply_symbol_overrides as _apply_thr_ov,
+                                    )
+                                    from config.config_whale_profiles import (
+                                        get_profile_thresholds as _thr,
                                     )
                                     from config.config_whale_profiles import (
                                         market_class_for_symbol as _mc,
-                                        get_profile_thresholds as _thr,
-                                        apply_symbol_overrides as _apply_thr_ov,
+                                    )
+                                    from whale.institutional_entry_methods import (
+                                        alt_flags_from_iem as _alt_from_iem,
                                     )
                                     from whale.orderbook_analysis import (
                                         alt_flags_from_stats as _alt_from_stats,
                                     )
-                                    from whale.institutional_entry_methods import (
-                                        alt_flags_from_iem as _alt_from_iem,
+                                    from whale.profile_selector import (
+                                        apply_hysteresis as _apply_hysteresis,
+                                    )
+                                    from whale.profile_selector import (
+                                        select_profile as _select_profile,
                                     )
 
                                     mc = _mc(lower_symbol)
@@ -1634,9 +1479,13 @@ class ProcessAssetBatchv1:
                                             pass
                                     # ── HTF: alt_confirm_min полегшення при up+confluence для BTC/ETH ──
                                     try:
-                                        from config.flags import HTF_CONTEXT_ENABLED as _HTF_ON  # type: ignore
+                                        from config.flags import (
+                                            HTF_CONTEXT_ENABLED,
+                                        )
+
+                                        _htf_on = HTF_CONTEXT_ENABLED
                                     except Exception:
-                                        _HTF_ON = False  # type: ignore[assignment]
+                                        _htf_on = False
                                     last_h1 = None
                                     try:
                                         st_local = normalized.get("stats") or {}
@@ -1654,7 +1503,7 @@ class ProcessAssetBatchv1:
                                     try:
                                         if isinstance(thr, dict) and thr:
                                             thr = _htf_adjust_alt_min(
-                                                mc, last_h1, thr, enabled=bool(_HTF_ON)
+                                                mc, last_h1, thr, enabled=bool(_htf_on)
                                             )
                                     except Exception:
                                         pass
@@ -1756,13 +1605,13 @@ class ProcessAssetBatchv1:
                             candidate_up = bias_f >= 0.0
                             dom_ok = True
                             if (
-                                _PROF_ENABLED
+                                _prof_enabled
                                 and isinstance(thr, dict)
                                 and bool(thr.get("require_dominance", False))
                             ):
                                 dom_ok = bool(dom_buy if candidate_up else dom_sell)
                             alt_ok = True
-                            if _PROF_ENABLED and isinstance(thr, dict):
+                            if _prof_enabled and isinstance(thr, dict):
                                 alt_ok = alt_confirms_count >= int(
                                     thr.get("alt_confirm_min", 0)
                                 )
@@ -1770,13 +1619,17 @@ class ProcessAssetBatchv1:
                             dir_hint: str | None = None
                             # ── HTF контекст (Stage C, опційно): BTC/ETH up+confluence → бонус до conf і полегшення alt_confirm_min ──
                             try:
-                                from config.flags import HTF_CONTEXT_ENABLED as _HTF_ON  # type: ignore
+                                from config.flags import (
+                                    HTF_CONTEXT_ENABLED as _HTF_ON,  # type: ignore
+                                )
                             except Exception:
-                                _HTF_ON = False  # type: ignore[assignment]
+                                _HTF_ON = False  # type: ignore[assignment]  # noqa: N806
                             htf_bonus_conf = 0.0
-                            if bool(_HTF_ON) and mc in ("BTC", "ETH"):
+                            if bool(_htf_on) and mc in ("BTC", "ETH"):
                                 try:
-                                    from context.htf_context import h1_ctx as _h1_ctx  # type: ignore
+                                    from context.htf_context import (
+                                        h1_ctx as _h1_ctx,  # type: ignore
+                                    )
                                 except Exception:
                                     _h1_ctx = None  # type: ignore[assignment]
                                 # Витягуємо last_h1 (гнучкі ключі)
@@ -2393,7 +2246,8 @@ class ProcessAssetBatchv1:
                         symbol=lower_symbol,
                         low_gate_effective=low_gate_eff,
                     )
-                    # Публікація bias_state (−1/0/+1) на кожному батчі — незалежно від того,
+                    # Публікація bias_state (−1/0/+1) на кожному батчі — єдине місце,
+                    # де ми оновлюємо market_context.meta та Prometheus незалежно від того,
                     # чи було 'phase' у stats раніше
                     try:
                         cd_val = float(
@@ -2447,10 +2301,6 @@ class ProcessAssetBatchv1:
                             )
                             # ── Контекст: оновити пам'ять та експорт ─────────────
                             try:
-                                from config.config import (  # type: ignore  # noqa: E402
-                                    CONTEXT_SNAPSHOTS_ENABLED,
-                                    NAMESPACE,
-                                )
                                 from config.keys import (
                                     build_key,  # type: ignore  # noqa: E402
                                 )
@@ -2525,42 +2375,8 @@ class ProcessAssetBatchv1:
                                     ).setdefault("meta", {})["structure"] = st_map
                                 except Exception:
                                     pass
-                                # Bias-state із cd/slope_atr (−1/0/+1) → meta + Prometheus
-                                try:
-                                    cd_val = float(
-                                        (stats_for_phase or {}).get(K_CUMULATIVE_DELTA)
-                                        or (stats_for_phase or {}).get(
-                                            "cumulative_delta"
-                                        )
-                                        or 0.0
-                                    )
-                                except Exception:
-                                    cd_val = 0.0
-                                try:
-                                    slope_val = float(
-                                        (stats_for_phase or {}).get(K_PRICE_SLOPE_ATR)
-                                        or (stats_for_phase or {}).get(
-                                            "price_slope_atr"
-                                        )
-                                        or 0.0
-                                    )
-                                except Exception:
-                                    slope_val = 0.0
-                                bias_state_val = 0
-                                if cd_val >= 0.35 and slope_val >= 0.8:
-                                    bias_state_val = 1
-                                elif cd_val <= -0.35 and slope_val <= -0.8:
-                                    bias_state_val = -1
-                                try:
-                                    normalized.setdefault(
-                                        "market_context", {}
-                                    ).setdefault("meta", {})["bias_state"] = int(
-                                        bias_state_val
-                                    )
-                                    if callable(set_bias_state):  # type: ignore[name-defined]
-                                        set_bias_state(symbol.upper(), int(bias_state_val))  # type: ignore[misc]
-                                except Exception:
-                                    pass
+                                # bias_state вже виставлено вище (meta + Prometheus);
+                                # тут залишаємо лише контекстні метрики без дублювання.
                                 # Prometheus (опційно)
                                 try:
                                     if callable(set_context_near_edge_persist):  # type: ignore[name-defined]

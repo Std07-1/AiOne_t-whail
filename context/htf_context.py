@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 
 def _sf(x: Any, default: float = 0.0) -> float:

@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Tuple, List
+from collections.abc import Mapping
+from typing import Any
+
 from utils.utils import safe_float
 
 # Мінімальна інтеграція false_breakout (Stage A): pure‑виклик від stats
@@ -51,6 +53,8 @@ try:
     from config.config_whale_profiles import get_profile_thresholds as _get_thr
     from levels.edge_band import (
         band_width as _band_width,
+    )
+    from levels.edge_band import (
         edge_features as _edge_features,
     )
 except Exception:  # pragma: no cover - fallbacks
@@ -66,7 +70,7 @@ except Exception:  # pragma: no cover - fallbacks
         except Exception:
             return 0.0
 
-    def _edge_features(_bars: List[Mapping[str, Any]], _band: Tuple[float, float]) -> Mapping[str, float]:  # type: ignore
+    def _edge_features(_bars: list[Mapping[str, Any]], _band: tuple[float, float]) -> Mapping[str, float]:  # type: ignore
         return {
             "edge_hits": 0.0,
             "accept_in_band": 0.0,
@@ -118,7 +122,7 @@ def select_profile(
     stats: Mapping[str, Any] | None,
     whale: Mapping[str, Any] | None,
     symbol: str,
-) -> Tuple[str, float, List[str]]:
+) -> tuple[str, float, list[str]]:
     """Вибір профілю за евристиками без I/O.
 
     Єдиний контракт: працюємо на доступних у stats/whale полях, уникаємо падінь.
@@ -130,7 +134,7 @@ def select_profile(
       - down_trend: dominance.sell & bias<0 & vdev<0
       - grab_lower: великий нижній хвіст (wick_lower_q ≥ 0.8), слабка акцептація
     """
-    reasons: List[str] = []
+    reasons: list[str] = []
     if not isinstance(whale, Mapping):
         return ("range_fade", 0.5, ["no_whale"])
 
@@ -150,7 +154,7 @@ def select_profile(
     if slope is None:
         slope = safe_float((stats or {}).get("slope_atr"))
 
-    def _augment_mismatch(rs: List[str]) -> List[str]:
+    def _augment_mismatch(rs: list[str]) -> list[str]:
         try:
             s_abs = abs(float(slope)) if isinstance(slope, (int, float)) else None
             is_edge = bool(near_upper or near_lower)

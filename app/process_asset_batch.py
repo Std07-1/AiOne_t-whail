@@ -598,6 +598,41 @@ def _emit_prom_presence(stats_for_phase: dict[str, Any], symbol: str) -> bool:
     return False
 
 
+# ── HTF influence helper (Stage C, pure) ─────────────────────────────────────
+def _htf_adjust_alt_min(
+    market_class: str,
+    last_h1: dict[str, Any] | None,
+    thr: dict[str, Any] | None,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Зменшує alt_confirm_min на 1 (мінімум 1) для BTC/ETH при h1 up+confluence.
+
+    Без побічних ефектів: повертає копію thr або {}.
+    """
+    try:
+        if not (enabled and market_class in ("BTC", "ETH") and isinstance(thr, dict)):
+            return dict(thr or {})
+        try:
+            from context.htf_context import h1_ctx as _h1_ctx  # type: ignore
+        except Exception:
+            return dict(thr or {})
+        if not isinstance(last_h1, dict):
+            return dict(thr or {})
+        try:
+            trend, conf = _h1_ctx(last_h1)
+        except Exception:
+            trend, conf = ("unknown", False)
+        if trend == "up" and bool(conf):
+            out = dict(thr or {})
+            base = int(out.get("alt_confirm_min", 0) or 0)
+            out["alt_confirm_min"] = max(1, base - 1)
+            return out
+        return dict(thr or {})
+    except Exception:
+        return dict(thr or {})
+
+
 def _compute_ctx_persist(
     buf: list[dict[str, Any]] | deque[dict[str, Any]], pres_thr: float
 ) -> tuple[float | None, float | None]:
@@ -1665,6 +1700,44 @@ class ProcessAssetBatchv1:
                                 )
 
                             dir_hint: str | None = None
+                            # ── HTF контекст (Stage C, опційно): BTC/ETH up+confluence → бонус до conf і полегшення alt_confirm_min ──
+                            try:
+                                from config.flags import HTF_CONTEXT_ENABLED as _HTF_ON  # type: ignore
+                            except Exception:
+                                _HTF_ON = False  # type: ignore[assignment]
+                            htf_bonus_conf = 0.0
+                            if bool(_HTF_ON) and mc in ("BTC", "ETH"):
+                                try:
+                                    from context.htf_context import h1_ctx as _h1_ctx  # type: ignore
+                                except Exception:
+                                    _h1_ctx = None  # type: ignore[assignment]
+                                # Витягуємо last_h1 (гнучкі ключі)
+                                last_h1 = None
+                                try:
+                                    st_local = normalized.get("stats") or {}
+                                    for kk in ("h1", "agg_h1", "last_h1"):
+                                        v = (
+                                            (st_local.get("htf") or {}).get(kk)
+                                            if isinstance(st_local.get("htf"), dict)
+                                            else st_local.get(kk)
+                                        )
+                                        if isinstance(v, dict):
+                                            last_h1 = v
+                                            break
+                                except Exception:
+                                    last_h1 = None
+                                if _h1_ctx and isinstance(last_h1, dict):
+                                    try:
+                                        h1_trend, h1_conf = _h1_ctx(last_h1)
+                                    except Exception:
+                                        h1_trend, h1_conf = ("unknown", False)
+                                    if h1_trend == "up" and bool(h1_conf):
+                                        htf_bonus_conf = 0.05
+                                        try:
+                                            reasons_prof.append("h1_trend=up")  # type: ignore[arg-type]
+                                            reasons_prof.append("h1_conf=1")  # type: ignore[arg-type]
+                                        except Exception:
+                                            pass
                             if (
                                 vdev_f >= vdev_min
                                 and abs(bias_f) >= bias_min
@@ -1724,12 +1797,16 @@ class ProcessAssetBatchv1:
                                             0.10,
                                             0.10,
                                         )
+                                        # бонус до профільної впевненості від HTF (якщо є)
+                                        prof_conf_eff = float(
+                                            profile_conf or 0.0
+                                        ) + float(htf_bonus_conf or 0.0)
                                         score = _clip01(
                                             w1 * pres_n
                                             + w2 * bias_n * (1.0 if agrees else 0.8)
                                             + w3 * vdev_n
                                             + w4 * (1.0 if dom_ok else 0.0)
-                                            + w5 * float(profile_conf or 0.0)
+                                            + w5 * prof_conf_eff
                                             + w6 * (1.0 if alt_ok else 0.0)
                                         )
                                         # Пер‑клас масштаб score (BTC=1.0, ETH=0.95, ALTS=0.85)
@@ -1803,6 +1880,8 @@ class ProcessAssetBatchv1:
                                         reasons.append(f"profile={profile_name}")
                                         reasons.append(f"dom_ok={(1 if dom_ok else 0)}")
                                         reasons.append(f"alt_ok={(1 if alt_ok else 0)}")
+                                        if htf_bonus_conf > 0.0:
+                                            reasons.append("htf_bonus=1")
                                         reasons.append(
                                             f"hysteresis={(1 if 'hysteresis_applied' in locals() and hysteresis_applied else 0)}"
                                         )

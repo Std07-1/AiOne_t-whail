@@ -237,6 +237,9 @@ SCENARIO_CANARY_PUBLISH_CANDIDATE: bool = False
 # Профільний двигун (Stage1 профілі порогів для hint'ів) — телеметрія‑only
 PROFILE_ENGINE_ENABLED: bool = False
 
+# HTF‑контекст (Stage C): вплив на профільну впевненість та alt_confirm у Stage2‑hint
+HTF_CONTEXT_ENABLED: bool = False
+
 __all__ = [
     "STAGE1_QDE_TRIGGERS_DISABLED",
     "STAGE1_STRUCTURAL_PRIORITIZE_ONLY",
@@ -305,4 +308,5 @@ __all__ = [
     "STRICT_SCENARIO_HYSTERESIS_ENABLED",
     "SCENARIO_CANARY_PUBLISH_CANDIDATE",
     "PROFILE_ENGINE_ENABLED",
+    "HTF_CONTEXT_ENABLED",
 ]

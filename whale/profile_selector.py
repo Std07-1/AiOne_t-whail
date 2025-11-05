@@ -17,6 +17,33 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Tuple, List
 
+# Мінімальна інтеграція false_breakout (Stage A): pure‑виклик від stats
+try:
+    from config.config_whale_profiles import (
+        get_false_breakout_cfg,
+        market_class_for_symbol,
+    )
+    from whale.false_breakout import detect_false_breakout_up_from_stats
+except Exception:  # захист від твердих падінь у середовищах без модулів
+
+    def get_false_breakout_cfg(market_class: str) -> dict:  # type: ignore
+        return {"min_wick_ratio": 0.6, "min_vol_z": 1.5}
+
+    def market_class_for_symbol(symbol: str) -> str:  # type: ignore
+        s = str(symbol or "").upper()
+        return (
+            "BTC" if s.startswith("BTC") else ("ETH" if s.startswith("ETH") else "ALTS")
+        )
+
+    def detect_false_breakout_up_from_stats(stats: Mapping[str, Any], cfg: Mapping[str, Any]) -> Mapping[str, Any]:  # type: ignore
+        return {
+            "is_false": False,
+            "overrun_pct": 0.0,
+            "wick_ratio": 0.0,
+            "vol_z": 0.0,
+            "reject_bars": 0,
+        }
+
 
 def apply_hysteresis(
     prev_profile: str | None,
@@ -153,6 +180,21 @@ def select_profile(
             f"edge_hits={edge_hits}/{edge_win}",
             "slope_twap_ok",
         ]
+        # Перевірка на хибний пробій: якщо True — перемикаємося на range_fade з причинами
+        try:
+            mc = market_class_for_symbol(symbol)
+            cfg_fb = get_false_breakout_cfg(mc)
+            fb = detect_false_breakout_up_from_stats(dict(stats or {}), cfg_fb)
+        except Exception:
+            fb = {"is_false": False}
+        if bool(fb.get("is_false")):
+            rf_reasons = reasons + [
+                "false_breakout_up",
+                f"wick_ratio>={fb.get('wick_ratio', 0):.2f}",
+                "no_acceptance",
+            ]
+            conf_rf = max(0.0, min(1.0, 0.45 + 0.2 * pres))
+            return ("range_fade", float(conf_rf), _augment_mismatch(rf_reasons))
         if 0.2 <= abs(bias) <= 0.5:
             reasons.append("bias_weak_mid")
         conf = max(

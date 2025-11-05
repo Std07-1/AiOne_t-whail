@@ -360,10 +360,22 @@ else:
                     inc_profile_hint_emitted as _inc_profile_hint_emitted,
                 )
 
+                # False breakout лічильник (опційно)
+                try:
+                    from telemetry.prom_gauges import (
+                        inc_false_breakout_detected as _inc_false_breakout_detected,
+                    )
+                except Exception:
+                    _inc_false_breakout_detected = None  # type: ignore[assignment]
+
                 set_profile_active = _set_profile_active  # type: ignore[assignment]
                 set_profile_confidence = _set_profile_confidence  # type: ignore[assignment]
                 inc_profile_switch = _inc_profile_switch  # type: ignore[assignment]
                 inc_profile_hint_emitted = _inc_profile_hint_emitted  # type: ignore[assignment]
+                try:
+                    inc_false_breakout_detected = _inc_false_breakout_detected  # type: ignore[assignment]
+                except Exception:
+                    inc_false_breakout_detected = None  # type: ignore[assignment]
             except Exception:
                 set_profile_active = None  # type: ignore[assignment]
                 set_profile_confidence = None  # type: ignore[assignment]
@@ -1801,6 +1813,38 @@ class ProcessAssetBatchv1:
                                             f"stale={(1 if stale_flag else 0)}"
                                         )
                                         reasons.append(f"vol_regime={vol_reg}")
+                                        # False breakout → range_fade: форсуємо нейтральний напрям і маркер причини
+                                        try:
+                                            if str(profile_name) == "range_fade":
+                                                rp = (
+                                                    locals().get("reasons_prof")
+                                                    if "reasons_prof" in locals()
+                                                    else []
+                                                )
+                                                if any(
+                                                    isinstance(r, str)
+                                                    and "false_breakout" in r
+                                                    for r in (rp or [])
+                                                ):
+                                                    reasons.append(
+                                                        "range_fade_from_false_breakout=1"
+                                                    )
+                                                    dir_hint = None
+                                                    try:
+                                                        if callable(
+                                                            locals().get(
+                                                                "inc_false_breakout_detected"
+                                                            )
+                                                        ):
+                                                            locals()[
+                                                                "inc_false_breakout_detected"
+                                                            ](
+                                                                symbol.upper(), "up"
+                                                            )  # type: ignore[index]
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
                                         # Діагностика pre_breakout_flag для probe_up: поруч із верхнім краєм і достатній нахил TWAP
                                         try:
                                             if str(profile_name) == "probe_up":

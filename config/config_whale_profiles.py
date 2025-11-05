@@ -48,6 +48,11 @@ WHALE_PROFILES: dict[str, dict[str, ProfileThresholds]] = {
             "atr_scale": {"low": 1.0, "mid": 1.0, "high": 1.0, "hyper": 1.05},
             "k_range": (3, 10),
             "cooldown_s": 30,
+            # band‑фічі (Stage B)
+            "band_k": 0.5,
+            "edge_hits_min": 3,
+            "band_squeeze_min": 0.35,
+            "max_pullback_in_band_ratio_max": 0.7,
         },
         "probe_up": {
             "presence_min": 0.70,
@@ -127,6 +132,10 @@ WHALE_PROFILES: dict[str, dict[str, ProfileThresholds]] = {
             "atr_scale": {"low": 1.0, "mid": 1.0, "high": 1.0, "hyper": 1.05},
             "k_range": (3, 10),
             "cooldown_s": 30,
+            "band_k": 0.5,
+            "edge_hits_min": 3,
+            "band_squeeze_min": 0.35,
+            "max_pullback_in_band_ratio_max": 0.7,
         },
         "probe_up": {
             "presence_min": 0.72,
@@ -162,6 +171,10 @@ WHALE_PROFILES: dict[str, dict[str, ProfileThresholds]] = {
             "atr_scale": {"low": 1.0, "mid": 1.0, "high": 1.0, "hyper": 1.05},
             "k_range": (3, 10),
             "cooldown_s": 30,
+            "band_k": 0.6,
+            "edge_hits_min": 4,
+            "band_squeeze_min": 0.35,
+            "max_pullback_in_band_ratio_max": 0.7,
         },
         "probe_up": {
             "presence_min": 0.78,
@@ -208,3 +221,37 @@ __all__ = [
     "market_class_for_symbol",
     "get_profile_thresholds",
 ]
+
+# ── Пороги для false_breakout (Stage A) ─────────────────────────────────
+# Значення: BTC/ETH — max_overrun до 0.0030 (0.30%), ALTS — до 0.0050 (0.50%).
+FALSE_BREAKOUT: dict[str, dict[str, float | int]] = {
+    "BTC": {
+        "min_overrun": 0.0005,
+        "max_overrun": 0.0030,
+        "min_wick_ratio": 0.6,
+        "min_vol_z": 1.5,
+        "max_reject_bars": 3,
+    },
+    "ETH": {
+        "min_overrun": 0.0005,
+        "max_overrun": 0.0030,
+        "min_wick_ratio": 0.6,
+        "min_vol_z": 1.5,
+        "max_reject_bars": 3,
+    },
+    "ALTS": {
+        "min_overrun": 0.0005,
+        "max_overrun": 0.0050,
+        "min_wick_ratio": 0.6,
+        "min_vol_z": 1.5,
+        "max_reject_bars": 3,
+    },
+}
+
+
+def get_false_breakout_cfg(market_class: str) -> dict[str, float | int]:
+    mc = (market_class or "ALTS").upper()
+    return dict(FALSE_BREAKOUT.get(mc) or FALSE_BREAKOUT["ALTS"])  # shallow copy
+
+
+__all__.extend(["FALSE_BREAKOUT", "get_false_breakout_cfg"])

@@ -158,6 +158,38 @@ async def bootstrap() -> UnifiedDataStore:
 
     # Завантаження конфігурації datastore
     cfg = load_datastore_cfg()
+    # Дозволяємо перевизначити namespace через STATE_NAMESPACE/config.config.NAMESPACE поверх YAML (для канарейок/ізоляції стану)
+    """
+    Нотатки і прийняті рішення
+Корінь проблеми після попередніх виправлень — сідер писав у дефолтний ai_one, бо ENV у PowerShell не застосувався, а код читав NAMESPACE на імпорті. Додав --namespace, щоб уникнути пастки ENV/шела.
+У процесі виявлено логічну похибку: при HIT в Redis телеметрія whale не вбудовувалась (умовний блок формував whale_embedded лише для MISS). Виправлено з мінімальним дифом без зміни контрактів.
+Додана цільова діагностика ключів [STRICT_WHALE] Redis MISS key=... ns=... db=... — допоможе швидко ловити розсинхрони namespace/DB/TTL надалі.
+Що далі
+Бажаєте, запущу швидку перевірку сигналів:
+Можу виконати tools.signals_truth на поточному логауті (потрібно підтвердити шлях до out_dir/run.log, який створює shim).
+За потреби — залишити app.whale_worker у фоні для постійного оновлення або додати tasks.json для швидкого старту воркера з VS Code.
+Після стабілізації — знизити рівень HIT‑логу до DEBUG, щоб уникати шуму у прод.
+Підсумок
+Whale‑ключі тепер у правильному namespace; підтверджені значення presence/bias/vdev у Redis і успішне зчитування у пайплайні (HIT).
+Виправлено критичний дефект, що блокував вбудовування на HIT.
+Запущено фонового воркера для оновлення телеметрії.
+Усі quality‑гейти зелені.
+
+
+    """
+    try:
+        from config.config import (
+            NAMESPACE as CFG_NS,  # lazy import для коректної _apply_sets
+        )
+    except Exception:
+        CFG_NS = cfg.namespace  # fallback без перевизначення
+    if str(cfg.namespace).strip(":") != str(CFG_NS).strip(":"):
+        logger.info(
+            "[Launch] Namespace override активний: %s → %s (ENV/flags)",
+            cfg.namespace,
+            CFG_NS,
+        )
+        cfg.namespace = str(CFG_NS).strip(":")
     logger.info(
         "[Launch] datastore.yaml loaded: namespace=%s base_dir=%s",
         cfg.namespace,
@@ -173,23 +205,24 @@ async def bootstrap() -> UnifiedDataStore:
         settings.redis_host,
         settings.redis_port,
     )
-    # Швидка перевірка доступності Redis; якщо недоступний — деградуємо у RAM-only режим
+    # Швидка перевірка доступності Redis; якщо повільна відповідь/тимчасова недоступність — не відрізаємо повністю I/O
+    # Даємо більше часу на ping на Windows/Docker та залишаємо хоча б 1 спробу I/O навіть при збої ping
     redis_available = True
     try:
-        await asyncio.wait_for(redis.ping(), timeout=0.5)
+        await asyncio.wait_for(redis.ping(), timeout=2.0)
     except Exception:
         redis_available = False
         logger.warning(
-            "[Launch] Redis недоступний — перемикаємось у RAM-only режим (best-effort кеш, без блокуючих ретраїв)"
+            "[Launch] Redis недоступний або повільний ping — тимчасово працюємо з обмеженим I/O (best-effort)"
         )
     # Pydantic v2: use model_dump(); fallback to dict() for backward compat
     try:
         profile_data = cfg.profile.model_dump()
     except Exception:
         profile_data = cfg.profile.dict()
-    # Параметри IO-ретраїв: якщо Redis недоступний — робимо миттєвий фейл-опен
-    # Якщо Redis недоступний: повністю вимикаємо I/O спроби (0 → RedisAdapter стане no-op)
-    io_attempts = cfg.io_retry_attempts if redis_available else 0
+    # Параметри IO-ретраїв: якщо Redis недоступний/повільний — не вимикаємо повністю I/O,
+    # залишаємо хоча б 1 швидку спробу (щоб уникнути постійних дефолтів при короткочасних збоях ping)
+    io_attempts = cfg.io_retry_attempts if redis_available else 1
     io_backoff = cfg.io_retry_backoff if redis_available else 0.0
 
     # Ініціалізація UnifiedDataStore

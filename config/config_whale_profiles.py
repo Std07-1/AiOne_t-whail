@@ -270,6 +270,30 @@ SYMBOL_OVERRIDES: dict[str, dict[str, dict[str, float | int]]] = {
     "snxusdt": {
         "probe_up": {"alt_confirm_min_override": 3, "presence_min_delta": +0.02}
     },
+    # Канарейка BTC: зменшуємо presence для chop і bias для probe
+    "btcusdt": {
+        "chop_pre_breakout_up": {"presence_min_delta": -0.02},
+        "probe_up": {"bias_abs_min_delta": -0.05},
+    },
+    # Канарейка ETH: мʼякший відхил presence/bias
+    "ethusdt": {
+        "chop_pre_breakout_up": {"presence_min_delta": -0.015},
+        "probe_up": {"bias_abs_min_delta": -0.04},
+    },
+    # Канарейка TON: швидший конформ presence/alt
+    "tonusdt": {
+        "chop_pre_breakout_up": {
+            "presence_min_delta": -0.03,
+            "vwap_dev_min_delta": -0.001,
+            "alt_confirm_min_override": 2,
+        },
+        "probe_up": {
+            "presence_min_delta": -0.04,
+            "bias_abs_min_delta": -0.05,
+            "vwap_dev_min_delta": -0.001,
+        },
+        "range_fade": {"presence_min_delta": -0.03},
+    },
 }
 
 

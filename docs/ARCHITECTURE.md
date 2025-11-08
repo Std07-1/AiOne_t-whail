@@ -65,3 +65,32 @@
 - Фіче‑флаги — `docs/FEATURE_FLAGS.md`.
 - Redis‑ключі — `docs/REDIS_KEYS.md`.
 - Directional/Whale/Crisis — див. статус‑документи у `docs/`.
+
+## Canonical helpers (process_asset_batch.helpers)
+
+Для спільних pure/near‑pure утиліт використовується модуль `process_asset_batch.helpers`.
+
+Основні функції:
+
+- `_active_alt_keys`, `_should_confirm_pre_breakout`, `_score_scale_for_class`
+- `_read_profile_cooldown`, `_write_profile_cooldown` (best‑effort Redis ключ `ai_one:ctx:{symbol}:cooldown`)
+- `_explain_should_log` (rate‑limit explain логу), `_emit_prom_presence` (опційно Prometheus)
+- `_normalize_and_cap_dvr`, `_is_heavy_compute_override`
+- `_htf_adjust_alt_min`, `_compute_ctx_persist`, `_update_accum_monitor`
+- `extract_last_h1` — безпечне діставання останнього HTF зрізу (`h1|agg_h1|last_h1`) зі `stats`.
+- `flag_htf_enabled` — централізоване читання фіче‑флага HTF з `config.flags`.
+
+Спільний стан (`_DVR_EMA_STATE`, `_PROM_PRES_LAST_TS`, `_ACCUM_MONITOR_STATE`) централізовано у `process_asset_batch.global_state`.
+
+Імпортні правила:
+
+- Новий код імпортує напряму: `from process_asset_batch.helpers import _active_alt_keys` (також `extract_last_h1`, `flag_htf_enabled` коли потрібно).
+- Історичний код, який звертається через `app.process_asset_batch`, залишається працездатним — там встановлено прості аліаси (без додаткового виклику).
+- Для monkeypatch у тестах з Prometheus використовується символ `set_presence` (може бути `None` якщо метрики вимкнені).
+
+Мотивація винесення:
+
+- Зменшення дублювання та упорядкування залежностей.
+- Спрощення unit‑тестів (менше побічних ефектів при імпорті).
+- Прозорі точки розширення для policy v2 без зміни контрактів Stage1/2/3.
+

@@ -371,7 +371,46 @@ class RedisAdapter:
         for attempt in range(self.cfg.io_retry_attempts):
             try:
                 raw = await self.r.get(key)
-                return default if raw is None else json.loads(raw)
+                if raw is None:
+                    # Діагностика промахів по китових ключах під маркером [STRICT_WHALE]
+                    try:
+                        if ":whale:" in key:
+                            db_idx = None
+                            try:
+                                pool = getattr(self.r, "connection_pool", None)
+                                conn_kwargs = (
+                                    getattr(pool, "connection_kwargs", {})
+                                    if pool
+                                    else {}
+                                )
+                                db_idx = conn_kwargs.get("db", None)
+                            except Exception:
+                                db_idx = None
+                            logger.info(
+                                "[STRICT_WHALE] Redis MISS key=%s ns=%s db=%s attempts_left=%d",
+                                key,
+                                self.cfg.namespace,
+                                str(db_idx),
+                                int(self.cfg.io_retry_attempts - attempt - 1),
+                            )
+                    except Exception:
+                        # best-effort логування, не впливає на поведінку
+                        pass
+                    return default
+                # HIT
+                try:
+                    val = json.loads(raw)
+                except Exception as e:
+                    # Легкий слід для китових ключів у разі JSON-помилки
+                    try:
+                        if ":whale:" in key:
+                            logger.error(
+                                "[STRICT_WHALE] JSON decode failed key=%s: %s", key, e
+                            )
+                    except Exception:
+                        pass
+                    raise
+                return val
             except Exception as e:
                 await asyncio.sleep(self.cfg.io_retry_backoff * (2**attempt))
                 if attempt == self.cfg.io_retry_attempts - 1:

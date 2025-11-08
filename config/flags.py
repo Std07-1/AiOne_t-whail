@@ -240,6 +240,24 @@ PROFILE_ENGINE_ENABLED: bool = False
 # HTF‑контекст (Stage C): вплив на профільну впевненість та alt_confirm у Stage2‑hint
 HTF_CONTEXT_ENABLED: bool = False
 
+# ── Forward profiles: soft thresholds (best-effort, tools.only) ────────────────
+# Якщо True — інструмент forward_from_log застосує м'якші пороги для відбору
+# алертів та часових вікон whale/explain за відсутності явних CLI-оверрайдів.
+# Контракти Stage1/2/3 не змінюються; вплив лише на офлайн-звіти forward.
+FORWARD_SOFT_THRESH_ENABLED: bool = False
+FORWARD_SOFT_THRESH = {
+    "whale": {
+        "presence_min": 0.50,
+        "bias_abs_min": 0.30,
+        "whale_max_age_sec": 1800,
+    },
+    "explain": {
+        "presence_min": 0.35,
+        "bias_abs_min": 0.20,
+        "explain_ttl_sec": 1200,
+    },
+}
+
 __all__ = [
     "STAGE1_QDE_TRIGGERS_DISABLED",
     "STAGE1_STRUCTURAL_PRIORITIZE_ONLY",
@@ -309,4 +327,6 @@ __all__ = [
     "SCENARIO_CANARY_PUBLISH_CANDIDATE",
     "PROFILE_ENGINE_ENABLED",
     "HTF_CONTEXT_ENABLED",
+    "FORWARD_SOFT_THRESH_ENABLED",
+    "FORWARD_SOFT_THRESH",
 ]

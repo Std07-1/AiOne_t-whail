@@ -61,3 +61,23 @@ Compact JSONL (`telemetry/replay_insights_*.jsonl`) для швидкого ог
 - Архітектура: `docs/ARCHITECTURE.md`
 - Телеметрія/аналіз: `docs/TELEMETRY.md`
 - Фіче‑флаги: `docs/FEATURE_FLAGS.md`
+
+## Forward profiles (офлайн)
+
+Інструмент `tools.forward_from_log` будує «forward» оцінки за три профілі сигналів: `strong`, `soft`, `explain`.
+
+- `source=whale` — бере останній `[STRICT_WHALE]` для символу поблизу часу активації сценарію і фільтрує за порогами `presence_min` та `|bias|>=bias_abs_min`. Додатково перевіряється «свіжість» китового запису за `whale_max_age_sec`.
+- `source=explain` — бере останній `[SCEN_EXPLAIN]` (explain‑payload) для символу та фільтрує за тими ж порогами, але з перевіркою `explain_ttl_sec` (макс. вік explain‑рядка).
+
+Дедуплікація: ключ `SYMBOL|ts_ms|(+|-)` (знак за `bias`). Ідентичні події в одному й тому ж барі вважаються дублями; «близнюки» з `ts±1` не зливаються.
+
+Порогові значення:
+- Жорсткі дефолти: `presence_min=0.75`, `bias_abs_min=0.60`, `whale_max_age_sec=600`, `explain_ttl_sec=600`.
+- Фіче‑флаг м'яких порогів (офлайн‑only): `FORWARD_SOFT_THRESH_ENABLED=True` разом із профілем `FORWARD_SOFT_THRESH` застосує м'які значення для `whale`/`explain`, якщо CLI не передав явних параметрів. У футері додається `note=soft_thresholds`.
+
+Великі логи: опція `--max-lines N` дозволяє ранньо зупинити парсинг надвеликих логів; у футері буде `note=early_stop`.
+
+У підсумку `forward_*.md` містить:
+- Шапку з параметрами фільтра, кількістю побачених/зіставлених подій.
+- Строки `K=<bars>` із часткою «згоди знаку» на горизонтах.
+- Футер із вікном часу, `N_total`, медіанами TTF (`ttf05_median`/`ttf10_median`) і явними `ttf_thresholds`.

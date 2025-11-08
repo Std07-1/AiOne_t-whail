@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +29,6 @@ from config.config import (
 
 # strict overrides/whitelist were previously used for heavy-compute gating; now unused
 from config.flags import (
-    ROUTER_ALERT_REQUIRE_DOMINANCE,
     SCENARIO_CANARY_PUBLISH_CANDIDATE,
     SCENARIO_TRACE_ENABLED,
     STAGE1_EXCLUDE_LOW_VOL_ATR_TRIGGERS,
@@ -40,6 +39,42 @@ from config.flags import (
     STRICT_SCENARIO_HYSTERESIS_ENABLED,
 )
 from monitoring.telemetry_sink import log_stage1_event
+from process_asset_batch.global_state import (
+    _CTX_MEMORY,
+    _EDGE_DWELL,
+    _EDGE_HIT_RING,
+    _HINT_COOLDOWN_LAST_TS,
+    _HYP_STATE,
+    _LAST_PHASE,
+    _PROFILE_STATE,
+    _SCEN_ALERT_LAST_TS,
+    _SCEN_EXPLAIN_BATCH_COUNTER,
+    _SCEN_EXPLAIN_FORCE_ALL,
+    _SCEN_EXPLAIN_LAST_TS,
+    _SCEN_HIST_RING,
+    _SCEN_LAST_STABLE,
+    _SCEN_TRACE_LAST_TS,
+    _SWEEP_LAST_SIDE,
+    _SWEEP_LAST_TS_MS,
+    _SWEEP_LEVEL,
+    _SWEEP_WARN_SHORT_HISTORY,
+    _WHALE_METRIC_RING,
+)
+from process_asset_batch.helpers import (
+    active_alt_keys,
+    compute_ctx_persist,
+    emit_prom_presence,
+    ensure_whale_default,
+    explain_should_log,
+    htf_adjust_alt_min,
+    normalize_and_cap_dvr,
+    read_profile_cooldown,
+    score_scale_for_class,
+    should_confirm_pre_breakout,
+    update_accum_monitor,
+    write_profile_cooldown,
+)
+from process_asset_batch.router_signal_v2 import router_signal_v2
 from stage1.asset_monitoring import AssetMonitorStage1
 from utils.phase_adapter import detect_phase_from_stats, resolve_scenario
 from utils.utils import (
@@ -49,6 +84,14 @@ from utils.utils import (
     sanitize_ohlcv_numeric,
 )
 
+# Локальний helper для вибірки last_h1 (мінімальний диф, без зміни контрактів)
+try:  # pragma: no cover
+    from process_asset_batch.helpers import (
+        extract_last_h1 as _extract_last_h1,  # type: ignore
+    )
+except Exception:  # pragma: no cover
+    _extract_last_h1 = None  # type: ignore[assignment]
+
 from .asset_state_manager import AssetStateManager
 
 # Policy v2 інтеграція (під прапором). Безпечний фолбек при відсутності модуля.
@@ -57,6 +100,31 @@ try:  # noqa: E402
 except Exception:  # pragma: no cover
     policy_engine_v2 = None  # type: ignore
 
+# Латентність Stage1: експорт опційної функції спостереження гістограми
+try:
+    from config.config import PROM_GAUGES_ENABLED as _PROM_ENABLED  # type: ignore
+except Exception:
+    _PROM_ENABLED = True  # type: ignore[assignment]
+if _PROM_ENABLED:
+    try:
+        from telemetry.prom_gauges import (  # type: ignore
+            record_stage1_latency_ms as _rec_stage1_latency_ms,
+        )
+
+        record_stage1_latency_ms = _rec_stage1_latency_ms  # type: ignore[assignment]
+    except Exception:
+        record_stage1_latency_ms = None  # type: ignore[assignment]
+
+# Опційний JSONL‑дамп рішень (best‑effort)
+write_decision_trace = None  # type: ignore[assignment]
+try:
+    from telemetry.decision_dump import (  # type: ignore
+        write_decision_trace as _write_decision_trace,
+    )
+
+    write_decision_trace = _write_decision_trace  # type: ignore[assignment]
+except Exception:
+    write_decision_trace = None  # type: ignore[assignment]
 
 logger = logging.getLogger("process_asset_batch")
 if not logger.handlers:
@@ -82,106 +150,6 @@ if not logger.handlers:
 if TYPE_CHECKING:  # pragma: no cover - type hints only
     from data.unified_store import UnifiedDataStore
 
-_WHALE_METRIC_RING: dict[str, deque[tuple[float, float]]] = {}
-_HINT_COOLDOWN_LAST_TS: dict[str, float] = {}
-
-_ACCUM_MONITOR_STATE: dict[str, dict[str, Any]] = {}
-_SCEN_TRACE_LAST_TS: dict[str, float] = {}
-_SCEN_EXPLAIN_LAST_TS: dict[str, float] = {}
-_SCEN_EXPLAIN_BATCH_COUNTER: dict[str, int] = {}
-# Форс‑режим логування explain для офлайн/реплею (ENV: SCEN_EXPLAIN_FORCE_ALL)
-_SCEN_EXPLAIN_FORCE_ALL: bool = bool(
-    str(os.getenv("SCEN_EXPLAIN_FORCE_ALL", "")).strip().lower() in ("1", "true", "yes")
-)
-# Sweep debounce/TTL state
-_SWEEP_LAST_TS_MS: dict[str, int] = {}
-_SWEEP_LEVEL: dict[str, float] = {}
-_SWEEP_LAST_SIDE: dict[str, str] = {}
-# WARN‑once трекер для короткої історії (<20×1m) при перевірках sweep→*
-_SWEEP_WARN_SHORT_HISTORY: set[str] = set()
-_EDGE_DWELL: dict[str, deque[str]] = {}
-# Кільце торкань верхнього краю для chop‑pre‑breakout (вікно ~15 барів)
-_EDGE_HIT_RING: dict[str, deque[bool]] = {}
-# Буфери для гістрезису сценаріїв (опційно)
-_SCEN_HIST_RING: dict[str, deque[dict[str, Any]]] = {}
-_SCEN_LAST_STABLE: dict[str, str | None] = {}
-_SCEN_ALERT_LAST_TS: dict[str, float] = {}
-_CTX_MEMORY: dict[str, Any] = {}
-_LAST_PHASE: dict[str, str] = {}
-_PROFILE_STATE: dict[str, dict[str, Any]] = {}
-# Легка гіпотеза pre_breakout на символ (open/confirm/expired)
-_HYP_STATE: dict[str, dict[str, Any]] = {}
-
-
-def _active_alt_keys(*alt_dicts: dict[str, bool] | None) -> set[str]:
-    """Формує множину активних alt-прапорців з кількох джерел (дедуп).
-
-    Повертає множину ключів із булевим значенням True у будь-якому джерелі.
-    """
-    active: set[str] = set()
-    for d in alt_dicts:
-        if not isinstance(d, dict):
-            continue
-        for k, v in d.items():
-            try:
-                if bool(v):
-                    active.add(str(k))
-            except Exception:
-                continue
-    return active
-
-
-def _score_scale_for_class(market_class: str) -> float:
-    """Множник для score за класом ринку (мінімальний диф, без конфігу).
-
-    BTC=1.0, ETH=0.95, ALTS=0.80 (консервативніші score для альтів).
-    """
-    mc = (market_class or "ALTS").upper()
-    if mc == "BTC":
-        return 1.0
-    if mc == "ETH":
-        return 0.95
-    return 0.80
-
-
-async def _read_profile_cooldown(symbol: str) -> float | None:
-    """Best‑effort читання cooldown_until_ts з Redis (TTL ~120с).
-
-    Ключ: ai_one:ctx:{symbol}:cooldown (значення — epoch seconds). Повертає None при помилці.
-    """
-    try:
-        from data.redis_connection import acquire_redis, release_redis  # type: ignore
-
-        key = f"ai_one:ctx:{symbol.lower()}:cooldown"
-        client = await acquire_redis()
-        try:
-            raw = await client.get(key)
-            if raw is None:
-                return None
-            return float(raw)
-        finally:
-            await release_redis(client)
-    except Exception:
-        return None
-
-
-async def _write_profile_cooldown(
-    symbol: str, until_ts: float, ttl_s: int = 120
-) -> None:
-    """Best‑effort запис cooldown_until_ts у Redis з TTL (не ламає пайплайн при збої)."""
-    try:
-        from data.redis_connection import acquire_redis, release_redis  # type: ignore
-
-        key = f"ai_one:ctx:{symbol.lower()}:cooldown"
-        client = await acquire_redis()
-        try:
-            # setex(key, ttl, value)
-            await client.setex(key, int(ttl_s), str(float(until_ts)))
-        finally:
-            await release_redis(client)
-    except Exception:
-        return
-
 
 # Rate-limit журналу для Prometheus presence (на символ): ~1 запис / 30с
 _PROM_PRES_LAST_TS: dict[str, float] = {}
@@ -206,6 +174,7 @@ set_phase = None  # type: ignore[assignment]
 set_scenario = None  # type: ignore[assignment]
 inc_scenario_reject = None  # type: ignore[assignment]
 inc_explain_line = None  # type: ignore[assignment]
+inc_explain_heartbeat = None  # type: ignore[assignment]
 set_liq_sweep = None  # type: ignore[assignment]
 inc_liq_sweep_total = None  # type: ignore[assignment]
 inc_sweep_then_breakout = None  # type: ignore[assignment]
@@ -248,6 +217,12 @@ else:
                 )
             except Exception:
                 _inc_explain_line = None  # type: ignore[assignment]
+            try:
+                from telemetry.prom_gauges import (  # type: ignore
+                    inc_explain_heartbeat as _inc_explain_heartbeat,
+                )
+            except Exception:
+                _inc_explain_heartbeat = None  # type: ignore[assignment]
 
             # Додаткові (опційні) лічильники для chop/hypothesis
             try:
@@ -319,6 +294,7 @@ else:
             set_scenario = _set_scenario  # type: ignore[assignment]
             inc_scenario_reject = _inc_scenario_reject  # type: ignore[assignment]
             inc_explain_line = _inc_explain_line  # type: ignore[assignment]
+            inc_explain_heartbeat = _inc_explain_heartbeat  # type: ignore[assignment]
             set_context_near_edge_persist = _set_ctx_nep  # type: ignore[assignment]
             set_context_presence_sustain = _set_ctx_ps  # type: ignore[assignment]
             set_btc_regime = _set_btc_regime  # type: ignore[assignment]
@@ -380,549 +356,6 @@ else:
         except Exception:  # pragma: no cover - відсутній пакет або помилка імпорту
             # Залишаємо no-op
             pass
-
-# Латентність Stage1: експорт опційної функції спостереження гістограми
-try:
-    from config.config import PROM_GAUGES_ENABLED as _PROM_ENABLED  # type: ignore
-except Exception:
-    _PROM_ENABLED = True  # type: ignore[assignment]
-if _PROM_ENABLED:
-    try:
-        from telemetry.prom_gauges import (  # type: ignore
-            record_stage1_latency_ms as _rec_stage1_latency_ms,
-        )
-
-        record_stage1_latency_ms = _rec_stage1_latency_ms  # type: ignore[assignment]
-    except Exception:
-        record_stage1_latency_ms = None  # type: ignore[assignment]
-
-# Опційний JSONL‑дамп рішень (best‑effort)
-write_decision_trace = None  # type: ignore[assignment]
-try:
-    from telemetry.decision_dump import (  # type: ignore
-        write_decision_trace as _write_decision_trace,
-    )
-
-    write_decision_trace = _write_decision_trace  # type: ignore[assignment]
-except Exception:
-    write_decision_trace = None  # type: ignore[assignment]
-
-
-def _explain_should_log(symbol: str, now_ts: float, min_period_s: float = 10.0) -> bool:
-    """Чи варто логувати [SCEN_EXPLAIN] зараз для символу.
-
-    Повертає True, якщо минуло ≥ ``min_period_s`` від останнього логування для
-    ``symbol``. Окремо в коді також логуватимемо кожен N-й батч (тонкий слід).
-    """
-    # У режимі офлайн‑реплею або за явним оверрайдом — логувати завжди
-    if _SCEN_EXPLAIN_FORCE_ALL:
-        return True
-    try:
-        last = float(_SCEN_EXPLAIN_LAST_TS.get(symbol.lower()) or 0.0)
-    except Exception:
-        last = 0.0
-    return bool((now_ts - last) >= float(min_period_s))
-
-
-def _normalize_and_cap_dvr(
-    symbol: str, value: Any, *, span: int = 10, cap: float = 5.0
-) -> float:
-    """Нормалізує DVR: EMA(span=10) і обмежує до [-cap, cap].
-
-    - Неграничні, нечислові значення → ігноруються (повертається 0.0 або попередня EMA).
-    - При обрізанні логуємо маркер [STRICT_SANITY] DVR_CAPPED.
-    """
-    try:
-        x = float(value)
-    except Exception:
-        x = 0.0
-    if not (x == x and abs(x) != float("inf")):  # NaN/Inf захист
-        x = 0.0
-    alpha = 2.0 / (float(span) + 1.0)
-    prev = float(_DVR_EMA_STATE.get(symbol, x))
-    ema = alpha * x + (1.0 - alpha) * prev
-    _DVR_EMA_STATE[symbol] = ema
-    capped = max(-float(cap), min(float(cap), float(ema)))
-    if capped != ema:
-        try:
-            logger.info(
-                "[STRICT_SANITY] %s DVR_CAPPED raw=%.3f ema=%.3f capped=%.3f",
-                symbol,
-                x,
-                ema,
-                capped,
-            )
-        except Exception:
-            pass
-    return float(capped)
-
-
-def _is_heavy_compute_override(stats: dict[str, Any]) -> bool:
-    """Override‑умова для heavy_compute whitelist: near_edge=True, band_pct<0.04, DVR≥0.6."""
-    try:
-        near_edge = stats.get("near_edge")
-        near_flag = bool(near_edge in (True, "upper", "lower"))
-    except Exception:
-        near_flag = False
-    try:
-        band_pct = float(stats.get("band_pct") or 1.0)
-    except Exception:
-        band_pct = 1.0
-    try:
-        dvr_val = float(
-            stats.get(K_DIRECTIONAL_VOLUME_RATIO) or stats.get("dvr") or 0.0
-        )
-    except Exception:
-        dvr_val = 0.0
-    return bool(near_flag and band_pct < 0.04 and dvr_val >= 0.6)
-
-
-def _ensure_whale_default(stats: dict[str, Any]) -> None:
-    """Гарантує наявність stats.whale із дефолтами (presence=0.0, stale=True)."""
-    try:
-        w = stats.get("whale")
-        if not isinstance(w, dict):
-            stats["whale"] = {
-                "version": "v2",
-                "stale": True,
-                "presence": 0.0,
-                "bias": 0.0,
-                "vwap_dev": None,
-                "zones_summary": {"accum_cnt": 0, "dist_cnt": 0},
-                "vol_regime": "unknown",
-            }
-            try:
-                logger.info(
-                    "[STRICT_SANITY] %s: whale default presence=0.00 stale=True",
-                    str(stats.get("symbol") or "-"),
-                )
-            except Exception:
-                pass
-    except Exception:
-        return
-
-    def _compute_profile_hint_direction_and_score(
-        whale_embedded: dict[str, Any],
-        *,
-        presence_min: float,
-        bias_min: float,
-        vdev_min: float,
-        thr: dict[str, Any] | None,
-        alt_flags: dict[str, bool] | None,
-    ) -> tuple[str | None, float, bool, bool]:
-        """Допоміжна pure‑функція для юніт‑тестів: визначає dir і score.
-
-        Параметри відповідають полям, що вже обчислені у основному коді.
-        Повертає: (dir or None, score, dom_ok, alt_ok).
-        """
-        try:
-            presence_f = float(whale_embedded.get("presence") or 0.0)
-            bias_f = float(whale_embedded.get("bias") or 0.0)
-            vdev_f = float(whale_embedded.get("vwap_dev") or 0.0)
-        except Exception:
-            presence_f, bias_f, vdev_f = 0.0, 0.0, 0.0
-        dom = (
-            (whale_embedded.get("dominance") or {})
-            if isinstance(whale_embedded, dict)
-            else {}
-        )
-        dom_buy = bool((dom or {}).get("buy"))
-        dom_sell = bool((dom or {}).get("sell"))
-        candidate_up = bias_f >= 0.0
-        require_dom = bool((thr or {}).get("require_dominance", False))
-        dom_ok = bool(dom_buy if candidate_up else dom_sell) if require_dom else True
-        alt_min = int((thr or {}).get("alt_confirm_min", 0))
-        ac = (
-            int(sum(1 for v in (alt_flags or {}).values() if bool(v)))
-            if isinstance(alt_flags, dict)
-            else 0
-        )
-        alt_ok = ac >= max(0, alt_min)
-
-        dir_hint: str | None = None
-        if (
-            abs(vdev_f) >= float(vdev_min)
-            and abs(bias_f) >= float(bias_min)
-            and presence_f >= float(presence_min)
-            and dom_ok
-            and alt_ok
-        ):
-            dir_hint = "long" if (bias_f > 0.0 or dom_buy) else "short"
-
-        # score
-        def _clip01(x: float) -> float:
-            return 0.0 if x < 0 else (1.0 if x > 1 else x)
-
-        pres_n = max(0.0, min(1.0, presence_f))
-        bias_n = max(0.0, min(1.0, abs(bias_f)))
-        vdev_n = max(0.0, min(1.0, abs(vdev_f) / max(float(vdev_min), 1e-6)))
-        agrees = (
-            1.0
-            if (
-                (bias_f >= 0 and dom_buy) or (bias_f <= 0 and dom_sell) or (bias_f == 0)
-            )
-            else 0.0
-        )
-        w1, w2, w3, w4, w5, w6 = 0.35, 0.25, 0.10, 0.10, 0.10, 0.10
-        score = _clip01(
-            w1 * pres_n
-            + w2 * bias_n * (1.0 if agrees else 0.8)
-            + w3 * vdev_n
-            + w4 * (1.0 if dom_ok else 0.0)
-            + w5 * 0.0  # conf додається у основному коді
-            + w6 * (1.0 if alt_ok else 0.0)
-        )
-        return dir_hint, float(score), bool(dom_ok), bool(alt_ok)
-
-
-def _emit_prom_presence(stats_for_phase: dict[str, Any], symbol: str) -> bool:
-    """Оновити гейдж presence з Redis/state, якщо доступний.
-
-    Повертає True, якщо set_presence було викликано; інакше False.
-    """
-    try:
-        wh = stats_for_phase.get("whale") if isinstance(stats_for_phase, dict) else {}
-        presence_raw = (wh or {}).get("presence") if isinstance(wh, dict) else None
-    except Exception:
-        presence_raw = None
-    if presence_raw is None:
-        return False
-    try:
-        pres_val = float(presence_raw)
-    except Exception:
-        return False
-    # Викликаємо Prometheus-клієнт лише якщо доступний
-    try:
-        if callable(set_presence):  # type: ignore[arg-type]
-            set_presence(symbol.upper(), float(pres_val))  # type: ignore[misc]
-            # Рейт-обмежений лог
-            now = time.time()
-            last = float(_PROM_PRES_LAST_TS.get(symbol.upper(), 0.0) or 0.0)
-            if now - last >= 30.0:
-                logger.info(
-                    "[PROM] presence set symbol=%s value=%.3f", symbol.upper(), pres_val
-                )
-                _PROM_PRES_LAST_TS[symbol.upper()] = now
-            return True
-    except Exception:
-        return False
-    return False
-
-
-# ── HTF influence helper (Stage C, pure) ─────────────────────────────────────
-def _htf_adjust_alt_min(
-    market_class: str,
-    last_h1: dict[str, Any] | None,
-    thr: dict[str, Any] | None,
-    *,
-    enabled: bool,
-) -> dict[str, Any]:
-    """Зменшує alt_confirm_min на 1 (мінімум 1) для BTC/ETH при h1 up+confluence.
-
-    Без побічних ефектів: повертає копію thr або {}.
-    """
-    try:
-        if not (enabled and market_class in ("BTC", "ETH") and isinstance(thr, dict)):
-            return dict(thr or {})
-        try:
-            from context.htf_context import h1_ctx as _h1_ctx  # type: ignore
-        except Exception:
-            return dict(thr or {})
-        if not isinstance(last_h1, dict):
-            return dict(thr or {})
-        try:
-            trend, conf = _h1_ctx(last_h1)
-        except Exception:
-            trend, conf = ("unknown", False)
-        if trend == "up" and bool(conf):
-            out = dict(thr or {})
-            base = int(out.get("alt_confirm_min", 0) or 0)
-            out["alt_confirm_min"] = max(1, base - 1)
-            return out
-        return dict(thr or {})
-    except Exception:
-        return dict(thr or {})
-
-
-def _compute_ctx_persist(
-    buf: list[dict[str, Any]] | deque[dict[str, Any]], pres_thr: float
-) -> tuple[float | None, float | None]:
-    """Обчислити near_edge_persist та presence_sustain з буфера.
-
-    near_edge_persist: частка записів із near_edge ∈ {True,"upper","lower"}.
-    presence_sustain: частка записів із presence ≥ pres_thr (None → 0.0).
-    Повертає (edge_persist, presence_sustain) у [0,1] або (None, None), якщо buf порожній.
-    """
-    try:
-        n = len(buf)  # type: ignore[arg-type]
-    except Exception:
-        n = 0
-    if not n:
-        return (None, None)
-    edge_cnt = 0
-    pres_cnt = 0
-    for e in list(buf)[-min(n, 12) :]:
-        ne = e.get("near_edge")
-        if ne is True or (isinstance(ne, str) and ne.lower() in {"upper", "lower"}):
-            edge_cnt += 1
-        p = e.get("presence")
-        try:
-            pval = float(p) if p is not None else 0.0
-        except Exception:
-            pval = 0.0
-        if pval >= float(pres_thr):
-            pres_cnt += 1
-    edge_persist = round(edge_cnt / float(n), 3)
-    pres_sustain = round(pres_cnt / float(n), 3)
-    return (edge_persist, pres_sustain)
-
-
-def _update_accum_monitor(
-    symbol: str, *, accum_cnt: int, dist_cnt: int
-) -> dict[str, Any]:
-    """Простий постпроцесор для відстеження динаміки зон акумуляції/дистрибуції."""
-
-    state = _ACCUM_MONITOR_STATE.setdefault(
-        symbol,
-        {
-            "last_accum": None,
-            "last_dist": None,
-            "streak_up": 0,
-            "streak_down": 0,
-        },
-    )
-    prev_accum = state.get("last_accum")
-    prev_dist = state.get("last_dist")
-    delta_accum = (accum_cnt - int(prev_accum)) if isinstance(prev_accum, int) else None
-    delta_dist = (dist_cnt - int(prev_dist)) if isinstance(prev_dist, int) else None
-
-    streak_up = int(state.get("streak_up", 0))
-    streak_down = int(state.get("streak_down", 0))
-    if isinstance(delta_accum, int):
-        if delta_accum > 0:
-            streak_up += 1
-            streak_down = 0
-        elif delta_accum < 0:
-            streak_down += 1
-            streak_up = 0
-        else:
-            streak_up = max(streak_up - 1, 0)
-            streak_down = max(streak_down - 1, 0)
-    else:
-        streak_up = 0
-        streak_down = 0
-
-    state.update(
-        {
-            "last_accum": accum_cnt,
-            "last_dist": dist_cnt,
-            "streak_up": streak_up,
-            "streak_down": streak_down,
-            "updated_ms": int(time.time() * 1000),
-        }
-    )
-
-    trend = "init"
-    if isinstance(delta_accum, int):
-        if delta_accum > 0:
-            trend = "up"
-        elif delta_accum < 0:
-            trend = "down"
-        else:
-            trend = "flat"
-
-    return {
-        "accum": accum_cnt,
-        "dist": dist_cnt,
-        "delta_accum": delta_accum,
-        "delta_dist": delta_dist,
-        "streak_up": streak_up,
-        "streak_down": streak_down,
-        "trend": trend,
-        "updated_ms": state["updated_ms"],
-    }
-
-
-def _router_signal_v2(
-    stats: dict[str, Any], profile_cfg: dict[str, Any]
-) -> tuple[str, float, list[str]]:
-    """Обчислює signal_v2 на базі stats (whale + directional контекст).
-
-    Args:
-        stats: Контейнер статистик (очікує stats.whale, band_pct, near_edge, rsi, price_slope_atr, dvr, cd).
-        profile_cfg: Конфіг роутера для профілю (див. STAGE2_SIGNAL_V2_PROFILES[STAGE2_PROFILE]).
-
-    Returns:
-        (sig, conf, reasons)
-    """
-    st = stats
-    wh = st.get("whale") or {}
-    presence = float(wh.get("presence") or 0.0)
-    bias = float(wh.get("bias") or 0.0)
-    vdev = float(wh.get("vwap_dev") or 0.0)
-    zones = wh.get("zones_summary") or {}
-    accum = int(zones.get("accum_cnt") or 0)
-    dist = int(zones.get("dist_cnt") or 0)
-    stale = bool(wh.get("stale"))
-
-    band = float(st.get("band_pct") or 1.0)
-    near = st.get("near_edge")
-    rsi = float(st.get("rsi") or 50.0)
-    slope = float(st.get(K_PRICE_SLOPE_ATR) or st.get("price_slope_atr") or 0.0)
-    dvr = float(st.get(K_DIRECTIONAL_VOLUME_RATIO) or 1.0)
-    cd = float(st.get(K_CUMULATIVE_DELTA) or st.get("cumulative_delta") or 0.0)
-
-    fresh_default = "AVOID"
-    stale_default = "OBSERVE"
-    sig, conf = (stale_default, 0.0) if stale else (fresh_default, 0.0)
-    reasons: list[str] = []
-
-    if not stale:
-        lg = profile_cfg.get("long", {})
-        sh = profile_cfg.get("short", {})
-        # Long кандидат
-        if (
-            band <= float(lg.get("band_max", 0.02))
-            and near == "upper"
-            and float(lg.get("rsi_lo", 45.0)) <= rsi <= float(lg.get("rsi_hi", 65.0))
-            and slope >= float(lg.get("slope_min", 0.5))
-            and cd >= float(lg.get("cd_min", 0.2))
-            and dvr <= float(lg.get("dvr_max", 0.8))
-        ):
-            if (
-                presence >= float(lg.get("presence_alert_min", 0.65))
-                and vdev >= float(lg.get("vdev_alert_min", 0.01))
-                and accum >= int(lg.get("zones_accum_min_alert", 3))
-            ):
-                # Кандидат на ALERT_BUY; за флагом можемо вимагати dominance.buy
-                if ROUTER_ALERT_REQUIRE_DOMINANCE:
-                    dom = (wh.get("dominance") or {}) if isinstance(wh, dict) else {}
-                    if not bool(dom.get("buy")):
-                        # Понижуємо до SOFT_BUY без зміни базового soft-контракту
-                        sig = "SOFT_BUY"
-                        conf = min(
-                            1.0,
-                            0.4 * presence
-                            + 0.3 * max(0.0, bias)
-                            + 10.0 * max(0.0, vdev),
-                        )
-                        reasons = [
-                            "band_narrow",
-                            "near_upper",
-                            "slope_strong",
-                            "cd_ok",
-                            "dvr_ok",
-                            "presence_ok",
-                            "bias_ok",
-                            "vdev_ok",
-                            "accum_zones>=thr",
-                        ]
-                    else:
-                        sig = "ALERT_BUY"
-                        conf = min(
-                            1.0,
-                            0.5 * presence
-                            + 0.3 * max(0.0, bias)
-                            + 20.0 * max(0.0, vdev),
-                        )
-                        reasons = [
-                            "band_narrow",
-                            "near_upper",
-                            "slope_strong",
-                            "cd_ok",
-                            "dvr_ok",
-                            "presence_strong",
-                            "vdev_strong",
-                            "accum_zones>=thr",
-                        ]
-                else:
-                    sig = "ALERT_BUY"
-                    conf = min(
-                        1.0,
-                        0.5 * presence + 0.3 * max(0.0, bias) + 20.0 * max(0.0, vdev),
-                    )
-                    reasons = [
-                        "band_narrow",
-                        "near_upper",
-                        "slope_strong",
-                        "cd_ok",
-                        "dvr_ok",
-                        "presence_strong",
-                        "vdev_strong",
-                        "accum_zones>=thr",
-                    ]
-            elif (
-                presence >= float(lg.get("presence_soft_min", 0.5))
-                and bias >= float(lg.get("bias_soft_min", 0.25))
-                and vdev >= float(lg.get("vdev_soft_min", 0.005))
-                and accum >= int(lg.get("zones_accum_min", 3))
-            ):
-                sig = "SOFT_BUY"
-                conf = min(1.0, 0.4 * presence + 0.3 * bias + 10.0 * vdev)
-                reasons = [
-                    "band_narrow",
-                    "near_upper",
-                    "slope_strong",
-                    "cd_ok",
-                    "dvr_ok",
-                    "presence_ok",
-                    "bias_ok",
-                    "vdev_ok",
-                    "accum_zones>=thr",
-                ]
-        # Short кандидат
-        if sig == "AVOID":
-            if (
-                band <= float(sh.get("band_max", 0.02))
-                and near == "lower"
-                and float(sh.get("rsi_lo", 35.0))
-                <= rsi
-                <= float(sh.get("rsi_hi", 55.0))
-                and slope <= -float(sh.get("slope_abs_min", 0.5))
-                and cd <= -float(sh.get("cd_abs_min", 0.2))
-                and dvr <= float(sh.get("dvr_max", 0.8))
-            ):
-                if (
-                    presence >= float(sh.get("presence_alert_min", 0.65))
-                    and (-vdev) >= float(sh.get("vdev_alert_min", 0.01))
-                    and dist >= int(sh.get("zones_dist_min_alert", 3))
-                ):
-                    sig = "ALERT_SELL"
-                    conf = min(
-                        1.0,
-                        0.5 * presence + 0.3 * max(0.0, -bias) + 20.0 * max(0.0, -vdev),
-                    )
-                    reasons = [
-                        "band_narrow",
-                        "near_lower",
-                        "slope_strong_neg",
-                        "cd_ok_neg",
-                        "dvr_ok",
-                        "presence_strong",
-                        "vdev_strong_neg",
-                        "dist_zones>=thr",
-                    ]
-                elif (
-                    presence >= float(sh.get("presence_soft_min", 0.5))
-                    and (-bias) >= float(sh.get("bias_soft_min", 0.25))
-                    and (-vdev) >= float(sh.get("vdev_soft_min", 0.005))
-                    and dist >= int(sh.get("zones_dist_min", 3))
-                ):
-                    sig = "SOFT_SELL"
-                    conf = min(1.0, 0.4 * presence + 0.3 * (-bias) + 10.0 * (-vdev))
-                    reasons = [
-                        "band_narrow",
-                        "near_lower",
-                        "slope_strong_neg",
-                        "cd_ok_neg",
-                        "dvr_ok",
-                        "presence_ok",
-                        "bias_ok_neg",
-                        "vdev_ok_neg",
-                        "dist_zones>=thr",
-                    ]
-
-    return sig, float(round(conf, 3)), reasons
 
 
 class ProcessAssetBatchv1:
@@ -1121,57 +554,74 @@ class ProcessAssetBatchv1:
                                 "[STRICT_WHALE] %s: whale-метрики не знайдено в Redis, очікуємо оновлення від воркера",
                                 lower_symbol,
                             )
-                            w = None
-
-                        if isinstance(w, dict):
-                            ts_ms = (
-                                w.get("ts")
-                                if isinstance(w.get("ts"), (int, float))
-                                else None
-                            )
-                            now_ms = int(time.time() * 1000)
-                            age_ms = (
-                                int(now_ms - int(ts_ms)) if ts_ms is not None else None
-                            )
-                            stale = bool(age_ms is None or age_ms > 7000)
-                            explain = (
-                                w.get("explain")
-                                if isinstance(w.get("explain"), dict)
-                                else {}
-                            )
-                            zones = (
-                                w.get("zones")
-                                if isinstance(w.get("zones"), dict)
-                                else {}
-                            )
-                            presence = w.get("presence_score")
-                            bias = w.get("bias")
-                            vdev = w.get("vwap_deviation")
-
+                            w = {}
+                        else:
                             try:
-                                atr_val = float(normalized["stats"].get("atr"))
-                            except Exception:
-                                atr_val = None
-                            try:
-                                cp_val2 = float(
-                                    normalized["stats"].get("current_price")
+                                ts_dbg = (
+                                    int(w.get("ts"))
+                                    if isinstance(w.get("ts"), (int, float))
+                                    else None
                                 )
                             except Exception:
-                                cp_val2 = None
-                            atr_pct_local = (
-                                (atr_val / cp_val2 * 100.0)
-                                if atr_val and cp_val2 and cp_val2 > 0
-                                else None
-                            )
-                            if isinstance(atr_pct_local, (int, float)):
-                                if atr_pct_local >= 3.5:
-                                    vol_regime = "hyper"
-                                elif atr_pct_local >= 2.0:
-                                    vol_regime = "high"
-                                else:
-                                    vol_regime = "normal"
+                                ts_dbg = None
+                            # Легка інформативна мітка, що хітнули Redis і маємо валідний словник
+                            if ts_dbg is not None:
+                                now_ms_dbg = int(time.time() * 1000)
+                                age_dbg = int(now_ms_dbg - ts_dbg)
+                                logger.info(
+                                    "[STRICT_WHALE] %s: whale-метрики отримано (age_ms=%s)",
+                                    lower_symbol,
+                                    age_dbg,
+                                )
+
+                        ts_ms = (
+                            w.get("ts")
+                            if isinstance(w.get("ts"), (int, float))
+                            else None
+                        )
+                        now_ms = int(time.time() * 1000)
+                        age_ms = int(now_ms - int(ts_ms)) if ts_ms is not None else None
+                        stale = bool(age_ms is None or age_ms > 7000)
+                        explain = (
+                            w.get("explain")
+                            if isinstance(w.get("explain"), dict)
+                            else {}
+                        )
+                        zones = (
+                            w.get("zones") if isinstance(w.get("zones"), dict) else {}
+                        )
+                        accum_raw = (
+                            zones.get("accum") if isinstance(zones, dict) else None
+                        )
+                        dist_raw = (
+                            zones.get("dist") if isinstance(zones, dict) else None
+                        )
+                        presence = w.get("presence_score")
+                        bias = w.get("bias")
+                        vdev = w.get("vwap_deviation")
+
+                        try:
+                            atr_val = float(normalized["stats"].get("atr"))
+                        except Exception:
+                            atr_val = None
+                        try:
+                            cp_val2 = float(normalized["stats"].get("current_price"))
+                        except Exception:
+                            cp_val2 = None
+                        atr_pct_local = (
+                            (atr_val / cp_val2 * 100.0)
+                            if atr_val and cp_val2 and cp_val2 > 0
+                            else None
+                        )
+                        if isinstance(atr_pct_local, (int, float)):
+                            if atr_pct_local >= 3.5:
+                                vol_regime = "hyper"
+                            elif atr_pct_local >= 2.0:
+                                vol_regime = "high"
                             else:
-                                vol_regime = "unknown"
+                                vol_regime = "normal"
+                        else:
+                            vol_regime = "unknown"
 
                             whale_embedded = {
                                 "version": "v2",
@@ -1187,8 +637,16 @@ class ProcessAssetBatchv1:
                                     else None
                                 ),
                                 "zones_summary": {
-                                    "accum_cnt": zones.get("accum"),
-                                    "dist_cnt": zones.get("dist"),
+                                    "accum_cnt": (
+                                        int(accum_raw)
+                                        if isinstance(accum_raw, (int, float))
+                                        else 0
+                                    ),
+                                    "dist_cnt": (
+                                        int(dist_raw)
+                                        if isinstance(dist_raw, (int, float))
+                                        else 0
+                                    ),
                                 },
                                 "vol_regime": vol_regime,
                             }
@@ -1261,7 +719,7 @@ class ProcessAssetBatchv1:
                                     "dist_cnt", 0
                                 )
                             )
-                            accum_payload = _update_accum_monitor(
+                            accum_payload = update_accum_monitor(
                                 lower_symbol,
                                 accum_cnt=accum_cnt,
                                 dist_cnt=dist_cnt,
@@ -1297,7 +755,7 @@ class ProcessAssetBatchv1:
 
                 # Гарантуємо дефолтні whale‑метрики (presence=0.0, stale=True)
                 try:
-                    _ensure_whale_default(normalized.setdefault("stats", {}))
+                    ensure_whale_default(normalized.setdefault("stats", {}))
                 except Exception:
                     pass
 
@@ -1332,6 +790,14 @@ class ProcessAssetBatchv1:
                                     and prev_pres > 0.0
                                 ):
                                     we["presence"] = prev_pres
+                                    try:
+                                        logger.debug(
+                                            "[STRICT_WHALE] %s carry-forward presence=%.3f",
+                                            lower_symbol,
+                                            prev_pres,
+                                        )
+                                    except Exception:
+                                        pass
                 except Exception:
                     pass
                 # Stage2-lite hints
@@ -1486,23 +952,19 @@ class ProcessAssetBatchv1:
                                         _htf_on = HTF_CONTEXT_ENABLED
                                     except Exception:
                                         _htf_on = False
-                                    last_h1 = None
+                                    # Витягаємо last_h1 через єдиний helper (мінімальний диф)
                                     try:
                                         st_local = normalized.get("stats") or {}
-                                        for kk in ("h1", "agg_h1", "last_h1"):
-                                            v = (
-                                                (st_local.get("htf") or {}).get(kk)
-                                                if isinstance(st_local.get("htf"), dict)
-                                                else st_local.get(kk)
-                                            )
-                                            if isinstance(v, dict):
-                                                last_h1 = v
-                                                break
+                                        last_h1 = (
+                                            _extract_last_h1(st_local)
+                                            if callable(_extract_last_h1)
+                                            else None
+                                        )
                                     except Exception:
                                         last_h1 = None
                                     try:
                                         if isinstance(thr, dict) and thr:
-                                            thr = _htf_adjust_alt_min(
+                                            thr = htf_adjust_alt_min(
                                                 mc, last_h1, thr, enabled=bool(_htf_on)
                                             )
                                     except Exception:
@@ -1595,7 +1057,7 @@ class ProcessAssetBatchv1:
                                     from_iem = _alt_from_iem(iem_res)
                             except Exception:
                                 pass
-                            active_alt = _active_alt_keys(from_stats, from_iem)
+                            active_alt = active_alt_keys(from_stats, from_iem)
                             alt_confirms_count = len(active_alt)
 
                             # Домінування за напрямом кандидата (за знаком bias)
@@ -1632,19 +1094,14 @@ class ProcessAssetBatchv1:
                                     )
                                 except Exception:
                                     _h1_ctx = None  # type: ignore[assignment]
-                                # Витягуємо last_h1 (гнучкі ключі)
-                                last_h1 = None
+                                # Єдина точка вилучення last_h1 (helper)
                                 try:
                                     st_local = normalized.get("stats") or {}
-                                    for kk in ("h1", "agg_h1", "last_h1"):
-                                        v = (
-                                            (st_local.get("htf") or {}).get(kk)
-                                            if isinstance(st_local.get("htf"), dict)
-                                            else st_local.get(kk)
-                                        )
-                                        if isinstance(v, dict):
-                                            last_h1 = v
-                                            break
+                                    last_h1 = (
+                                        _extract_last_h1(st_local)
+                                        if callable(_extract_last_h1)
+                                        else None
+                                    )
                                 except Exception:
                                     last_h1 = None
                                 if _h1_ctx and isinstance(last_h1, dict):
@@ -1732,7 +1189,7 @@ class ProcessAssetBatchv1:
                                         )
                                         # Пер‑клас масштаб score (BTC=1.0, ETH=0.95, ALTS=0.85)
                                         try:
-                                            score *= _score_scale_for_class(mc)
+                                            score *= score_scale_for_class(mc)
                                         except Exception:
                                             pass
                                         cooldown_active = False
@@ -1744,7 +1201,7 @@ class ProcessAssetBatchv1:
                                             if not isinstance(cd_until, (int, float)):
                                                 # Мʼякий відновлювач cooldown із Redis (при рестарті)
                                                 cd_restore = (
-                                                    await _read_profile_cooldown(
+                                                    await read_profile_cooldown(
                                                         lower_symbol
                                                     )
                                                 )
@@ -1943,7 +1400,7 @@ class ProcessAssetBatchv1:
                                             except Exception:
                                                 s_val = 0.0
                                             reasons.append(
-                                                f"slope_twap_ok={(1 if s_val>=0.6 else 0)}"
+                                                f"slope_twap_ok={(1 if s_val>=0.8 else 0)}"
                                             )
                                             # інкремент chop‑лічильника (best‑effort)
                                             try:
@@ -1966,32 +1423,54 @@ class ProcessAssetBatchv1:
                                             )
                                         except Exception:
                                             thr_alt_min = 0
-                                        if str(
-                                            profile_name
-                                        ) == "chop_pre_breakout_up" and (
-                                            accept_ok
-                                            or alt_confirms_count >= thr_alt_min
-                                        ):
-                                            hs = _HYP_STATE.setdefault(lower_symbol, {})
-                                            hs.update(
-                                                {
-                                                    "type": "pre_breakout",
-                                                    "state": "confirmed",
-                                                    "confirmed_ts": now_ts,
-                                                }
+                                        confirm_flags: OrderedDict[str, bool] | None = (
+                                            None
+                                        )
+                                        confirm_ready = False
+                                        if str(profile_name) == "chop_pre_breakout_up":
+                                            confirm_ready, confirm_flags = (
+                                                should_confirm_pre_breakout(
+                                                    accept_ok=accept_ok,
+                                                    alt_confirms_count=alt_confirms_count,
+                                                    thr_alt_min=thr_alt_min,
+                                                    dominance_buy=dom_buy,
+                                                    vwap_dev=vdev_f,
+                                                    slope_atr=s_val,
+                                                )
                                             )
-                                            try:
-                                                if callable(
-                                                    locals().get(
-                                                        "inc_hypothesis_confirm"
-                                                    )
-                                                ):
-                                                    locals()["inc_hypothesis_confirm"]("pre_breakout")  # type: ignore[index]
-                                            except Exception:
-                                                pass
-                                            reasons.append("pre_breakout_confirm")
-                                            # Після підтвердження дозволяємо напрямок UP
-                                            dir_hint = "long"
+                                            for key, ok in (
+                                                confirm_flags or {}
+                                            ).items():
+                                                reasons.append(
+                                                    f"{key}={(1 if ok else 0)}"
+                                                )
+                                            if confirm_ready:
+                                                hs = _HYP_STATE.setdefault(
+                                                    lower_symbol, {}
+                                                )
+                                                hs.update(
+                                                    {
+                                                        "type": "pre_breakout",
+                                                        "state": "confirmed",
+                                                        "confirmed_ts": now_ts,
+                                                    }
+                                                )
+                                                try:
+                                                    if callable(
+                                                        locals().get(
+                                                            "inc_hypothesis_confirm"
+                                                        )
+                                                    ):
+                                                        locals()[
+                                                            "inc_hypothesis_confirm"
+                                                        ](
+                                                            "pre_breakout"
+                                                        )  # type: ignore[index]
+                                                except Exception:
+                                                    pass
+                                                reasons.append("pre_breakout_confirm")
+                                                # Після підтвердження дозволяємо напрямок UP
+                                                dir_hint = "long"
                                         # Експірація open‑гіпотези
                                         try:
                                             hs = _HYP_STATE.get(lower_symbol) or {}
@@ -2099,7 +1578,7 @@ class ProcessAssetBatchv1:
                                                 )["cooldown_until_ts"] = until
                                                 # Мʼякий персист у Redis з TTL=120с
                                                 try:
-                                                    await _write_profile_cooldown(
+                                                    await write_profile_cooldown(
                                                         lower_symbol, until, ttl_s=120
                                                     )
                                                 except Exception:
@@ -2171,7 +1650,7 @@ class ProcessAssetBatchv1:
                         raw_dvr = (stats_for_phase or {}).get(
                             K_DIRECTIONAL_VOLUME_RATIO
                         )
-                        dvr_norm = _normalize_and_cap_dvr(lower_symbol, raw_dvr)
+                        dvr_norm = normalize_and_cap_dvr(lower_symbol, raw_dvr)
                         normalized.setdefault("stats", {})[
                             K_DIRECTIONAL_VOLUME_RATIO
                         ] = dvr_norm
@@ -2468,11 +1947,12 @@ class ProcessAssetBatchv1:
                                 )
                                 # пояснювальний лог
                                 try:
+                                    # Формат уніфіковано під тулінг якості: scenario=..., explain="..."
+                                    # Порожній explain допустимий для "серцебиття" у NEUTRAL/gray, щоб підвищити ExpCov
                                     logger.info(
-                                        "[SCEN_EXPLAIN] symbol=%s scen=%s conf=%.2f ctx={nep=%.2f,ps=%.2f,htfs=%.2f} btc_gate=%s",
+                                        '[SCEN_EXPLAIN] symbol=%s scenario=%s explain="" ctx={nep=%.2f,ps=%.2f,htfs=%.2f} btc_gate=%s conf=%.2f',
                                         lower_symbol,
                                         (scn_name or "-"),
-                                        float(scn_conf or 0.0),
                                         float(ctx_meta.get("near_edge_persist", 0.0)),
                                         float(ctx_meta.get("presence_sustain", 0.0)),
                                         float(ctx_meta.get("htf_sustain", 0.0)),
@@ -2484,6 +1964,7 @@ class ProcessAssetBatchv1:
                                             )
                                             else "skipped"
                                         ),
+                                        float(scn_conf or 0.0),
                                     )
                                 except Exception:
                                     pass
@@ -3204,7 +2685,7 @@ class ProcessAssetBatchv1:
                                     pres_thr = float(_PRES_MIN)
                                 except Exception:
                                     pres_thr = 0.60
-                                edge_persist, pres_sustain = _compute_ctx_persist(
+                                edge_persist, pres_sustain = compute_ctx_persist(
                                     ctx_ring, pres_thr
                                 )
                                 if (
@@ -3588,7 +3069,7 @@ class ProcessAssetBatchv1:
                                             + 1
                                         )
                                         _SCEN_EXPLAIN_BATCH_COUNTER[lower_symbol] = bidx
-                                        should_log = _explain_should_log(
+                                        should_log = explain_should_log(
                                             lower_symbol, now_ts, 10.0
                                         ) or (
                                             SCEN_EXPLAIN_VERBOSE_EVERY_N > 0
@@ -3615,6 +3096,8 @@ class ProcessAssetBatchv1:
                                             try:
                                                 if callable(inc_explain_line):  # type: ignore[arg-type]
                                                     inc_explain_line(symbol.upper())  # type: ignore[misc]
+                                                if scen_tag == "none" and callable(inc_explain_heartbeat):  # type: ignore[arg-type]
+                                                    inc_explain_heartbeat(symbol.upper())  # type: ignore[misc]
                                             except Exception:
                                                 pass
                                 except Exception:
@@ -3750,7 +3233,7 @@ class ProcessAssetBatchv1:
                             if callable(set_htf_strength):  # type: ignore[arg-type]
                                 set_htf_strength(symbol.upper(), float(htf_val))  # type: ignore[misc]
                             # presence: лише якщо є в state; лог рейт-обмежений
-                            _emit_prom_presence(stats_for_phase, symbol)
+                            emit_prom_presence(stats_for_phase, symbol)
                         except Exception:
                             pass
                         try:
@@ -3929,7 +3412,7 @@ class ProcessAssetBatchv1:
                         profile_cfg = STAGE2_SIGNAL_V2_PROFILES.get(
                             STAGE2_PROFILE
                         ) or STAGE2_SIGNAL_V2_PROFILES.get("strict", {})
-                        sig, conf, reasons = _router_signal_v2(st, profile_cfg)
+                        sig, conf, reasons = router_signal_v2(st, profile_cfg)
                         st["signal_v2"] = sig
                         st["signal_v2_conf"] = conf
                         if reasons:

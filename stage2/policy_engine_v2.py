@@ -1,9 +1,23 @@
+"""
+Policy Engine v2 (Stage2) — прийняття керованих сигналів під фіче‑флагом.
+
+Цілі T0:
+- Контракти Stage1/Stage2/Stage3 НЕ змінюємо; нові дані лише у market_context.meta.*
+- Видавати SignalDecision з class_/side/p_win/sl_atr/tp_atr/ttl_s/reason/features.
+- Жодних блокуючих I/O: працюємо лише на переданих stats/ds (best‑effort).
+- Лаконічний лог однією строкою: [SIGNAL_V2] ...
+"""
+
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from rich.console import Console
+from rich.logging import RichHandler
 
 # Конфіг читаємо безпосередньо (джерело правди — config.config)
 try:  # pragma: no cover
@@ -21,15 +35,13 @@ except Exception:  # pragma: no cover
 
     cfg = _Dummy()  # type: ignore
 
-"""
-Policy Engine v2 (Stage2) — прийняття керованих сигналів під фіче‑флагом.
 
-Цілі T0:
-- Контракти Stage1/Stage2/Stage3 НЕ змінюємо; нові дані лише у market_context.meta.*
-- Видавати SignalDecision з class_/side/p_win/sl_atr/tp_atr/ttl_s/reason/features.
-- Жодних блокуючих I/O: працюємо лише на переданих stats/ds (best‑effort).
-- Лаконічний лог однією строкою: [SIGNAL_V2] ...
-"""
+logger = logging.getLogger("policy_engine_v2")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    # Пишемо у stdout, щоб tee у tools.run_window коректно дзеркалив у файл UTF-8
+    logger.addHandler(RichHandler(console=Console(file=sys.stdout), show_path=True))
+    logger.propagate = False
 
 
 @dataclass
@@ -164,7 +176,6 @@ def decide(
       - ACCUM_BREAKOUT: band_pct ≤ ACCUM_BAND_PCT_MAX AND presence_sustain≈1 AND ramp_score ≥ τ1 AND sweep_ctx==true
       - MEAN_REVERT: retest_ok==true AND vol_z ≤ 0 AND htf_strength < MEANREV_HTF_MAX AND dist_to_level ≤ τ2
     """
-    logger = logging.getLogger(__name__)
     symbol = (
         str((stats or {}).get("symbol") or (stats or {}).get("SYMBOL") or "").upper()
         or "?"

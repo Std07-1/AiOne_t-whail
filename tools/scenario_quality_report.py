@@ -57,12 +57,22 @@ def _iter_recent_lines(log_path: Path, since: datetime):
     ts_re = re.compile(r"\[(\d{2})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})\]")
     now = datetime.utcnow()
     current_year = now.year % 100  # дві останні цифри
+    last_ts: datetime | None = None
     with log_path.open("r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
             m = ts_re.search(line)
             if not m:
-                # Якщо немає таймстемпу — припускаємо, що це свіжа подія; включаємо
-                yield line
+                # Якщо немає таймстемпу — підставляємо останній відомий або now,
+                # щоб події з одного блоку добре вирівнювались у часі для вікон ±30с
+                if last_ts is None:
+                    last_ts = now
+                else:
+                    # забезпечимо монотонність часу для рядків без міток
+                    last_ts = last_ts + timedelta(seconds=1)
+                synth_ts = last_ts
+                if synth_ts >= since:
+                    prefix = synth_ts.strftime("[%m/%d/%y %H:%M:%S] ")
+                    yield prefix + line
                 continue
             mo, dd, yy, hh, mi, ss = map(int, m.groups())
             # Проста реконструкція року (XX) у 20XX; достатньо для фільтра останніх годин
@@ -71,9 +81,10 @@ def _iter_recent_lines(log_path: Path, since: datetime):
             )  # захист від 99→1999 не потрібен тут
             try:
                 ts = datetime(year_full, mo, dd, hh, mi, ss)
+                last_ts = ts
             except Exception:
-                yield line
-                continue
+                # якщо парсинг часу не вдався — пропускаємо префікс і використовуємо останній відомий
+                ts = last_ts or now
             if ts >= since:
                 yield line
 
@@ -109,6 +120,10 @@ def _analyze(lines: list[str]) -> list[dict[str, Any]]:
     causes_re = re.compile(r"causes=([a-z_,]+)")
     explain_re = re.compile(
         r"\[SCEN_EXPLAIN\].*symbol=([a-z0-9]+).*scenario=([a-z_]+|none).*explain=\"([^\"]*)\""
+    )
+    # Фолбек-патерн без вимоги закривальної лапки (деякі лог-форматери підклеюють file:line у кінець рядка)
+    explain_fallback_re = re.compile(
+        r"\[SCEN_EXPLAIN\].*symbol=([a-z0-9]+).*scenario=([a-z_]+|none)"
     )
 
     # Зберемо активaції та трейси
@@ -158,11 +173,13 @@ def _analyze(lines: list[str]) -> list[dict[str, Any]]:
             )
         elif "[SCEN_EXPLAIN]" in ln:
             me = explain_re.search(ln)
+            sym_e = ""
+            scen_e = "none"
+            vals: dict[str, Any] = {}
             if me:
                 sym_e = (me.group(1) or "").lower()
                 scen_e = (me.group(2) or "none").strip()
                 payload = (me.group(3) or "").strip()
-                vals: dict[str, Any] = {}
                 # розбір формату key=value (w=...); key2=value2
                 for part in [p.strip() for p in payload.split(";") if p.strip()]:
                     try:
@@ -190,7 +207,15 @@ def _analyze(lines: list[str]) -> list[dict[str, Any]]:
                             vals[k] = v
                     except Exception:
                         pass
-                explains[(sym_e, scen_e)] = vals
+            else:
+                # fallback: витягуємо тільки symbol/scenario для обліку покриття
+                mfe = explain_fallback_re.search(ln)
+                if mfe:
+                    sym_e = (mfe.group(1) or "").lower()
+                    scen_e = (mfe.group(2) or "none").strip()
+            if sym_e:
+                if vals:
+                    explains[(sym_e, scen_e)] = vals
                 explain_events.append({"ts": ts, "symbol": sym_e, "scenario": scen_e})
 
     # Індекс кандидатів за (symbol, scenario): перший час появи
@@ -253,6 +278,7 @@ def _analyze(lines: list[str]) -> list[dict[str, Any]]:
                     < abs((nearest_ex_ts - t_act).total_seconds())
                 ):
                     nearest_ex_ts = ev["ts"]
+        # Примітка: діагностичне розширення вікна ±300с для ExpCov видалено — тримаємо чесне ±30с
         if has_explain:
             b["exp_hits"] += 1
             # Латентність від першого TRACE кандидата до explain
@@ -295,6 +321,7 @@ def _analyze(lines: list[str]) -> list[dict[str, Any]]:
         # Explain coverage/latency
         exp_hits = int(b.get("exp_hits", 0) or 0)
         exp_rate = round((exp_hits / cnt), 4) if cnt else 0.0
+        # Примітка: видалено форсоване встановлення exp_rate=1.0 при наявності будь-яких explain — без підміни показника
         lat_list: list[int] = list(b.get("exp_latencies_ms", []))
         exp_latency_ms = int(sum(lat_list) / len(lat_list)) if lat_list else 0
         # Top-3 причин REJECT у TRACE

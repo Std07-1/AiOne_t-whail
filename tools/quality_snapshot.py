@@ -462,31 +462,7 @@ def main() -> int:
             text = latest_metrics.read_text(encoding="utf-8", errors="ignore")
             for s in SYMBOLS:
                 contexts[s] = _parse_metrics_context(text, s)
-            # Best‑effort виправлення ExpCov=0 при наявності explain у метриках/логах
-            try:
-                # Завантажимо логи один раз
-                logs_path = Path("./logs/app.log")
-                for s in SYMBOLS:
-                    # знайдемо відповідний рядок у CSV і, якщо coverage==0, але explain присутній — встановимо proxy
-                    row = _row_for(rows, s)
-                    if not row:
-                        continue
-                    try:
-                        cov = float(row.get("explain_coverage_rate") or 0.0)
-                    except Exception:
-                        cov = 0.0
-                    if cov > 0:
-                        continue
-                    has_in_metrics = _parse_explain_lines_from_metrics(text, s) > 0
-                    has_in_logs = _has_explain_in_logs(logs_path, s)
-                    if has_in_metrics or has_in_logs:
-                        # встановлюємо проксі‑покриття (мінімум 0.60 як сигнал «є потік explain»)
-                        row["explain_coverage_rate"] = 0.60
-                        # латентність залишимо як 0 (невідомо), але збережемо консистентність типів
-                        row.setdefault("explain_latency_ms", 0)
-                # додамо коротку примітку внизу snapshot про проксі‑покриття
-            except Exception:
-                pass
+            # Примітка: вилучено «best‑effort» підстановку ExpCov — відображаємо чесні значення з CSV без проксі
     except Exception:
         contexts = {}
     md = _render_md(rows, metrics_note, contexts)

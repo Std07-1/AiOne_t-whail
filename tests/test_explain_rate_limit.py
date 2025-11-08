@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from app import process_asset_batch as pab
+import app.process_asset_batch as pab
 from config.config import SCEN_EXPLAIN_VERBOSE_EVERY_N
+from process_asset_batch.helpers import _explain_should_log
 
 
 def test_explain_should_log_rate_limit_basic():
@@ -9,13 +10,13 @@ def test_explain_should_log_rate_limit_basic():
     pab._SCEN_EXPLAIN_LAST_TS.clear()
 
     now = 100.0
-    assert pab._explain_should_log(sym, now, min_period_s=10.0) is True
+    assert _explain_should_log(sym, now, min_period_s=10.0) is True
 
     # set last ts to now; within 5s should be False
     pab._SCEN_EXPLAIN_LAST_TS[sym] = now
-    assert pab._explain_should_log(sym, now + 5.0, min_period_s=10.0) is False
+    assert _explain_should_log(sym, now + 5.0, min_period_s=10.0) is False
     # after 10s or more should be True
-    assert pab._explain_should_log(sym, now + 10.0, min_period_s=10.0) is True
+    assert _explain_should_log(sym, now + 10.0, min_period_s=10.0) is True
 
 
 def test_every_nth_batch_condition():

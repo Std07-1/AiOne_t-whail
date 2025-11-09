@@ -20,6 +20,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from rich.console import Console
@@ -44,6 +45,7 @@ if not logger.handlers:
     logger.propagate = False
 
 
+EMA_PRESENCE: dict[str, float] = {}
 @dataclass
 class Ring:
     closes: deque[float]
@@ -104,6 +106,86 @@ def _iceberg_flag(volumes: list[float], z_thr: float = 2.5) -> bool:
         return False
     z = (volumes[-1] - mu) / sigma
     return bool(z >= z_thr)
+
+
+def _volume_spike(volumes: list[float], z_thr: float = 1.8) -> bool:
+    if len(volumes) < 8:
+        return False
+    mu, sigma = _safe_mean_std(volumes[:-1])
+    if sigma <= 0:
+        return False
+    z = (volumes[-1] - mu) / sigma
+    return bool(z >= z_thr)
+
+
+def _apply_presence_ema(symbol: str, value: float, *, alpha: float, enabled: bool) -> float:
+    try:
+        x = float(value)
+    except Exception:
+        x = 0.0
+    if not enabled:
+        EMA_PRESENCE.pop(symbol, None)
+        return float(round(max(0.0, min(1.0, x)), 4))
+    prev = EMA_PRESENCE.get(symbol)
+    ema = x if prev is None else alpha * x + (1.0 - alpha) * float(prev)
+    EMA_PRESENCE[symbol] = ema
+    return float(round(max(0.0, min(1.0, ema)), 4))
+
+
+def compute_dominance(
+    vwap_dev: float,
+    slope_twap: float,
+    flags: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        vdev_min = float(cfg.get("vwap_dev_min", 0.0) or 0.0)
+    except Exception:
+        vdev_min = 0.0
+    try:
+        slope_abs_min = float(cfg.get("slope_abs_min", 0.0) or 0.0)
+    except Exception:
+        slope_abs_min = 0.0
+    alt_cfg = cfg.get("alt_confirm") or {}
+    need_any = int(alt_cfg.get("need_any", 1) or 0)
+    zone_min = int(alt_cfg.get("dist_zones_min", 0) or 0)
+
+    iceberg = bool(flags.get("iceberg"))
+    vol_spike = bool(flags.get("vol_spike"))
+    accum_cnt = int(flags.get("zones_accum", 0) or 0)
+    dist_cnt = int(flags.get("zones_dist", 0) or 0)
+
+    buy_hits: list[str] = []
+    sell_hits: list[str] = []
+    if iceberg:
+        buy_hits.append("iceberg")
+        sell_hits.append("iceberg")
+    if vol_spike:
+        buy_hits.append("vol_spike")
+        sell_hits.append("vol_spike")
+    if zone_min and accum_cnt >= zone_min:
+        buy_hits.append("zones")
+    if zone_min and dist_cnt >= zone_min:
+        sell_hits.append("zones")
+
+    buy_candidate = bool(vwap_dev >= vdev_min and slope_twap >= slope_abs_min)
+    sell_candidate = bool((-vwap_dev) >= vdev_min and (-slope_twap) >= slope_abs_min)
+    buy_confirmed = buy_candidate and len(buy_hits) >= need_any
+    sell_confirmed = sell_candidate and len(sell_hits) >= need_any
+
+    return {
+        "buy": bool(buy_confirmed),
+        "sell": bool(sell_confirmed),
+        "meta": {
+            "need_any": need_any,
+            "buy_candidate": buy_candidate,
+            "sell_candidate": sell_candidate,
+            "buy_hits": buy_hits,
+            "sell_hits": sell_hits,
+            "buy_confirmed": buy_confirmed,
+            "sell_confirmed": sell_confirmed,
+        },
+    }
 
 
 def _zones_simple(
@@ -199,6 +281,14 @@ async def run_whale_worker() -> None:
     dev_bonus_hi = float(STAGE2_WHALE_TELEMETRY.get("dev_bonus_high", 0.08))
     dev_bonus_lo = float(STAGE2_WHALE_TELEMETRY.get("dev_bonus_low", 0.04))
     iceberg_only_cap = float(STAGE2_WHALE_TELEMETRY.get("iceberg_only_cap", 0.40))
+    presence_proxy_cap = float(STAGE2_WHALE_TELEMETRY.get("presence_proxy_cap", 0.85))
+    presence_zones_none_cap = float(STAGE2_WHALE_TELEMETRY.get("presence_zones_none_cap", 0.30))
+    presence_accum_only_cap = float(STAGE2_WHALE_TELEMETRY.get("presence_accum_only_cap", 0.35))
+    bias_vwap_thr = float(STAGE2_WHALE_TELEMETRY.get("bias_vwap_dev_thr", 0.01))
+    ema_cfg = dict(STAGE2_WHALE_TELEMETRY.get("ema", {}))
+    ema_alpha = float(ema_cfg.get("alpha", 0.30))
+    ema_enabled = bool(ema_cfg.get("enabled", True))
+    dom_cfg = dict(STAGE2_WHALE_TELEMETRY.get("dominance", {}))
 
     rings: dict[str, Ring] = {}
 
@@ -271,13 +361,15 @@ async def run_whale_worker() -> None:
                 vdev = _vwap_dev(closes, volumes, window=tail_window)
                 slope = _slope_twap(closes, window=min(20, tail_window))
                 iceberg = _iceberg_flag(volumes, z_thr=2.5)
+                vol_spike = _volume_spike(volumes, z_thr=2.0)
 
                 logger.debug(
-                    "Розраховано метрики для %s: vdev=%.5f, slope=%.5f, iceberg=%s",
+                    "Розраховано метрики для %s: vdev=%.5f, slope=%.5f, iceberg=%s, vol_spike=%s",
                     sym,
                     vdev,
                     slope,
                     iceberg,
+                    vol_spike,
                 )
 
                 # Стратегії‑ознаки
@@ -286,6 +378,7 @@ async def run_whale_worker() -> None:
                     "vwap_selling": vdev < 0.0,
                     "twap_accumulation": slope > 0.001,
                     "iceberg_orders": iceberg,
+                    "vol_spike": vol_spike,
                 }
 
                 vwap_abs = abs(vdev)
@@ -295,33 +388,24 @@ async def run_whale_worker() -> None:
                 elif vwap_abs >= mid_dev_thr:
                     vwap_level = "mid"
 
-                # Зони (дуже проста евристика)
                 vwap_est = float(closes[-1]) - vdev * float(closes[-1])
                 zones = _zones_simple(closes, vwap=vwap_est, lookback=20)
 
-                # Presence score
                 presence = 0.0
-                presence += (1.0 if (vdev > 0 or vdev < 0) else 0.0) * float(
-                    weights.get("vwap", 0.25)
-                )
-                presence += (1.0 if iceberg else 0.0) * float(
-                    weights.get("iceberg", 0.20)
-                )
+                presence += (1.0 if vdev != 0.0 else 0.0) * float(weights.get("vwap", 0.25))
+                presence += (1.0 if iceberg else 0.0) * float(weights.get("iceberg", 0.20))
                 presence += (1.0 if zones.get("accum", 0) >= 3 else 0.0) * float(
                     weights.get("accum", 0.10)
                 )
                 presence += (1.0 if zones.get("dist", 0) >= 3 else 0.0) * float(
                     weights.get("dist", 0.30)
                 )
-                presence += (1.0 if slope > 0.0 else 0.0) * float(
-                    weights.get("twap", 0.15)
-                )
-                # dev bonus
+                presence += (1.0 if slope > 0.0 else 0.0) * float(weights.get("twap", 0.15))
                 if vwap_level == "strong":
                     presence += dev_bonus_hi
                 elif vwap_level == "mid":
                     presence += dev_bonus_lo
-                # iceberg-only cap
+
                 if strats["iceberg_orders"] and not any(
                     [
                         strats["vwap_buying"],
@@ -330,23 +414,39 @@ async def run_whale_worker() -> None:
                     ]
                 ):
                     presence = min(presence, iceberg_only_cap)
-                presence = float(round(max(0.0, min(1.0, presence)), 4))
 
-                # Bias (sign від vdev + підсилення slope + корекція iceberg)
+                if not any(
+                    [
+                        strats["vwap_buying"],
+                        strats["vwap_selling"],
+                        strats["twap_accumulation"],
+                        strats["iceberg_orders"],
+                    ]
+                ):
+                    presence = min(presence, presence_proxy_cap)
+                    if (zones.get("accum", 0) or 0) <= 0 and (zones.get("dist", 0) or 0) <= 0:
+                        presence = min(presence, presence_zones_none_cap)
+                    elif (zones.get("accum", 0) or 0) > 0 and (zones.get("dist", 0) or 0) <= 0:
+                        presence = min(presence, presence_accum_only_cap)
+
+                presence_capped = max(0.0, min(1.0, presence))
+                presence = _apply_presence_ema(sym, presence_capped, alpha=ema_alpha, enabled=ema_enabled)
+
                 bias = 0.0
-                if vdev != 0.0:
-                    base = min(1.0, vwap_abs / max(1e-6, strong_dev_thr) * 0.5)
+                if abs(vdev) >= bias_vwap_thr:
+                    base = min(1.0, vwap_abs / max(1e-6, strong_dev_thr)) * 0.5
                     bias = math.copysign(base, vdev)
-                    # twap boost ~0.1 у бік slope
-                    bias += (
-                        0.1
-                        if (slope > 0 and bias > 0)
-                        else (-0.1 if (slope < 0 and bias < 0) else 0.0)
-                    )
-                    # iceberg epsilon
+                    if slope > 0 and vdev > 0:
+                        bias = min(1.0, bias + 0.1)
+                    elif slope < 0 and vdev < 0:
+                        bias = max(-1.0, bias - 0.1)
                     if iceberg:
-                        bias += 0.02 if bias > 0 else -0.02
-                    bias = float(max(-1.0, min(1.0, bias)))
+                        bias += 0.02 if vdev > 0 else -0.02
+                    if vol_spike:
+                        bias += 0.03 if vdev > 0 else -0.03
+                    bias = math.copysign(min(1.0, max(0.0, abs(bias))), vdev)
+                else:
+                    bias = 0.0
 
                 logger.debug(
                     "Presence=%.4f, Bias=%.4f, vwap_level=%s, strats=%s, zones=%s",
@@ -357,38 +457,16 @@ async def run_whale_worker() -> None:
                     zones,
                 )
 
-                # Dominance flags (buy/sell) — легка версія на базі конфігурації, без складних нормалізацій
-                try:
-                    dom_cfg = dict(STAGE2_WHALE_TELEMETRY.get("dominance", {}))
-                    vdev_thr = float(dom_cfg.get("vwap_dev_min", 0.01))
-                    alt = dom_cfg.get("alt_confirm", {}) or {}
-                    need_any = int(alt.get("need_any", 1))
-                    use_iceberg = bool(alt.get("iceberg", True))
-                    use_volspike = bool(alt.get("vol_spike", True))
-                    dist_min = int(alt.get("dist_zones_min", 3))
-
-                    alt_buy_ct = 0
-                    if use_iceberg:
-                        alt_buy_ct += 1 if iceberg else 0
-                    if use_volspike:
-                        # У цій легкій версії використовуємо iceberg як проксі vol_spike
-                        alt_buy_ct += 1 if iceberg else 0
-                    if dist_min:
-                        alt_buy_ct += 1 if (zones.get("accum", 0) >= dist_min) else 0
-
-                    alt_sell_ct = 0
-                    if use_iceberg:
-                        alt_sell_ct += 1 if iceberg else 0
-                    if use_volspike:
-                        alt_sell_ct += 1 if iceberg else 0
-                    if dist_min:
-                        alt_sell_ct += 1 if (zones.get("dist", 0) >= dist_min) else 0
-
-                    dom_buy = bool((vdev >= vdev_thr) and (alt_buy_ct >= need_any))
-                    dom_sell = bool(((-vdev) >= vdev_thr) and (alt_sell_ct >= need_any))
-                except Exception:
-                    dom_buy = False
-                    dom_sell = False
+                dom_flags = {
+                    "iceberg": iceberg,
+                    "vol_spike": vol_spike,
+                    "zones_accum": zones.get("accum", 0),
+                    "zones_dist": zones.get("dist", 0),
+                }
+                dominance_data = compute_dominance(vdev, slope, dom_flags, dom_cfg)
+                dom_buy = bool(dominance_data.get("buy"))
+                dom_sell = bool(dominance_data.get("sell"))
+                dominance_meta = dominance_data.get("meta", {})
 
                 whale_payload = {
                     "schema": "whale.v2",
@@ -400,40 +478,28 @@ async def run_whale_worker() -> None:
                     "strats": strats,
                     "zones": zones,
                     "dominance": {"buy": dom_buy, "sell": dom_sell},
+                    "dominance_meta": dominance_meta,
+                    "features": {
+                        "slope_twap": float(round(slope, 6)),
+                        "vol_spike": bool(vol_spike),
+                        "iceberg": bool(iceberg),
+                    },
                     "weights_profile": "strict",
                     "explain": {
                         "dev_level": vwap_level,
-                        "notes": [
+                        "raw_presence": float(round(presence_capped, 4)),
+                        "reasons": [
                             n
                             for n in [
-                                (
-                                    "asymmetry_bonus"
-                                    if (zones.get("dist", 0) - zones.get("accum", 0))
-                                    * (1 if bias < 0 else -1)
-                                    > 2
-                                    else None
-                                ),
-                                "strong_vwap_dev" if vwap_level == "strong" else None,
+                                "iceberg" if iceberg else None,
+                                "vol_spike" if vol_spike else None,
+                                "vwap_strong" if vwap_level == "strong" else None,
+                                "vwap_mid" if vwap_level == "mid" else None,
                             ]
                             if n is not None
                         ],
                     },
                 }
-                try:
-                    await ds.redis.jset(
-                        "whale", sym, "1m", value=whale_payload, ttl=ttl
-                    )
-                    logger.info(
-                        "Опубліковано whale_payload для %s (presence=%.3f, bias=%.3f)",
-                        sym,
-                        presence,
-                        bias,
-                    )
-                except Exception as exc:
-                    if STRICT_LOG_MARKERS:
-                        logger.debug(
-                            "[STRICT_WHALE] jset whale failed for %s: %s", sym, exc
-                        )
 
                 if INSIGHT_LAYER_ENABLED:
                     # Телеметрія‑only картка

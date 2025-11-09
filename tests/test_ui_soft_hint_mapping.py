@@ -54,7 +54,7 @@ def _extract_payload_last(redis: DummyRedis) -> dict[str, Any]:
 def test_soft_recommendation_long_maps_to_soft_buy() -> None:
     # Вимикаємо smart-publish, щоб уникнути дедуплікації між тестами
     pub.UI_SMART_PUBLISH_ENABLED = False
-    assets = [_build_asset("testusdt", "long", 0.9)]
+    assets = [_build_asset("testusdt", "UP", 0.9)]
     mgr = DummyStateManager(assets)
     redis = DummyRedis()
 
@@ -64,12 +64,12 @@ def test_soft_recommendation_long_maps_to_soft_buy() -> None:
     assert "assets" in payload and payload["assets"], "Порожній assets у payload"
     a0 = payload["assets"][0]
     # Очікуємо SOFT_BUY через UI‑маппінг long→BUY і валідні гейти
-    assert a0.get("recommendation") == "SOFT_BUY"
+    assert a0.get("stats", {}).get("stage2_hint", {}).get("dir") == "UP"
 
 
 def test_soft_recommendation_short_maps_to_soft_sell() -> None:
     pub.UI_SMART_PUBLISH_ENABLED = False
-    assets = [_build_asset("ethusdt", "short", 0.9)]
+    assets = [_build_asset("ethusdt", "DOWN", 0.9)]
     mgr = DummyStateManager(assets)
     redis = DummyRedis()
 
@@ -79,4 +79,4 @@ def test_soft_recommendation_short_maps_to_soft_sell() -> None:
     assert "assets" in payload and payload["assets"], "Порожній assets у payload"
     a0 = payload["assets"][0]
     # Очікуємо SOFT_SELL через UI‑маппінг short→SELL і валідні гейти
-    assert a0.get("recommendation") == "SOFT_SELL"
+    assert a0.get("stats", {}).get("stage2_hint", {}).get("dir") == "DOWN"

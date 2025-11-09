@@ -692,9 +692,9 @@ async def publish_full_state(
                             # Це не змінює контракти Stage1/Stage2/Stage3, лише впливає на відображення бейджів
                             if isinstance(hint_dir, str):
                                 _d = hint_dir.strip().lower()
-                                if _d == "long":
+                                if _d in ("long", "up"):
                                     hint_dir = "BUY"
-                                elif _d == "short":
+                                elif _d in ("short", "down"):
                                     hint_dir = "SELL"
                             hint_score = safe_float(
                                 getattr(hint_blk, "get", dict.get)(hint_blk, "score")

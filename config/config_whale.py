@@ -60,6 +60,21 @@ class WhaleTelemetryEMAConfig(TypedDict, total=False):
     alpha: float
 
 
+class WhaleTelemetryHintWeights(TypedDict, total=False):
+    """Ваги компонентів для stage2_hint score."""
+
+    presence: float
+    bias: float
+    vwap_dev: float
+
+
+class WhaleTelemetryHintCooldown(TypedDict, total=False):
+    """Налаштування cooldown для stage2_hint."""
+
+    base: float
+    impulse: float
+
+
 class WhaleTelemetryConfig(TypedDict, total=False):
     """Базовий словник конфігурації китових метрик."""
 
@@ -82,6 +97,10 @@ class WhaleTelemetryConfig(TypedDict, total=False):
     presence_zones_none_cap: float
     presence_accum_only_cap: float
     ema: WhaleTelemetryEMAConfig
+    hint_weights: WhaleTelemetryHintWeights
+    hint_cooldown: WhaleTelemetryHintCooldown
+    stale_score_penalty: float
+    neutral_score_penalty: float
 
 
 STAGE2_WHALE_TELEMETRY: Final[WhaleTelemetryConfig] = {
@@ -125,6 +144,17 @@ STAGE2_WHALE_TELEMETRY: Final[WhaleTelemetryConfig] = {
         "enabled": True,
         "alpha": 0.30,
     },
+    "hint_weights": {
+        "presence": 0.45,
+        "bias": 0.35,
+        "vwap_dev": 0.20,
+    },
+    "hint_cooldown": {
+        "base": 120.0,
+        "impulse": 45.0,
+    },
+    "stale_score_penalty": 0.5,
+    "neutral_score_penalty": 0.6,
 }
 
 __all__ = ["WhaleTelemetryConfig", "STAGE2_WHALE_TELEMETRY"]

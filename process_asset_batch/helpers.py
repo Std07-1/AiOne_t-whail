@@ -196,6 +196,124 @@ def normalize_and_cap_dvr(
     return float(capped)
 
 
+def build_stage2_hint_from_whale(
+    whale_embedded: dict[str, Any] | None,
+    hint_cfg: dict[str, Any] | None = None,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Формує stage2_hint на основі whale‑телеметрії (pure-функція)."""
+
+    cfg = hint_cfg or (STAGE2_WHALE_TELEMETRY or {})
+    if not isinstance(whale_embedded, dict):
+        now_value = int(now_ms if now_ms is not None else time.time() * 1000)
+        cooldown_cfg = (cfg.get("hint_cooldown") or {}) if isinstance(cfg, dict) else {}
+        base_cd = float(cooldown_cfg.get("base", 120.0))
+        return {
+            "dir": "NEUTRAL",
+            "score": 0.0,
+            "reasons": [],
+            "ts": now_value,
+            "cooldown_s": int(round(base_cd)),
+        }
+
+    def _clip01(val: float) -> float:
+        return 0.0 if val < 0.0 else (1.0 if val > 1.0 else val)
+
+    presence_f = float(whale_embedded.get("presence") or 0.0)
+    bias_f = float(whale_embedded.get("bias") or 0.0)
+    vdev_f = float(whale_embedded.get("vwap_dev") or 0.0)
+    features_map = (
+        whale_embedded.get("features")
+        if isinstance(whale_embedded.get("features"), dict)
+        else {}
+    )
+    slope_f = float(features_map.get("slope_twap") or 0.0)
+    dom_state = (
+        whale_embedded.get("dominance")
+        if isinstance(whale_embedded.get("dominance"), dict)
+        else {}
+    )
+    dom_meta = (
+        whale_embedded.get("dominance_meta")
+        if isinstance(whale_embedded.get("dominance_meta"), dict)
+        else {}
+    )
+
+    dir_hint = "NEUTRAL"
+    if bool(dom_state.get("buy")) and bias_f > 0:
+        dir_hint = "UP"
+    elif bool(dom_state.get("sell")) and bias_f < 0:
+        dir_hint = "DOWN"
+
+    weights = (cfg.get("hint_weights") or {}) if isinstance(cfg, dict) else {}
+    presence_norm = _clip01(presence_f)
+    bias_norm = _clip01(abs(bias_f))
+    strong_dev = float(cfg.get("strong_dev_thr", 0.02) or 0.02)
+    vdev_norm = min(1.0, abs(vdev_f) / max(strong_dev, 1e-6))
+    score = (
+        presence_norm * float((weights or {}).get("presence", 0.45))
+        + bias_norm * float((weights or {}).get("bias", 0.35))
+        + vdev_norm * float((weights or {}).get("vwap_dev", 0.20))
+    )
+    score = _clip01(score)
+
+    reasons: list[str] = []
+    if vdev_f > 0:
+        reasons.append("vwap_dev↑")
+    elif vdev_f < 0:
+        reasons.append("vwap_dev↓")
+
+    slope_thr = float((cfg.get("dominance") or {}).get("slope_abs_min", 0.0))
+    if slope_f > slope_thr:
+        reasons.append("slope_twap↑")
+    elif slope_f < -slope_thr:
+        reasons.append("slope_twap↓")
+
+    zones_summary = (
+        whale_embedded.get("zones_summary")
+        if isinstance(whale_embedded.get("zones_summary"), dict)
+        else {}
+    )
+    try:
+        dist_cnt = int(zones_summary.get("dist_cnt", 0))
+        reasons.append(f"zones.dist={dist_cnt}")
+    except Exception:
+        pass
+
+    if whale_embedded.get("stale"):
+        penalty = float(cfg.get("stale_score_penalty", 0.5))
+        score *= _clip01(penalty)
+        reasons.append("stale")
+
+    if dir_hint == "NEUTRAL":
+        neutral_penalty = float(cfg.get("neutral_score_penalty", 0.6))
+        score *= _clip01(neutral_penalty)
+        buy_candidate = bool(dom_meta.get("buy_candidate"))
+        sell_candidate = bool(dom_meta.get("sell_candidate"))
+        buy_confirmed = bool(dom_meta.get("buy_confirmed"))
+        sell_confirmed = bool(dom_meta.get("sell_confirmed"))
+        if buy_candidate and not buy_confirmed:
+            reasons.append("alt_confirm=0")
+        if sell_candidate and not sell_confirmed and "alt_confirm=0" not in reasons:
+            reasons.append("alt_confirm=0")
+
+    score = _clip01(score)
+    cooldown_cfg = (cfg.get("hint_cooldown") or {}) if isinstance(cfg, dict) else {}
+    base_cd = float(cooldown_cfg.get("base", 120.0))
+    impulse_cd = float(cooldown_cfg.get("impulse", 45.0))
+    cooldown_s = impulse_cd if dir_hint != "NEUTRAL" else base_cd
+
+    now_value = int(now_ms if now_ms is not None else time.time() * 1000)
+    return {
+        "dir": dir_hint,
+        "score": float(round(score, 4)),
+        "reasons": reasons,
+        "ts": now_value,
+        "cooldown_s": int(round(cooldown_s)),
+    }
+
+
 def is_heavy_compute_override(stats: dict[str, Any]) -> bool:
     """Override‑умова для heavy_compute whitelist: near_edge=True, band_pct<0.04, DVR≥0.6."""
     try:

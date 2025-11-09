@@ -26,6 +26,7 @@ from config.config import (
     STAGE2_SIGNAL_V2_PROFILES,
     TELEM_ENRICH_PHASE_PAYLOAD,
 )
+from config.config_whale import STAGE2_WHALE_TELEMETRY
 
 # strict overrides/whitelist were previously used for heavy-compute gating; now unused
 from config.flags import (
@@ -65,6 +66,7 @@ from process_asset_batch.helpers import (
     compute_ctx_persist,
     emit_prom_presence,
     ensure_whale_default,
+    build_stage2_hint_from_whale,
     explain_should_log,
     htf_adjust_alt_min,
     normalize_and_cap_dvr,
@@ -74,6 +76,7 @@ from process_asset_batch.helpers import (
     update_accum_monitor,
     write_profile_cooldown,
 )
+_ensure_whale_default = ensure_whale_default
 from process_asset_batch.router_signal_v2 import router_signal_v2
 from stage1.asset_monitoring import AssetMonitorStage1
 from utils.phase_adapter import detect_phase_from_stats, resolve_scenario
@@ -180,6 +183,9 @@ inc_liq_sweep_total = None  # type: ignore[assignment]
 inc_sweep_then_breakout = None  # type: ignore[assignment]
 inc_sweep_reject = None  # type: ignore[assignment]
 set_retest_ok = None  # type: ignore[assignment]
+set_whale_presence_metric = None  # type: ignore[assignment]
+set_whale_bias_metric = None  # type: ignore[assignment]
+set_whale_dominance_metric = None  # type: ignore[assignment]
 record_stage1_latency_ms = None  # type: ignore[assignment]
 try:
     from config.config import PROM_GAUGES_ENABLED  # noqa: F401
@@ -204,6 +210,20 @@ else:
             from telemetry.prom_gauges import (
                 set_scenario as _set_scenario,
             )
+            try:
+                from telemetry.prom_gauges import (  # type: ignore
+                    set_whale_presence as _set_whale_presence_metric,
+                )
+                from telemetry.prom_gauges import (  # type: ignore
+                    set_whale_bias as _set_whale_bias_metric,
+                )
+                from telemetry.prom_gauges import (  # type: ignore
+                    set_whale_dominance as _set_whale_dominance_metric,
+                )
+            except Exception:
+                _set_whale_presence_metric = None  # type: ignore[assignment]
+                _set_whale_bias_metric = None  # type: ignore[assignment]
+                _set_whale_dominance_metric = None  # type: ignore[assignment]
 
             try:
                 from telemetry.prom_gauges import (  # type: ignore
@@ -295,6 +315,9 @@ else:
             inc_scenario_reject = _inc_scenario_reject  # type: ignore[assignment]
             inc_explain_line = _inc_explain_line  # type: ignore[assignment]
             inc_explain_heartbeat = _inc_explain_heartbeat  # type: ignore[assignment]
+            set_whale_presence_metric = _set_whale_presence_metric  # type: ignore[assignment]
+            set_whale_bias_metric = _set_whale_bias_metric  # type: ignore[assignment]
+            set_whale_dominance_metric = _set_whale_dominance_metric  # type: ignore[assignment]
             set_context_near_edge_persist = _set_ctx_nep  # type: ignore[assignment]
             set_context_presence_sustain = _set_ctx_ps  # type: ignore[assignment]
             set_btc_regime = _set_btc_regime  # type: ignore[assignment]
@@ -590,6 +613,12 @@ class ProcessAssetBatchv1:
                         zones = (
                             w.get("zones") if isinstance(w.get("zones"), dict) else {}
                         )
+                        features_in = (
+                            w.get("features") if isinstance(w.get("features"), dict) else {}
+                        )
+                        dom_meta_in = (
+                            w.get("dominance_meta") if isinstance(w.get("dominance_meta"), dict) else {}
+                        )
                         accum_raw = (
                             zones.get("accum") if isinstance(zones, dict) else None
                         )
@@ -631,6 +660,7 @@ class ProcessAssetBatchv1:
                                 "presence": presence,
                                 "bias": bias,
                                 "vwap_dev": vdev,
+                                "features": features_in,
                                 "dev_level": (
                                     explain.get("dev_level")
                                     if isinstance(explain, dict)
@@ -664,6 +694,8 @@ class ProcessAssetBatchv1:
                                         "buy": bool(dom_in.get("buy")),
                                         "sell": bool(dom_in.get("sell")),
                                     }
+                                    if isinstance(dom_meta_in, dict):
+                                        whale_embedded["dominance_meta"] = dict(dom_meta_in)
                                 else:
                                     profile_cfg = STAGE2_SIGNAL_V2_PROFILES.get(
                                         STAGE2_PROFILE
@@ -705,10 +737,52 @@ class ProcessAssetBatchv1:
                                         "buy": dom_buy,
                                         "sell": dom_sell,
                                     }
+                                    whale_embedded.setdefault("dominance_meta", {})
+                                    whale_embedded["dominance_meta"].update(
+                                        {
+                                            "buy_candidate": bool(dom_buy),
+                                            "sell_candidate": bool(dom_sell),
+                                            "buy_confirmed": bool(dom_buy),
+                                            "sell_confirmed": bool(dom_sell),
+                                        }
+                                    )
                             except Exception:
                                 # best-effort, пропускаємо у разі проблем
                                 pass
+                            whale_embedded.setdefault("dominance_meta", {})
                             normalized.setdefault("stats", {})["whale"] = whale_embedded
+                            metric_symbol = lower_symbol.upper()
+                            try:
+                                if callable(set_whale_presence_metric):  # type: ignore[arg-type]
+                                    set_whale_presence_metric(  # type: ignore[misc]
+                                        metric_symbol,
+                                        float(whale_embedded.get("presence") or 0.0),
+                                    )
+                            except Exception:
+                                pass
+                            try:
+                                if callable(set_whale_bias_metric):  # type: ignore[arg-type]
+                                    set_whale_bias_metric(  # type: ignore[misc]
+                                        metric_symbol,
+                                        float(whale_embedded.get("bias") or 0.0),
+                                    )
+                            except Exception:
+                                pass
+                            try:
+                                dom_state = whale_embedded.get("dominance") or {}
+                                if callable(set_whale_dominance_metric) and isinstance(dom_state, dict):  # type: ignore[arg-type]
+                                    set_whale_dominance_metric(  # type: ignore[misc]
+                                        metric_symbol,
+                                        "buy",
+                                        1.0 if bool(dom_state.get("buy")) else 0.0,
+                                    )
+                                    set_whale_dominance_metric(  # type: ignore[misc]
+                                        metric_symbol,
+                                        "sell",
+                                        1.0 if bool(dom_state.get("sell")) else 0.0,
+                                    )
+                            except Exception:
+                                pass
                             accum_cnt = int(
                                 (whale_embedded.get("zones_summary") or {}).get(
                                     "accum_cnt", 0
@@ -800,841 +874,70 @@ class ProcessAssetBatchv1:
                                         pass
                 except Exception:
                     pass
-                # Stage2-lite hints
+                # Stage2-lite hints (dominance-driven скоринг)
                 try:
                     if STAGE2_HINT_ENABLED and isinstance(whale_embedded, dict):
                         logger.debug(
-                            "[STAGE2_HINT] %s: перевірка умов...", lower_symbol
+                            "[STAGE2_HINT] %s: побудова stage2_hint", lower_symbol
                         )
-                        if (
-                            not whale_embedded.get("stale")
-                            and isinstance(whale_embedded.get("presence"), (int, float))
-                            and isinstance(whale_embedded.get("bias"), (int, float))
-                            and isinstance(whale_embedded.get("vwap_dev"), (int, float))
-                        ):
-                            presence_f = float(whale_embedded["presence"])
-                            bias_f = float(whale_embedded["bias"])
-                            vdev_f = float(whale_embedded["vwap_dev"])
-                            vol_reg = str(whale_embedded.get("vol_regime", "unknown"))
+                        hint_cfg = STAGE2_WHALE_TELEMETRY or {}
+                        presence_f = float(whale_embedded.get("presence") or 0.0)
+                        bias_f = float(whale_embedded.get("bias") or 0.0)
+                        vdev_f = float(whale_embedded.get("vwap_dev") or 0.0)
+                        hint_obj = build_stage2_hint_from_whale(
+                            whale_embedded,
+                            hint_cfg,
+                        )
+                        dir_hint = str(hint_obj.get("dir") or "NEUTRAL")
+                        reasons = list(hint_obj.get("reasons") or [])
+                        normalized.setdefault("stats", {})["stage2_hint"] = hint_obj
+                        try:
+                            normalized.setdefault("market_context", {}).setdefault("meta", {})[
+                                "stage2_hint"
+                            ] = hint_obj
+                        except Exception:
+                            pass
 
-                            # Базові пороги (fallback), можуть бути перевизначені профілем
-                            presence_min = 0.55
-                            bias_min = 0.60
-                            vdev_min = 0.01
-                            cooldown_s = 240
-                            hysteresis_s = 30
-                            k_range: tuple[int, int] | None = None
+                        try:
+                            head = reasons[:3]
+                            tail = reasons[-3:] if len(reasons) > 3 else reasons[:]
+                            logger.info(
+                                "[STRICT_WHALE] dir=%s score=%.2f | reasons=%s head:%s tail:%s",
+                                dir_hint,
+                                hint_obj["score"],
+                                reasons,
+                                head,
+                                tail,
+                            )
+                        except Exception:
+                            pass
 
-                            # Профільний двигун (телеметрія‑only, під фіче‑флагом), не змінює контракти
-                            _prof_enabled = False
+                        try:
+                            price_now = None
                             try:
-                                import config.flags as _flags  # type: ignore
-
-                                _prof_enabled = bool(
-                                    getattr(_flags, "PROFILE_ENGINE_ENABLED", False)
-                                )
+                                price_now = float((normalized.get("stats") or {}).get("current_price"))
                             except Exception:
-                                _prof_enabled = False
-
-                            profile_name = None
-                            profile_conf = None
-                            if _prof_enabled:
-                                try:
-                                    from config.config_whale_profiles import (
-                                        apply_symbol_overrides as _apply_thr_ov,
-                                    )
-                                    from config.config_whale_profiles import (
-                                        get_profile_thresholds as _thr,
-                                    )
-                                    from config.config_whale_profiles import (
-                                        market_class_for_symbol as _mc,
-                                    )
-                                    from whale.institutional_entry_methods import (
-                                        alt_flags_from_iem as _alt_from_iem,
-                                    )
-                                    from whale.orderbook_analysis import (
-                                        alt_flags_from_stats as _alt_from_stats,
-                                    )
-                                    from whale.profile_selector import (
-                                        apply_hysteresis as _apply_hysteresis,
-                                    )
-                                    from whale.profile_selector import (
-                                        select_profile as _select_profile,
-                                    )
-
-                                    mc = _mc(lower_symbol)
-                                    # Підрахунок edge‑hits (upper) у 15‑барному вікні для селектора
-                                    try:
-                                        st_local = normalized.get("stats") or {}
-                                        ne = st_local.get("near_edge")
-                                        near_upper_flag = bool(
-                                            ne is True or str(ne).lower() == "upper"
-                                        )
-                                        er = _EDGE_HIT_RING.setdefault(
-                                            lower_symbol, deque(maxlen=15)
-                                        )
-                                        er.append(bool(near_upper_flag))
-                                        st_local["edge_hits_upper"] = int(
-                                            sum(1 for x in er if x)
-                                        )
-                                        st_local["edge_hits_window"] = int(len(er))
-                                        normalized["stats"] = st_local
-                                    except Exception:
-                                        pass
-                                    prof_raw, profile_conf, reasons_prof = (
-                                        _select_profile(
-                                            normalized.get("stats"),
-                                            whale_embedded,
-                                            lower_symbol,
-                                        )
-                                    )
-                                    # Гістерезис профілю
-                                    st = _PROFILE_STATE.setdefault(lower_symbol, {})
-                                    prev_prof = st.get("active")
-                                    last_sw = st.get("last_switch_ts")
-                                    thr0 = _thr(mc, prof_raw)
-                                    if isinstance(thr0, dict) and thr0:
-                                        hysteresis_s = int(
-                                            thr0.get("hysteresis_s", hysteresis_s)
-                                        )
-                                    profile_name = _apply_hysteresis(
-                                        prev_prof,
-                                        prof_raw,
-                                        float(last_sw or 0.0),
-                                        hysteresis_s,
-                                    )
-                                    hysteresis_applied = bool(
-                                        prev_prof and prof_raw != profile_name
-                                    )
-                                    if profile_name != prev_prof and prev_prof:
-                                        st["last_switch_ts"] = time.time()
-                                        try:
-                                            if callable(
-                                                locals().get("inc_profile_switch")
-                                            ):
-                                                locals()["inc_profile_switch"](str(prev_prof), str(profile_name))  # type: ignore[index]
-                                        except Exception:
-                                            pass
-                                        st["active"] = profile_name
-                                    elif not prev_prof:
-                                        st["active"] = profile_name
-
-                                    thr = _thr(mc, profile_name)
-                                    if isinstance(thr, dict) and thr:
-                                        presence_min = float(
-                                            thr.get("presence_min", presence_min)
-                                        )
-                                        bias_min = float(
-                                            thr.get("bias_abs_min", bias_min)
-                                        )
-                                        vdev_min = float(
-                                            thr.get("vwap_dev_min", vdev_min)
-                                        )
-                                        cooldown_s = int(
-                                            thr.get("cooldown_s", cooldown_s)
-                                        )
-                                        k_range = tuple(thr.get("k_range", (5, 10)))  # type: ignore[assignment]
-                                        # ATR-scale (за vol_regime), масштабуємо пороги лінійно
-                                        try:
-                                            scale_map = thr.get("atr_scale") or {}
-                                            scale = float(scale_map.get(str(vol_reg), 1.0) or 1.0)  # type: ignore[arg-type]
-                                            presence_min *= scale
-                                            bias_min *= scale
-                                            vdev_min *= scale
-                                        except Exception:
-                                            pass
-                                    # ── HTF: alt_confirm_min полегшення при up+confluence для BTC/ETH ──
-                                    try:
-                                        from config.flags import (
-                                            HTF_CONTEXT_ENABLED,
-                                        )
-
-                                        _htf_on = HTF_CONTEXT_ENABLED
-                                    except Exception:
-                                        _htf_on = False
-                                    # Витягаємо last_h1 через єдиний helper (мінімальний диф)
-                                    try:
-                                        st_local = normalized.get("stats") or {}
-                                        last_h1 = (
-                                            _extract_last_h1(st_local)
-                                            if callable(_extract_last_h1)
-                                            else None
-                                        )
-                                    except Exception:
-                                        last_h1 = None
-                                    try:
-                                        if isinstance(thr, dict) and thr:
-                                            thr = htf_adjust_alt_min(
-                                                mc, last_h1, thr, enabled=bool(_htf_on)
-                                            )
-                                    except Exception:
-                                        pass
-                                    # Символьні оверрайди профільних порогів (телеметрія‑only)
-                                    try:
-                                        thr2, _ov_applied = _apply_thr_ov(
-                                            thr if isinstance(thr, dict) else {},
-                                            lower_symbol,
-                                            str(profile_name or ""),
-                                        )
-                                        if isinstance(thr2, dict) and thr2:
-                                            thr = thr2
-                                        if _ov_applied:
-                                            try:
-                                                reasons_prof.append("override=1")  # type: ignore[arg-type]
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        pass
-                                    logger.info(
-                                        "[PROFILE] %s profile=%s conf=%.2f | thr(p=%.2f b=%.2f v=%.3f dom=%s alt_min=%d cool=%ds) reasons=%s",
-                                        lower_symbol,
-                                        profile_name,
-                                        float(profile_conf or 0.0),
-                                        float(presence_min),
-                                        float(bias_min),
-                                        float(vdev_min),
-                                        (
-                                            str(
-                                                bool(
-                                                    thr.get("require_dominance", False)
-                                                )
-                                            )
-                                            if isinstance(thr, dict)
-                                            else "False"
-                                        ),
-                                        (
-                                            int(thr.get("alt_confirm_min", 0))
-                                            if isinstance(thr, dict)
-                                            else 0
-                                        ),
-                                        int(cooldown_s),
-                                        (
-                                            reasons_prof
-                                            if "reasons_prof" in locals()
-                                            else []
-                                        ),
-                                    )
-                                    # Додаємо у market_context.meta спостережний профіль
-                                    try:
-                                        normalized.setdefault(
-                                            "market_context", {}
-                                        ).setdefault("meta", {})["profile"] = {
-                                            "name": profile_name,
-                                            "conf": float(profile_conf or 0.0),
-                                            "k_range": k_range or (5, 10),
-                                        }
-                                    except Exception:
-                                        pass
-                                    # Метрики профілю (best-effort)
-                                    try:
-                                        if callable(locals().get("set_profile_active")):
-                                            locals()["set_profile_active"](symbol.upper(), str(profile_name), mc)  # type: ignore[index]
-                                        if callable(
-                                            locals().get("set_profile_confidence")
-                                        ):
-                                            locals()["set_profile_confidence"](symbol.upper(), float(profile_conf or 0.0))  # type: ignore[index]
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    logger.debug(
-                                        "[PROFILE] %s: selector failed",
-                                        lower_symbol,
-                                        exc_info=True,
-                                    )
-
-                            # Alt-confirm прапорці (дедуп у множину)
-                            from_stats = {}
-                            from_iem = {}
-                            try:
-                                from_stats = _alt_from_stats(
-                                    normalized.get("stats") or {}
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                iem_res = (normalized.get("stats") or {}).get("iem")
-                                if isinstance(iem_res, dict):
-                                    from_iem = _alt_from_iem(iem_res)
-                            except Exception:
-                                pass
-                            active_alt = active_alt_keys(from_stats, from_iem)
-                            alt_confirms_count = len(active_alt)
-
-                            # Домінування за напрямом кандидата (за знаком bias)
-                            dom = whale_embedded.get("dominance") or {}
-                            dom_buy = bool((dom or {}).get("buy"))
-                            dom_sell = bool((dom or {}).get("sell"))
-                            candidate_up = bias_f >= 0.0
-                            dom_ok = True
-                            if (
-                                _prof_enabled
-                                and isinstance(thr, dict)
-                                and bool(thr.get("require_dominance", False))
-                            ):
-                                dom_ok = bool(dom_buy if candidate_up else dom_sell)
-                            alt_ok = True
-                            if _prof_enabled and isinstance(thr, dict):
-                                alt_ok = alt_confirms_count >= int(
-                                    thr.get("alt_confirm_min", 0)
-                                )
-
-                            dir_hint: str | None = None
-                            # ── HTF контекст (Stage C, опційно): BTC/ETH up+confluence → бонус до conf і полегшення alt_confirm_min ──
-                            try:
-                                from config.flags import (
-                                    HTF_CONTEXT_ENABLED as _HTF_ON,  # type: ignore
-                                )
-                            except Exception:
-                                _HTF_ON = False  # type: ignore[assignment]  # noqa: N806
-                            htf_bonus_conf = 0.0
-                            if bool(_htf_on) and mc in ("BTC", "ETH"):
-                                try:
-                                    from context.htf_context import (
-                                        h1_ctx as _h1_ctx,  # type: ignore
-                                    )
-                                except Exception:
-                                    _h1_ctx = None  # type: ignore[assignment]
-                                # Єдина точка вилучення last_h1 (helper)
-                                try:
-                                    st_local = normalized.get("stats") or {}
-                                    last_h1 = (
-                                        _extract_last_h1(st_local)
-                                        if callable(_extract_last_h1)
-                                        else None
-                                    )
-                                except Exception:
-                                    last_h1 = None
-                                if _h1_ctx and isinstance(last_h1, dict):
-                                    try:
-                                        h1_trend, h1_conf = _h1_ctx(last_h1)
-                                    except Exception:
-                                        h1_trend, h1_conf = ("unknown", False)
-                                    if h1_trend == "up" and bool(h1_conf):
-                                        htf_bonus_conf = 0.05
-                                        try:
-                                            reasons_prof.append("h1_trend=up")  # type: ignore[arg-type]
-                                            reasons_prof.append("h1_conf=1")  # type: ignore[arg-type]
-                                        except Exception:
-                                            pass
-                            if (
-                                vdev_f >= vdev_min
-                                and abs(bias_f) >= bias_min
-                                and presence_f >= presence_min
-                                and dom_ok
-                                and alt_ok
-                            ):
-                                dir_hint = (
-                                    "long"
-                                    if (bias_f > 0.0 or dom_buy)
-                                    else "short" if (bias_f < 0.0 or dom_sell) else None
-                                )
-
-                            if dir_hint and vol_reg != "hyper":
-                                now_ts = time.time()
-                                last_ts = _HINT_COOLDOWN_LAST_TS.get(lower_symbol, 0.0)
-                                if (now_ts - last_ts) >= cooldown_s:
-                                    ring = _WHALE_METRIC_RING.get(lower_symbol)
-                                    if ring is None:
-                                        ring = deque(maxlen=3)
-                                        _WHALE_METRIC_RING[lower_symbol] = ring
-                                    ring.append((presence_f, bias_f))
-                                    stable_ok = True
-                                    if len(ring) >= 2:
-                                        dp = abs(ring[-1][0] - ring[-2][0])
-                                        db = abs(ring[-1][1] - ring[-2][1])
-                                        if max(dp, db) > 0.10:
-                                            stable_ok = False
-                                    if stable_ok:
-                                        # Обчислення score за профільною схемою (0..1)
-                                        def _clip01(x: float) -> float:
-                                            return (
-                                                0.0 if x < 0 else (1.0 if x > 1 else x)
-                                            )
-
-                                        # Нормування проксі
-                                        pres_n = max(0.0, min(1.0, presence_f))
-                                        bias_n = max(0.0, min(1.0, abs(bias_f)))
-                                        vdev_n = max(
-                                            0.0,
-                                            min(1.0, abs(vdev_f) / max(vdev_min, 1e-6)),
-                                        )
-                                        agrees = (
-                                            1.0
-                                            if (
-                                                (bias_f >= 0 and dom_buy)
-                                                or (bias_f <= 0 and dom_sell)
-                                                or (bias_f == 0)
-                                            )
-                                            else 0.0
-                                        )
-                                        w1, w2, w3, w4, w5, w6 = (
-                                            0.35,
-                                            0.25,
-                                            0.10,
-                                            0.10,
-                                            0.10,
-                                            0.10,
-                                        )
-                                        # бонус до профільної впевненості від HTF (якщо є)
-                                        prof_conf_eff = float(
-                                            profile_conf or 0.0
-                                        ) + float(htf_bonus_conf or 0.0)
-                                        score = _clip01(
-                                            w1 * pres_n
-                                            + w2 * bias_n * (1.0 if agrees else 0.8)
-                                            + w3 * vdev_n
-                                            + w4 * (1.0 if dom_ok else 0.0)
-                                            + w5 * prof_conf_eff
-                                            + w6 * (1.0 if alt_ok else 0.0)
-                                        )
-                                        # Пер‑клас масштаб score (BTC=1.0, ETH=0.95, ALTS=0.85)
-                                        try:
-                                            score *= score_scale_for_class(mc)
-                                        except Exception:
-                                            pass
-                                        cooldown_active = False
-                                        # cooldown пенальті (якщо активний)
-                                        try:
-                                            cd_until = (
-                                                _PROFILE_STATE.get(lower_symbol) or {}
-                                            ).get("cooldown_until_ts")
-                                            if not isinstance(cd_until, (int, float)):
-                                                # Мʼякий відновлювач cooldown із Redis (при рестарті)
-                                                cd_restore = (
-                                                    await read_profile_cooldown(
-                                                        lower_symbol
-                                                    )
-                                                )
-                                                if isinstance(cd_restore, (int, float)):
-                                                    _PROFILE_STATE.setdefault(
-                                                        lower_symbol, {}
-                                                    )["cooldown_until_ts"] = cd_restore
-                                                    cd_until = cd_restore
-                                            if isinstance(
-                                                cd_until, (int, float)
-                                            ) and now_ts < float(cd_until):
-                                                score *= 0.5
-                                                dir_hint = (
-                                                    None  # форсуємо нейтральний вихід
-                                                )
-                                                cooldown_active = True
-                                        except Exception:
-                                            pass
-                                        # Пенальті/стеля для stale whale-підказок + нейтралізація
-                                        try:
-                                            if bool(whale_embedded.get("stale")):
-                                                from config.config_stage2 import (
-                                                    STAGE2_INSIGHT as _INS_CFG,
-                                                )
-
-                                                stale_penalty = float(
-                                                    (_INS_CFG or {}).get(
-                                                        "stale_hint_penalty", 0.5
-                                                    )
-                                                )
-                                                stale_cap = float(
-                                                    (_INS_CFG or {}).get(
-                                                        "stale_hint_cap", 0.35
-                                                    )
-                                                )
-                                                score = min(
-                                                    stale_cap, score * stale_penalty
-                                                )
-                                                # fail-open: додатково форсуємо NEUTRAL та зменшуємо
-                                                dir_hint = None
-                                                score *= 0.5
-                                                stale_flag = True
-                                        except Exception:
-                                            pass
-                                        else:
-                                            stale_flag = False
-                                        reasons: list[str] = []
-                                        if presence_f >= presence_min:
-                                            reasons.append("presence_ok")
-                                        if abs(bias_f) >= bias_min:
-                                            reasons.append("bias_ok")
-                                        if abs(vdev_f) >= vdev_min:
-                                            reasons.append("vwap_dev_ok")
-                                        reasons.append(f"profile={profile_name}")
-                                        reasons.append(f"dom_ok={(1 if dom_ok else 0)}")
-                                        reasons.append(f"alt_ok={(1 if alt_ok else 0)}")
-                                        if htf_bonus_conf > 0.0:
-                                            reasons.append("htf_bonus=1")
-                                        reasons.append(
-                                            f"hysteresis={(1 if 'hysteresis_applied' in locals() and hysteresis_applied else 0)}"
-                                        )
-                                        reasons.append(
-                                            f"cooldown={(1 if cooldown_active else 0)}"
-                                        )
-                                        reasons.append(
-                                            f"stale={(1 if stale_flag else 0)}"
-                                        )
-                                        reasons.append(f"vol_regime={vol_reg}")
-                                        # False breakout → range_fade: форсуємо нейтральний напрям і маркер причини
-                                        try:
-                                            if str(profile_name) == "range_fade":
-                                                rp = (
-                                                    locals().get("reasons_prof")
-                                                    if "reasons_prof" in locals()
-                                                    else []
-                                                )
-                                                if any(
-                                                    isinstance(r, str)
-                                                    and "false_breakout" in r
-                                                    for r in (rp or [])
-                                                ):
-                                                    reasons.append(
-                                                        "range_fade_from_false_breakout=1"
-                                                    )
-                                                    dir_hint = None
-                                                    try:
-                                                        if callable(
-                                                            locals().get(
-                                                                "inc_false_breakout_detected"
-                                                            )
-                                                        ):
-                                                            locals()[
-                                                                "inc_false_breakout_detected"
-                                                            ](
-                                                                symbol.upper(), "up"
-                                                            )  # type: ignore[index]
-                                                    except Exception:
-                                                        pass
-                                        except Exception:
-                                            pass
-                                        # Діагностика pre_breakout_flag для probe_up: поруч із верхнім краєм і достатній нахил TWAP
-                                        try:
-                                            if str(profile_name) == "probe_up":
-                                                st_local = normalized.get("stats") or {}
-                                                ne = st_local.get("near_edge")
-                                                near_upper_flag = bool(
-                                                    ne is True
-                                                    or str(ne).lower() == "upper"
-                                                )
-                                                try:
-                                                    s_val = float(
-                                                        st_local.get(K_PRICE_SLOPE_ATR)
-                                                        or st_local.get(
-                                                            "price_slope_atr"
-                                                        )
-                                                        or 0.0
-                                                    )
-                                                except Exception:
-                                                    s_val = 0.0
-                                                slope_ok = bool(s_val >= 0.8)
-                                                reasons.append(
-                                                    f"pre_breakout={(1 if (near_upper_flag and slope_ok) else 0)}"
-                                                )
-                                                reasons.append(
-                                                    f"slope_twap_ok={(1 if slope_ok else 0)}"
-                                                )
-                                        except Exception:
-                                            pass
-                                        # ── Pre‑breakout гіпотеза: NEUTRAL під час chop; confirm при accept або alt_confirm≥thr ──
-                                        try:
-                                            st_local = normalized.get("stats") or {}
-                                            ne = st_local.get("near_edge")
-                                            near_upper_flag = bool(
-                                                ne is True or str(ne).lower() == "upper"
-                                            )
-                                            accept_ok = bool(
-                                                st_local.get("acceptance_ok", False)
-                                            )
-                                        except Exception:
-                                            near_upper_flag, accept_ok = False, False
-                                        # Відкриття та підтримка гіпотези, якщо активний chop‑профіль
-                                        if str(profile_name) == "chop_pre_breakout_up":
-                                            # edge hits для reasons (best‑effort)
-                                            try:
-                                                eh = int(
-                                                    st_local.get("edge_hits_upper") or 0
-                                                )
-                                                ew = int(
-                                                    st_local.get("edge_hits_window")
-                                                    or 0
-                                                )
-                                            except Exception:
-                                                eh, ew = 0, 0
-                                            hs = _HYP_STATE.get(lower_symbol) or {}
-                                            if (not hs) or (
-                                                now_ts
-                                                >= float(
-                                                    hs.get("expires_ts", 0.0) or 0.0
-                                                )
-                                            ):
-                                                _HYP_STATE[lower_symbol] = {
-                                                    "type": "pre_breakout",
-                                                    "state": "open",
-                                                    "opened_ts": now_ts,
-                                                    "expires_ts": now_ts + 120.0,
-                                                    "edge_hits": eh,
-                                                    "window": ew,
-                                                }
-                                                try:
-                                                    if callable(
-                                                        locals().get(
-                                                            "inc_hypothesis_open"
-                                                        )
-                                                    ):
-                                                        locals()["inc_hypothesis_open"]("pre_breakout")  # type: ignore[index]
-                                                except Exception:
-                                                    pass
-                                                logger.info(
-                                                    "[HYP] %s pre_breakout OPEN | edge_hits=%d/%d",
-                                                    lower_symbol,
-                                                    eh,
-                                                    ew,
-                                                )
-                                            # Під час chop форсуємо нейтральний напрям + причини діагностики
-                                            dir_hint = None
-                                            reasons.append("chop_pre_breakout")
-                                            reasons.append("pre_breakout=1")
-                                            reasons.append("pre_breakout_wait")
-                                            reasons.append(f"edge_hits={eh}/{ew}")
-                                            try:
-                                                s_val = float(
-                                                    st_local.get(K_PRICE_SLOPE_ATR)
-                                                    or st_local.get("price_slope_atr")
-                                                    or 0.0
-                                                )
-                                            except Exception:
-                                                s_val = 0.0
-                                            reasons.append(
-                                                f"slope_twap_ok={(1 if s_val>=0.8 else 0)}"
-                                            )
-                                            # інкремент chop‑лічильника (best‑effort)
-                                            try:
-                                                if callable(
-                                                    locals().get("inc_chop_hits_total")
-                                                ):
-                                                    locals()["inc_chop_hits_total"](symbol.upper(), "upper")  # type: ignore[index]
-                                            except Exception:
-                                                pass
-                                        # Confirm: accept або alt_confirm достатньо
-                                        try:
-                                            thr_alt_min = (
-                                                int(
-                                                    (thr or {}).get(
-                                                        "alt_confirm_min", 0
-                                                    )
-                                                )
-                                                if isinstance(thr, dict)
-                                                else 0
-                                            )
-                                        except Exception:
-                                            thr_alt_min = 0
-                                        confirm_flags: OrderedDict[str, bool] | None = (
-                                            None
-                                        )
-                                        confirm_ready = False
-                                        if str(profile_name) == "chop_pre_breakout_up":
-                                            confirm_ready, confirm_flags = (
-                                                should_confirm_pre_breakout(
-                                                    accept_ok=accept_ok,
-                                                    alt_confirms_count=alt_confirms_count,
-                                                    thr_alt_min=thr_alt_min,
-                                                    dominance_buy=dom_buy,
-                                                    vwap_dev=vdev_f,
-                                                    slope_atr=s_val,
-                                                )
-                                            )
-                                            for key, ok in (
-                                                confirm_flags or {}
-                                            ).items():
-                                                reasons.append(
-                                                    f"{key}={(1 if ok else 0)}"
-                                                )
-                                            if confirm_ready:
-                                                hs = _HYP_STATE.setdefault(
-                                                    lower_symbol, {}
-                                                )
-                                                hs.update(
-                                                    {
-                                                        "type": "pre_breakout",
-                                                        "state": "confirmed",
-                                                        "confirmed_ts": now_ts,
-                                                    }
-                                                )
-                                                try:
-                                                    if callable(
-                                                        locals().get(
-                                                            "inc_hypothesis_confirm"
-                                                        )
-                                                    ):
-                                                        locals()[
-                                                            "inc_hypothesis_confirm"
-                                                        ](
-                                                            "pre_breakout"
-                                                        )  # type: ignore[index]
-                                                except Exception:
-                                                    pass
-                                                reasons.append("pre_breakout_confirm")
-                                                # Після підтвердження дозволяємо напрямок UP
-                                                dir_hint = "long"
-                                        # Експірація open‑гіпотези
-                                        try:
-                                            hs = _HYP_STATE.get(lower_symbol) or {}
-                                            if (
-                                                hs
-                                                and hs.get("type") == "pre_breakout"
-                                                and hs.get("state") == "open"
-                                                and now_ts
-                                                > float(
-                                                    hs.get("expires_ts", 0.0) or 0.0
-                                                )
-                                            ):
-                                                hs["state"] = "expired"
-                                                try:
-                                                    if callable(
-                                                        locals().get(
-                                                            "inc_hypothesis_expired"
-                                                        )
-                                                    ):
-                                                        locals()["inc_hypothesis_expired"]("pre_breakout")  # type: ignore[index]
-                                                except Exception:
-                                                    pass
-                                                logger.info(
-                                                    "[HYP] %s pre_breakout EXPIRED",
-                                                    lower_symbol,
-                                                )
-                                        except Exception:
-                                            pass
-                                        hint_obj = {
-                                            "dir": (dir_hint or "neutral"),
-                                            "score": round(score, 4),
-                                            "reasons": reasons,
-                                            "ts": int(time.time() * 1000),
-                                            "cooldown_s": cooldown_s,
-                                        }
-                                        # Виносимо стан гіпотези у meta (спостережно)
-                                        try:
-                                            mc_meta = normalized.setdefault(
-                                                "market_context", {}
-                                            ).setdefault("meta", {})
-                                            hyp = _HYP_STATE.get(lower_symbol)
-                                            if (
-                                                hyp
-                                                and hyp.get("type") == "pre_breakout"
-                                            ):
-                                                mc_meta.setdefault("hypothesis", {})[
-                                                    "pre_breakout"
-                                                ] = {
-                                                    "state": hyp.get("state"),
-                                                    "edge_hits": hyp.get("edge_hits"),
-                                                    "window": hyp.get("window"),
-                                                }
-                                        except Exception:
-                                            pass
-                                        logger.info(
-                                            "[STAGE2_HINT] %s dir=%s score=%.3f presence=%.2f bias=%.2f vdev=%.3f vol=%s",
-                                            lower_symbol,
-                                            (dir_hint or "neutral"),
-                                            float(hint_obj["score"]),
-                                            presence_f,
-                                            bias_f,
-                                            vdev_f,
-                                            vol_reg,
-                                        )
-                                        try:
-                                            logger.info(
-                                                "[STRICT_WHALE] dir=%s score=%.2f | reasons=%s",
-                                                (dir_hint or "neutral"),
-                                                float(hint_obj["score"]),
-                                                ",".join(reasons[:3])
-                                                + ("..." if len(reasons) > 3 else ""),
-                                            )
-                                        except Exception:
-                                            pass
-                                        normalized.setdefault("stats", {})[
-                                            "stage2_hint"
-                                        ] = hint_obj
-                                        # Дублюємо хінт у market_context.meta (спостережно)
-                                        try:
-                                            normalized.setdefault(
-                                                "market_context", {}
-                                            ).setdefault("meta", {})[
-                                                "stage2_hint"
-                                            ] = hint_obj
-                                        except Exception:
-                                            pass
-                                        # Публікуємо як загальний manipulation_hint у Prometheus (long→up, short→down)
-                                        try:
-                                            from telemetry.prom_gauges import (
-                                                set_manipulation_hint as _mhint,
-                                            )
-
-                                            dir_map = {"long": "up", "short": "down"}
-                                            dlabel = dir_map.get(str(dir_hint))
-                                            if dlabel:
-                                                _mhint(symbol.upper(), dlabel, 1)
-                                        except Exception:
-                                            pass
-                                        # Кулдаун після позитивної емісії
-                                        try:
-                                            if dir_hint in ("long", "short"):
-                                                until = now_ts + float(cooldown_s)
-                                                _PROFILE_STATE.setdefault(
-                                                    lower_symbol, {}
-                                                )["cooldown_until_ts"] = until
-                                                # Мʼякий персист у Redis з TTL=120с
-                                                try:
-                                                    await write_profile_cooldown(
-                                                        lower_symbol, until, ttl_s=120
-                                                    )
-                                                except Exception:
-                                                    pass
-                                                if callable(
-                                                    locals().get(
-                                                        "inc_profile_hint_emitted"
-                                                    )
-                                                ):
-                                                    locals()["inc_profile_hint_emitted"]("up" if dir_hint == "long" else "down")  # type: ignore[index]
-                                        except Exception:
-                                            pass
-                                        try:
-                                            price_now = None
-                                            try:
-                                                price_now = float(
-                                                    (normalized.get("stats") or {}).get(
-                                                        "current_price"
-                                                    )
-                                                )
-                                            except Exception:
-                                                price_now = None
-                                            await log_stage1_event(
-                                                event="stage2_hint",
-                                                symbol=lower_symbol,
-                                                payload={
-                                                    "dir": dir_hint,
-                                                    "score": float(hint_obj["score"]),
-                                                    "reasons": hint_obj.get("reasons"),
-                                                    "price": price_now,
-                                                    # Додаємо контекст для офлайн аналізу
-                                                    "presence": presence_f,
-                                                    "bias": bias_f,
-                                                    "vwap_dev": vdev_f,
-                                                    "vol_regime": vol_reg,
-                                                },
-                                            )
-                                        except Exception:
-                                            logger.debug(
-                                                "[TELEM] %s: stage2_hint log failed",
-                                                lower_symbol,
-                                            )
-                                        _HINT_COOLDOWN_LAST_TS[lower_symbol] = now_ts
-                                    else:
-                                        logger.debug(
-                                            "[STAGE2_HINT] %s: не стабільний (dp=%.3f, db=%.3f)",
-                                            lower_symbol,
-                                            dp,
-                                            db,
-                                        )
-                                else:
-                                    logger.debug(
-                                        "[STAGE2_HINT] %s: cooldown ще не минув (%.1f сек)",
-                                        lower_symbol,
-                                        now_ts - last_ts,
-                                    )
+                                price_now = None
+                            await log_stage1_event(
+                                event="stage2_hint",
+                                symbol=lower_symbol,
+                                payload={
+                                    "dir": dir_hint,
+                                    "score": float(hint_obj["score"]),
+                                    "reasons": hint_obj.get("reasons"),
+                                    "price": price_now,
+                                    "presence": presence_f,
+                                    "bias": bias_f,
+                                    "vwap_dev": vdev_f,
+                                    "vol_regime": whale_embedded.get("vol_regime"),
+                                },
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[TELEM] %s: stage2_hint log failed",
+                                lower_symbol,
+                            )
+                        _HINT_COOLDOWN_LAST_TS[lower_symbol] = time.time()
                 except Exception as exc:
                     logger.error(
                         "[STAGE2_HINT] %s: помилка Stage2-lite hints: %s",

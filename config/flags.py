@@ -37,6 +37,9 @@ PROCESSOR_INSIGHT_WIREUP: bool = True
 # Дозволити використання vol_z_min proxy для етапу виснаження
 VOLZ_PROXY_ALLOWED_FOR_EXHAUSTION: bool = True
 
+# Stage3 paper: мінімальний whale-сигнал (канарейка)
+STAGE3_MIN_WHALE_SIGNAL_ENABLED: bool = True
+
 # Якщо True — позначаємо stats.vol_z_source="proxy" (коли ввімкнено проксі‑агрегацію).
 # За замовчуванням False, Stage1 виставляє "real".
 VOLZ_SOURCE_PROXY_MODE: bool = True
@@ -59,6 +62,9 @@ STAGE2_PROFILE: str = (
 # STAGE2_WHALE_EMBED_ENABLED — окремий флаг для вбудовування китової телеметрії
 # у Stage1.stats.whale (best‑effort). Вимкнення не впливає на роботу WhaleWorker/Redis.
 STAGE2_WHALE_EMBED_ENABLED: bool = True
+
+# Якщо True — Stage1 проставляє market_context.meta.whale_status, коли payload відсутній.
+STAGE1_WHALE_MISSING_META_ENABLED: bool = True
 
 # STAGE2_HINT_ENABLED — флаг для формування "stage2_hint" у stats (телеметрія‑only):
 # підказки long/short без впливу на Stage1 сигнал. За замовчуванням вимкнено.
@@ -273,10 +279,12 @@ __all__ = [
     "STAGE2_ENABLED",
     "STAGE2_PROFILE",
     "STAGE2_WHALE_EMBED_ENABLED",
+    "STAGE1_WHALE_MISSING_META_ENABLED",
     "STAGE2_HINT_ENABLED",
     "STAGE2_SIGNAL_V2_ENABLED",
     "STAGE2_WHALE_EMBED_ENABLED",
     "STAGE2_HINT_ENABLED",
+    "STAGE3_MIN_WHALE_SIGNAL_ENABLED",
     "EXH_STRATEGY_HINT_ENABLED",
     "INSIGHT_TELEMETRY_ONLY",
     "UI_WHALE_PUBLISH_ENABLED",

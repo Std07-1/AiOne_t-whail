@@ -82,6 +82,16 @@ class WhaleTelemetryConfig(TypedDict, total=False):
     presence_zones_none_cap: float
     presence_accum_only_cap: float
     ema: WhaleTelemetryEMAConfig
+    MIN_SIGNAL_PRESENCE: float
+    MIN_SIGNAL_BIAS: float
+    MIN_SIGNAL_DVR: float
+    MIN_SIGNAL_VWAP_DEV_ATR: float
+    MAX_BAND_PCT: float
+    RETEST_TTL_S: int
+    TIME_EXIT_S: int
+    SL_ATR: float
+    TP1_ATR: float
+    TP2_ATR: float
 
 
 STAGE2_WHALE_TELEMETRY: Final[WhaleTelemetryConfig] = {
@@ -125,6 +135,16 @@ STAGE2_WHALE_TELEMETRY: Final[WhaleTelemetryConfig] = {
         "enabled": True,
         "alpha": 0.30,
     },
+    "MIN_SIGNAL_PRESENCE": 0.55,
+    "MIN_SIGNAL_BIAS": 0.12,
+    "MIN_SIGNAL_DVR": 1.20,
+    "MIN_SIGNAL_VWAP_DEV_ATR": 0.50,
+    "MAX_BAND_PCT": 0.03,
+    "RETEST_TTL_S": 600,
+    "TIME_EXIT_S": 1800,
+    "SL_ATR": 1.5,
+    "TP1_ATR": 1.5,
+    "TP2_ATR": 3.0,
 }
 
 __all__ = ["WhaleTelemetryConfig", "STAGE2_WHALE_TELEMETRY"]

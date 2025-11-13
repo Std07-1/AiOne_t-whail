@@ -25,11 +25,25 @@ from rich.logging import RichHandler
 from config.config_stage2 import STAGE2_INSIGHT, TELEMETRY_BASE_DIR  # type: ignore
 from config.config_whale import STAGE2_WHALE_TELEMETRY  # type: ignore
 
+try:
+    from config import config as _live_config  # type: ignore
+except Exception:  # pragma: no cover - дефолт на випадок збою імпорту
+    _live_config = None
+
 logger = logging.getLogger("monitoring.insight_builder")
 if not logger.handlers:  # guard
     logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
+
+
+def _insight_cfg() -> Mapping[str, Any]:
+    cfg = getattr(_live_config, "STAGE2_INSIGHT", None)
+    if isinstance(cfg, Mapping):
+        return cfg
+    if isinstance(cfg, dict):
+        return cfg
+    return STAGE2_INSIGHT or {}
 
 
 def opportunity_risk_score(overlay: Mapping[str, Any] | None) -> float:
@@ -125,11 +139,10 @@ def opportunity_risk_score(overlay: Mapping[str, Any] | None) -> float:
     except Exception:
         whale_stale_flag = False
     if whale_stale_flag:
+        ins_cfg = _insight_cfg()
         try:
-            from config.config_stage2 import STAGE2_INSIGHT as _INS_CFG  # type: ignore
-
-            stale_penalty = float((_INS_CFG or {}).get("stale_hint_penalty", 0.5))
-            stale_cap = float((_INS_CFG or {}).get("stale_hint_cap", 0.35))
+            stale_penalty = float((ins_cfg or {}).get("stale_hint_penalty", 0.5))
+            stale_cap = float((ins_cfg or {}).get("stale_hint_cap", 0.35))
         except Exception:
             stale_penalty = 0.5
             stale_cap = 0.35
@@ -143,10 +156,9 @@ def opportunity_risk_score(overlay: Mapping[str, Any] | None) -> float:
 
     if score == 0.0:
         # Спробуємо застосувати фолу-бек з китових метрик (телеметрія-only), якщо дозволено конфігом
+        ins_cfg = _insight_cfg()
         try:
-            from config.config import STAGE2_INSIGHT as _INS_CFG  # type: ignore
-
-            fb_cfg = (_INS_CFG or {}).get("fallback_from_whales") or {}
+            fb_cfg = (ins_cfg or {}).get("fallback_from_whales") or {}
             fb_enabled = bool(fb_cfg.get("enabled", False))
             presence_min = float(fb_cfg.get("presence_min", 0.20) or 0.20)
             bias_min = float(fb_cfg.get("bias_min", 0.40) or 0.40)
@@ -187,9 +199,7 @@ def opportunity_risk_score(overlay: Mapping[str, Any] | None) -> float:
 
             # Зони як фільтр: вимагаємо або dist>=min, або accum>=min; якщо немає даних — блокуємо скор
             try:
-                from config.config import STAGE2_INSIGHT as _INS2  # type: ignore
-
-                _zf = ((_INS2 or {}).get("fallback_from_whales") or {}).get(
+                _zf = ((ins_cfg or {}).get("fallback_from_whales") or {}).get(
                     "zones_min_filter", {}
                 )
                 accum_min = int(_zf.get("accum_min", 3))
@@ -216,10 +226,8 @@ def opportunity_risk_score(overlay: Mapping[str, Any] | None) -> float:
 
             # Стабільність: якщо prev-значення є, вимагаємо дрейф ≤ drift_max; якщо їх немає — дозволяємо
             try:
-                from config.config import STAGE2_INSIGHT as _INS3  # type: ignore
-
                 drift_max = float(
-                    ((_INS3 or {}).get("fallback_from_whales") or {})
+                    ((ins_cfg or {}).get("fallback_from_whales") or {})
                     .get("stability_window", {})
                     .get("drift_max", 0.10)
                 )
@@ -245,9 +253,7 @@ def opportunity_risk_score(overlay: Mapping[str, Any] | None) -> float:
 
             # Кеп ваги за волатильнісним режимом
             try:
-                from config.config import STAGE2_INSIGHT as _INS4  # type: ignore
-
-                caps = ((_INS4 or {}).get("fallback_from_whales") or {}).get(
+                caps = ((ins_cfg or {}).get("fallback_from_whales") or {}).get(
                     "weight_cap_by_volregime", {}
                 )
                 if isinstance(caps, Mapping) and vol_reg:
@@ -1179,9 +1185,9 @@ def explain(symbol: str, score: float, overlay: Mapping[str, Any] | None) -> str
         ]
         # Опційна примітка: якщо скор сформовано фолу-беком за китами
         try:
-            from config.config import STAGE2_INSIGHT as _INS  # type: ignore
-
-            note_fb = bool((_INS or {}).get("note_fallback_in_explain", False))
+            note_fb = bool(
+                (_insight_cfg() or {}).get("note_fallback_in_explain", False)
+            )
         except Exception:
             note_fb = False
         if note_fb:

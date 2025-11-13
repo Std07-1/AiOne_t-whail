@@ -39,6 +39,8 @@ VOLZ_PROXY_ALLOWED_FOR_EXHAUSTION: bool = True
 
 # Stage3 paper: мінімальний whale-сигнал (канарейка)
 STAGE3_MIN_WHALE_SIGNAL_ENABLED: bool = True
+# Stage3 паперовий раннер (без реальних угод)
+STAGE3_PAPER_ENABLED: bool = True
 
 # Якщо True — позначаємо stats.vol_z_source="proxy" (коли ввімкнено проксі‑агрегацію).
 # За замовчуванням False, Stage1 виставляє "real".
@@ -86,6 +88,14 @@ UI_WHALE_PUBLISH_ENABLED: bool = True
 UI_INSIGHT_PUBLISH_ENABLED: bool = True
 # Частота публікацій whale/insight воркером (секунди)
 WHALE_THROTTLE_SEC: int = 3
+# Максимальний допустимий вік whale-пейлоада перед визнанням застарілим (мс)
+WHALE_STALE_MS: float = 7_000.0
+# Увімкнути модель відсутності/застарілості whale-сигналу (прапор для T0)
+WHALE_MISSING_STALE_MODEL_ENABLED: bool = True
+# TTL для carry-forward останнього снепшота (секунди)
+WHALE_CARRY_FORWARD_TTL_S: int = 90
+# «М'який» TTL для позначення снепшота як потенційно застарілого (секунди)
+WHALE_SOFT_STALE_TTL_S: int = 45
 # Вмикає строгі лог‑маркери типу [STRICT_WHALE]
 STRICT_LOG_MARKERS: bool = True
 
@@ -285,11 +295,16 @@ __all__ = [
     "STAGE2_WHALE_EMBED_ENABLED",
     "STAGE2_HINT_ENABLED",
     "STAGE3_MIN_WHALE_SIGNAL_ENABLED",
+    "STAGE3_PAPER_ENABLED",
     "EXH_STRATEGY_HINT_ENABLED",
     "INSIGHT_TELEMETRY_ONLY",
     "UI_WHALE_PUBLISH_ENABLED",
     "UI_INSIGHT_PUBLISH_ENABLED",
     "WHALE_THROTTLE_SEC",
+    "WHALE_STALE_MS",
+    "WHALE_MISSING_STALE_MODEL_ENABLED",
+    "WHALE_CARRY_FORWARD_TTL_S",
+    "WHALE_SOFT_STALE_TTL_S",
     "STRICT_LOG_MARKERS",
     "SOFT_RECOMMENDATIONS_ENABLED",
     "SOFT_RECO_SCORE_THR",

@@ -1,17 +1,6 @@
 from __future__ import annotations
 
 import utils.phase_adapter as pa
-from app import process_asset_batch as pab
-
-
-def test_whale_default_presence_injection():
-    stats = {"symbol": "AAAUSDT"}
-    assert "whale" not in stats
-    pab._ensure_whale_default(stats)
-    assert isinstance(stats.get("whale"), dict)
-    w = stats["whale"]
-    assert w.get("stale") is True
-    assert float(w.get("presence") or 0.0) == 0.0
 
 
 def test_phase_adapter_htf_gray_penalty(monkeypatch):

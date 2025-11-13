@@ -47,3 +47,18 @@ def test_quality_snapshot_render_smoke(tmp_path: Path):
     assert "BTCUSDT" in md and "TONUSDT" in md and "SNXUSDT" in md
     # табличка рядків і короткі висновки
     assert "p75_conf" in md and "ExpCov" in md
+
+
+def test_quality_snapshot_min_signal_block() -> None:
+    rows: list[dict[str, str]] = []
+    min_stats = {
+        "BTCUSDT": {
+            "candidates": 2,
+            "open": 1,
+            "exit_total": 1,
+            "exit_breakdown": {"time_exit": 1},
+        }
+    }
+    md = _render_md(rows, metrics_note="", min_signal_stats=min_stats)
+    assert "Min-signal Paper KPI" in md
+    assert "time_exit:1" in md

@@ -72,6 +72,7 @@ from .flags import (
     UI_WHALE_PUBLISH_ENABLED,
     VOLZ_PROXY_ALLOWED_FOR_EXHAUSTION,
     WHALE_SCORING_V2_ENABLED,
+    WHALE_STALE_MS,
     WHALE_THROTTLE_SEC,
 )
 
@@ -204,6 +205,35 @@ STAGE1_LATENCY_LOG: Final[str] = "stage1_latency.jsonl"
 # Флаг, що вмикає або вимикає телеметрію для Stage3.
 # Якщо False — події Stage3 не логуються.
 STAGE3_TELEMETRY_ENABLED: Final[bool] = True
+
+# Масштабатор скорінгу для прогнозованого профіту (paper Stage3); 1.0 = без змін
+STAGE3_PREDICTED_PROFIT_SCALE: Final[float] = 1.0
+# Базові параметри політики Stage3; можуть бути переозначені оверрайдом у runtime
+STAGE3_TRADE_PARAMS: Final[dict[str, float]] = {}
+
+
+def get_stage3_param(symbol: str, name: str, default: Any) -> Any:
+    """Повертає Stage3 параметр із урахуванням символ-специфічних оверрайдів."""
+
+    params = STAGE3_TRADE_PARAMS or {}
+    if not isinstance(params, Mapping):
+        return default
+
+    symbol_key = str(symbol or "").upper()
+
+    per_symbol = params.get("per_symbol")
+    if isinstance(per_symbol, Mapping) and symbol_key:
+        overrides = per_symbol.get(symbol_key)
+        if isinstance(overrides, Mapping) and name in overrides:
+            return overrides.get(name, default)
+
+    defaults = params.get("defaults")
+    if isinstance(defaults, Mapping) and name in defaults:
+        return defaults.get(name, default)
+
+    return params.get(name, default)
+
+
 # Формат — JSONL (по одному запису на рядок).
 STAGE1_EVENTS_LOG: Final[str] = "stage1_events.jsonl"
 # Флаг для логування подій Stage1 (наприклад, спрацювання тригерів).
@@ -889,6 +919,7 @@ __all__ = [
     "UI_WHALE_PUBLISH_ENABLED",
     "UI_INSIGHT_PUBLISH_ENABLED",
     "WHALE_THROTTLE_SEC",
+    "WHALE_STALE_MS",
     "STRICT_LOG_MARKERS",
     "SymbolInfo",
     "TRADE_REFRESH_INTERVAL",

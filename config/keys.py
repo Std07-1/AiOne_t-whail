@@ -17,7 +17,15 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
+
+
+def normalize_symbol(symbol: str | None) -> str:
+    """Привести символ до канонічного нижнього регістру."""
+
+    if symbol is None:
+        return ""
+    return str(symbol).strip().lower()
 
 
 def _clean_parts(parts: Iterable[str | None]) -> list[str]:
@@ -51,7 +59,8 @@ def build_key(
     Returns:
         str: Ключ формату `namespace:domain[:symbol][:granularity][:extra...]`.
     """
-    sym = symbol.lower() if isinstance(symbol, str) else None
+    sym_value = normalize_symbol(symbol) if symbol is not None else None
+    sym = sym_value or None
     parts = _clean_parts((namespace, domain, sym, granularity))
     if extra:
         parts.extend(_clean_parts(extra))
@@ -66,4 +75,4 @@ def build_channel(namespace: str, *parts: str) -> str:
     return build_key(namespace, "channel", extra=parts)
 
 
-__all__ = ["build_key", "build_channel"]
+__all__ = ["build_key", "build_channel", "normalize_symbol"]

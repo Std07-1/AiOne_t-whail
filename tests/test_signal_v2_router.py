@@ -32,6 +32,19 @@ def test_router_stale_observe():
     assert conf == 0.0
 
 
+def test_router_missing_observe():
+    stats = _base_stats()
+    stats["whale"].update({"missing": True, "stale": False})
+    profile_cfg = (
+        STAGE2_SIGNAL_V2_PROFILES.get(STAGE2_PROFILE)
+        or STAGE2_SIGNAL_V2_PROFILES["strict"]
+    )
+    sig, conf, reasons = _router_signal_v2(stats, profile_cfg)
+    assert sig == "OBSERVE"
+    assert conf == 0.0
+    assert "missing" in reasons
+
+
 def test_router_soft_buy_when_fresh():
     stats = _base_stats()
     stats["whale"]["stale"] = False

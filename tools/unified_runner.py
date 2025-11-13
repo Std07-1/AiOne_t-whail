@@ -126,161 +126,126 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-# Local imports are done lazily inside methods to honor --set flags
+# Профілі forward (основні). hint/quality обробляються окремо без порогів.
+FORWARD_PROFILES: dict[str, dict[str, Any]] = {
+    "strong": {"presence": 0.75, "bias": 0.60, "whale": 600, "source": "whale"},
+    "soft": {"presence": 0.55, "bias": 0.40, "whale": 1200, "source": "whale"},
+    "explain": {"presence": 0.45, "bias": 0.30, "ttl": 600, "source": "explain"},
+}
+
+_TEE_ORIG_STDOUT = None
+_TEE_ORIG_STDERR = None
+_TEE_FILE = None
 
 
 def _now_iso() -> str:
-    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-_TEE_FILE = None  # type: Any
-_TEE_ORIG_STDOUT = None  # type: Any
-_TEE_ORIG_STDERR = None  # type: Any
+    try:
+        return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:  # pragma: no cover
+        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _tee_stdout_stderr(log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    class _Tee:
-        def __init__(self, stream, fileobj):
-            self._stream = stream
-            self._file = fileobj
-
-        def write(self, data):
-            try:
-                self._stream.write(data)
-            finally:
-                self._file.write(data)
-
-        def flush(self):
-            try:
-                self._stream.flush()
-            finally:
-                self._file.flush()
-
-    global _TEE_FILE, _TEE_ORIG_STDOUT, _TEE_ORIG_STDERR
-    fh = log_path.open("a", encoding="utf-8", buffering=1)
-    _TEE_FILE = fh
+    """Дублює stdout/stderr у файл log_path. Повторний виклик ігнорується."""
+    global _TEE_ORIG_STDOUT, _TEE_ORIG_STDERR, _TEE_FILE
+    if _TEE_FILE is not None:
+        return
+    try:
+        _TEE_FILE = open(log_path, "a", encoding="utf-8")
+    except Exception:  # pragma: no cover
+        return
     _TEE_ORIG_STDOUT = sys.stdout
     _TEE_ORIG_STDERR = sys.stderr
-    sys.stdout = _Tee(sys.stdout, fh)  # type: ignore[assignment]
-    sys.stderr = _Tee(sys.stderr, fh)  # type: ignore[assignment]
 
+    class _Tee:
+        def __init__(self, orig, stream_name: str):
+            self._orig = orig
+            self._name = stream_name
 
-def _close_tee() -> None:
-    """Відʼєднати tee та звільнити дескриптор run.log (важливо для Windows перед move)."""
-    global _TEE_FILE, _TEE_ORIG_STDOUT, _TEE_ORIG_STDERR
-    try:
-        # Відновлюємо оригінальні потоки, якщо є
-        if _TEE_ORIG_STDOUT is not None:
+        def write(self, data: str) -> int:  # type: ignore[override]
             try:
-                sys.stdout.flush()
+                _TEE_FILE.write(data)
             except Exception:
                 pass
-            sys.stdout = _TEE_ORIG_STDOUT  # type: ignore[assignment]
-    except Exception:
-        pass
-    try:
-        if _TEE_ORIG_STDERR is not None:
-            try:
-                sys.stderr.flush()
-            except Exception:
-                pass
-            sys.stderr = _TEE_ORIG_STDERR  # type: ignore[assignment]
-    except Exception:
-        pass
-    # Закриваємо файл tee (run.log)
-    try:
-        if _TEE_FILE is not None:
+            return self._orig.write(data)
+
+        def flush(self) -> None:  # type: ignore[override]
             try:
                 _TEE_FILE.flush()
             except Exception:
                 pass
-            try:
-                _TEE_FILE.close()
-            except Exception:
-                pass
-    finally:
-        _TEE_FILE = None
-        _TEE_ORIG_STDOUT = None
-        _TEE_ORIG_STDERR = None
+            return self._orig.flush()
+
+    sys.stdout = _Tee(sys.stdout, "stdout")  # type: ignore[assignment]
+    sys.stderr = _Tee(sys.stderr, "stderr")  # type: ignore[assignment]
+
+
+def _close_tee() -> None:
+    global _TEE_ORIG_STDOUT, _TEE_ORIG_STDERR, _TEE_FILE
+    if _TEE_FILE is None:
+        return
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        if _TEE_FILE:
+            _TEE_FILE.flush()
+            _TEE_FILE.close()
+    except Exception:
+        pass
+    if _TEE_ORIG_STDOUT is not None:
+        sys.stdout = _TEE_ORIG_STDOUT  # type: ignore[assignment]
+    if _TEE_ORIG_STDERR is not None:
+        sys.stderr = _TEE_ORIG_STDERR  # type: ignore[assignment]
+    _TEE_FILE = None
+    _TEE_ORIG_STDOUT = None
+    _TEE_ORIG_STDERR = None
+
+
+def _coerce_value(val: str) -> Any:
+    v = val.strip()
+    low = v.lower()
+    if low in {"true", "false"}:
+        return low == "true"
+    try:
+        if "." in v:
+            return float(v)
+        return int(v)
+    except Exception:
+        return v
 
 
 def _apply_sets(pairs: list[tuple[str, str]]) -> None:
-    """
-    Застосувати список пар ключ/значення до os.environ та, за наявності,
-    відобразити їх у модулі config.config із best-effort приведенням типів.
-
-    Поведінка:
-        - Записує кожну пару в os.environ як str(key)=str(value).
-        - Якщо вдається імпортувати модуль config.config, намагається виконати setattr
-          для кожного ключа з приведеним значенням:
-            - "true"/"false" (незалежно від регістру) → bool
-            - цілі числа → int
-            - числа з плаваючою крапкою → float
-            - інакше → str
-    - Усі операції — best-effort: помилки імпорту, присвоєння чи конвертації
-      приглушуються, щоб функція не піднімала винятків через ці спроби.
-
-    Параметри:
-    - pairs: list[tuple[str, str]] — список пар (ключ, значення). Якщо порожній — повертає None.
-
-    Повертає:
-    - None
-
-    Примітки:
-    - Функція змінює процесне оточення (os.environ) і може синхронізувати значення
-      з модулем config.config; виклик безпечний у контексті запуску/ініціалізації.
-    """
-    if not pairs:
-        return
-    # 1) ENV
     for k, v in pairs:
-        os.environ[str(k)] = str(v)
-    # 2) Best-effort reflect into config.config
-    try:
-        import config.config as cfg  # noqa: F401
+        try:
+            os.environ[str(k)] = str(v)
+        except Exception:
+            pass
+        # Віддзеркалення у config.config (best-effort)
+        try:
+            import config.config as _cfg  # type: ignore
 
-        for k, v in pairs:
-            vv: Any = v
-            low = str(v).lower()
-            if low in ("true", "false"):
-                vv = low == "true"
-            else:
-                try:
-                    vv = int(v)
-                except ValueError:
-                    try:
-                        vv = float(v)
-                    except ValueError:
-                        vv = v
-            try:
-                setattr(cfg, str(k), vv)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            coerced = _coerce_value(v)
+            if hasattr(_cfg, k):
+                setattr(_cfg, k, coerced)
+        except Exception:
+            continue
 
 
-def _parse_sets(values: list[str]) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for raw in values or []:
-        if "=" not in raw:
-            raise SystemExit(f"--set expects NAME=VALUE, got: {raw}")
-        k, v = raw.split("=", 1)
-        out.append((k.strip(), v.strip()))
-    return out
-
-
-# Вбудовані профілі фільтрації для forward-звіту
-# Мінімальний диф: жодних змін у контрактах інших інструментів
-FORWARD_PROFILES: dict[str, dict[str, float | int | str]] = {
-    # Whale-based профілі
-    "strong": {"presence": 0.75, "bias": 0.60, "whale": 900, "source": "whale"},
-    "soft": {"presence": 0.55, "bias": 0.40, "whale": 1200, "source": "whale"},
-    # Explain-based профіль (отримує presence/bias із [SCEN_EXPLAIN])
-    "explain": {"presence": 0.45, "bias": 0.30, "ttl": 600, "source": "explain"},
-}
+def _parse_sets(raw: list[str]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for item in raw:
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        pairs.append((k, v))
+    return pairs
 
 
 class _MetricsScraper:
@@ -598,18 +563,153 @@ class RunnerOrchestrator:
                 continue
         return tot
 
-    def _parse_false_breakout_total(self, text: str) -> int:
+    def _parse_metric_values(self, text: str, metric: str) -> dict[str, float]:
         import re
 
-        s = 0.0
-        for m in re.finditer(
-            r"^ai_one_false_breakout_total\{[^}]*\}\s+([0-9eE+\-.]+)$", text, re.M
-        ):
+        pattern = re.compile(
+            rf"^{re.escape(metric)}\{{([^}}]+)\}}\s+([0-9eE+\-.]+)$",
+            re.M,
+        )
+        values: dict[str, float] = {}
+        for match in pattern.finditer(text):
+            labels = match.group(1)
+            val_raw = match.group(2)
+            sym_match = re.search(r'symbol="([^\"]+)"', labels)
+            if not sym_match:
+                continue
             try:
-                s += float(m.group(1))
+                values[sym_match.group(1)] = float(val_raw)
             except Exception:
                 continue
-        return int(s)
+        return values
+
+    def _parse_gap_bucket_totals(self, text: str) -> dict[str, float]:
+        import re
+
+        pattern = re.compile(
+            r"^ai_one_whale_publish_gap_bucket_total\{([^}]*)\}\s+([0-9eE+\-.]+)$",
+            re.M,
+        )
+        totals: dict[str, float] = {}
+        for match in pattern.finditer(text):
+            labels = match.group(1)
+            val_raw = match.group(2)
+            le_match = re.search(r'le="([^"]+)"', labels)
+            if not le_match:
+                continue
+            try:
+                le_key = le_match.group(1)
+                totals[le_key] = totals.get(le_key, 0.0) + float(val_raw)
+            except Exception:
+                continue
+        return totals
+
+    def _calc_stale_ratio(self, text: str) -> float | None:
+        buckets = self._parse_gap_bucket_totals(text)
+        total = float(buckets.get("inf", 0.0))
+        if total <= 0.0:
+            return None
+        non_stale = float(buckets.get("10000", 0.0))
+        stale = max(0.0, total - non_stale)
+        # Захищаємося від невеликих флуктуацій лічильників
+        ratio = max(0.0, min(1.0, stale / total))
+        return ratio
+
+    def _calc_stale_ratio_by_symbol(self, text: str) -> dict[str, float]:
+        import re
+
+        pattern = re.compile(
+            r"^ai_one_whale_publish_gap_bucket_total\{([^}]*)\}\s+([0-9eE+\-.]+)$",
+            re.M,
+        )
+        buckets: dict[str, dict[str, float]] = {}
+        for match in pattern.finditer(text):
+            labels = match.group(1)
+            val_raw = match.group(2)
+            sym_match = re.search(r'symbol="([^"]+)"', labels)
+            le_match = re.search(r'le="([^"]+)"', labels)
+            if not sym_match or not le_match:
+                continue
+            try:
+                sym = sym_match.group(1)
+                le_key = le_match.group(1)
+                buckets.setdefault(sym, {})[le_key] = float(val_raw)
+            except Exception:
+                continue
+
+        ratios: dict[str, float] = {}
+        for sym, vals in buckets.items():
+            total = float(vals.get("inf", 0.0))
+            if total <= 0.0:
+                continue
+            non_stale = float(vals.get("10000", 0.0))
+            stale = max(0.0, total - non_stale)
+            ratios[sym] = max(0.0, min(1.0, stale / total))
+        return ratios
+
+    def _build_metrics_snapshot_lines(
+        self, snaps: list[tuple[str, str]], switch_rate: float
+    ) -> list[str]:
+        if not snaps:
+            return []
+        text = snaps[-1][1]
+        lines: list[str] = []
+        stats = self._parse_histogram_stats(text)
+        if stats:
+            p95, mean, cnt = stats
+            lines.append(
+                f"- ai_one_stage1_latency_ms_p95={p95:.0f} (mean={mean:.0f}, count={cnt})\n"
+            )
+        else:
+            lines.append("- ai_one_stage1_latency_ms_p95=NA\n")
+
+        stale_ratio_global = self._calc_stale_ratio(text)
+        stale_ratio_by_sym = self._calc_stale_ratio_by_symbol(text)
+        if stale_ratio_by_sym:
+            preview = ", ".join(
+                f"{sym}:{ratio:.2f}"
+                for sym, ratio in sorted(stale_ratio_by_sym.items())
+            )
+            lines.append(f"- stale_ratio_by_symbol={preview}\n")
+        else:
+            lines.append("- stale_ratio_by_symbol=NA\n")
+        if stale_ratio_global is not None:
+            lines.append(f"- stale_ratio_global={stale_ratio_global:.2f}\n")
+        else:
+            lines.append("- stale_ratio_global=NA\n")
+
+        lines.append(f"- profile_switch_rate_1m={switch_rate:.2f}/хв\n")
+
+        gap = self._parse_metric_values(text, "ai_one_whale_publish_gap_ms")
+        if gap:
+            top_gap = sorted(gap.items(), key=lambda kv: -kv[1])[:4]
+            preview = ", ".join(f"{sym}:{val:.0f}" for sym, val in top_gap)
+            lines.append(f"- whale_publish_gap_ms (топ): {preview}\n")
+        gap_warn = self._parse_metric_values(
+            text, "ai_one_whale_publish_gap_warn_total"
+        )
+        if gap_warn:
+            total_warn = int(sum(gap_warn.values()))
+            top_warn = ", ".join(
+                f"{sym}:{int(val)}"
+                for sym, val in sorted(gap_warn.items(), key=lambda kv: -kv[1])[:4]
+            )
+            lines.append(
+                f"- whale_publish_gap_warn_total: {total_warn} ({top_warn or '—'})\n"
+            )
+        presence_warn = self._parse_metric_values(
+            text, "ai_one_whale_presence_zero_nonstale_total"
+        )
+        if presence_warn:
+            total_presence = int(sum(presence_warn.values()))
+            top_presence = ", ".join(
+                f"{sym}:{int(val)}"
+                for sym, val in sorted(presence_warn.items(), key=lambda kv: -kv[1])[:4]
+            )
+            lines.append(
+                f"- whale_presence_zero_nonstale_total: {total_presence} ({top_presence or '—'})\n"
+            )
+        return lines
 
     def _parse_forward_md(self, path: Path) -> list[tuple[int, int, float]]:
         """Розбір простого формату tools.forward_from_log:
@@ -641,6 +741,8 @@ class RunnerOrchestrator:
         if not self.metrics_txt.exists():
             return []
         text = self.metrics_txt.read_text(encoding="utf-8", errors="ignore")
+        if text.startswith("### SNAPSHOT ts="):
+            text = "\n" + text
         parts = text.split("\n### SNAPSHOT ts=")
         snaps: list[tuple[str, str]] = []
         for i, part in enumerate(parts):
@@ -683,23 +785,87 @@ class RunnerOrchestrator:
         fb_total: int = 0
         expcov_global: float = 0.0
         per_sym: dict[str, float] = {}
+        stale_ratio: float | None = None
 
-        # Metrics-derived KPI
+        # Metrics-derived KPI або офлайн fallback
         if snaps:
             last = snaps[-1][1]
             stats = self._parse_histogram_stats(last)
             if stats:
                 p95, mean, cnt = stats
-            fb_total = self._parse_false_breakout_total(last)
+            stale_ratio = self._calc_stale_ratio(last)
+            fb_values: dict[str, float] = {}
+            for _ts, body in snaps:
+                metrics = self._parse_metric_values(body, "ai_one_false_breakout_total")
+                if not metrics:
+                    continue
+                fb_values.update(metrics)
+            fb_total = int(sum(fb_values.values()))
             switch_rate = self._calc_switch_rate(snaps)
+        else:
+            # Offline KPI з run.log (latency_ms=, profile перемикання)
+            latencies: list[int] = []
+            switches = 0
+            t_min: int | None = None
+            t_max: int | None = None
+            log_path = self.run_log
+            if log_path.exists():
+                import re as _re_off
+
+                for ln in log_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                ).splitlines():
+                    m_lat = _re_off.search(r"latency_ms=(\d+)", ln)
+                    if m_lat:
+                        try:
+                            v = int(m_lat.group(1))
+                            latencies.append(v)
+                        except Exception:
+                            pass
+                    # timestamp epoch ms (ts=...)
+                    m_ts = _re_off.search(r"\bts=(\d{10,13})\b", ln)
+                    if m_ts:
+                        try:
+                            ts_val = int(m_ts.group(1))
+                            if len(m_ts.group(1)) == 10:
+                                ts_val *= 1000
+                            if t_min is None or ts_val < t_min:
+                                t_min = ts_val
+                            if t_max is None or ts_val > t_max:
+                                t_max = ts_val
+                        except Exception:
+                            pass
+                    if "profile_switch" in ln.lower():
+                        switches += 1
+            if latencies:
+                latencies.sort()
+                cnt = len(latencies)
+                p95_idx = int(
+                    min(len(latencies) - 1, round(0.95 * (len(latencies) - 1)))
+                )
+                p95 = float(latencies[p95_idx])
+                mean = float(sum(latencies) / len(latencies))
+            if (
+                switches > 0
+                and t_min is not None
+                and t_max is not None
+                and t_max > t_min
+            ):
+                minutes_span = max(1.0, (t_max - t_min) / 1000.0 / 60.0)
+                switch_rate = switches / minutes_span
+            # fb_total залишаємо 0 (немає даних офлайн)
+            offline_note = True
+        offline_note = locals().get("offline_note", False)
 
         # ExpCov from quality.csv (weighted by activations if available)
         qcsv = self.out_dir / "quality.csv"
+        expcov_na = False
         if qcsv.exists():
             import csv
 
             total_act = 0.0
             wsum = 0.0
+            any_cov_positive = False
             with qcsv.open("r", encoding="utf-8", newline="") as fh:
                 rd = csv.DictReader(fh)
                 for r in rd:
@@ -711,6 +877,8 @@ class RunnerOrchestrator:
                         cov, act = 0.0, 0.0
                     if sym:
                         per_sym[sym] = max(per_sym.get(sym, 0.0), cov)
+                    if cov > 0.0:
+                        any_cov_positive = True
                     total_act += act
                     wsum += cov * act
             expcov_global = (
@@ -718,6 +886,9 @@ class RunnerOrchestrator:
                 if total_act > 0
                 else (sum(per_sym.values()) / max(1, len(per_sym)))
             )
+            # Якщо всі значення покриття == 0.0 → вважаємо ExpCov як NA (zero events)
+            if not any_cov_positive:
+                expcov_na = True
         # Forward md
         fwd_path = self.out_dir / f"forward_{mode}.md"
         fwd_block = ""
@@ -785,7 +956,12 @@ class RunnerOrchestrator:
             sym_table = ", ".join(f"{k}:{v:.2f}" for k, v in sorted(per_sym.items()))
         else:
             sym_table = "-"
-        lines.append(f"- ExpCov: {expcov_global:.2f}  | по символах: {sym_table}\n")
+        if "expcov_na" in locals() and expcov_na:
+            lines.append(
+                f"- ExpCov: {expcov_global:.2f} (NA)  | по символах: {sym_table}\n"
+            )
+        else:
+            lines.append(f"- ExpCov: {expcov_global:.2f}  | по символах: {sym_table}\n")
         if fwd_block:
             lines.append("- Forward K (K=3/5/10/20/30): див. секцію нижче\n")
         # Scenarios
@@ -806,6 +982,29 @@ class RunnerOrchestrator:
         else:
             lines.append("- Prometheus snapshot: (немає)\n")
         lines.append("\n")
+        lines.append("## Metrics snapshot\n")
+        if snaps:
+            lines.extend(self._build_metrics_snapshot_lines(snaps, switch_rate))
+        else:
+            lines.extend(
+                [
+                    "- ai_one_stage1_latency_ms_p95=NA\n",
+                    "- stale_ratio_by_symbol=NA\n",
+                    "- stale_ratio_global=NA\n",
+                    "- profile_switch_rate_1m=NA\n",
+                ]
+            )
+        lines.append("\n")
+        if offline_note:
+            lines.append("## Offline KPI (no metrics endpoint)\n")
+            # Новий формат: офлайн-метрики позначаємо як n/a, а ExpCov беремо з quality.csv (або 0.00)
+            expcov_off = expcov_global if isinstance(expcov_global, float) else 0.0
+            lines.append(
+                f"p95_ms_offline=n/a, mean_ms_offline=n/a, switch_per_min_offline=n/a, ExpCov_from_quality={expcov_off:.2f}\n"
+            )
+            lines.append(
+                "Notes: metrics snapshot n/a; KPIs computed from quality.csv/snapshot\n\n"
+            )
         # Artifacts
         lines.append("## Artifacts\n")
         lines.append(
@@ -822,7 +1021,7 @@ class RunnerOrchestrator:
         profs = list(self.cfg.forward_profiles or [])
         # Якщо прапор не задано, але файли існують — також підхопимо
         discovered: list[str] = []
-        for name in ("strong", "soft", "explain"):
+        for name in ("strong", "soft", "explain", "hint", "quality"):
             if (self.out_dir / f"forward_{name}.md").exists():
                 discovered.append(name)
         for n in discovered:
@@ -830,71 +1029,67 @@ class RunnerOrchestrator:
                 profs.append(n)
         # Впорядковуємо за пріоритетом strong > soft > explain
         _pri = {"strong": 0, "soft": 1, "explain": 2}
-        profs = [p for p in profs if p in ("strong", "soft", "explain")]
-        profs.sort(key=lambda n: _pri.get(n, 99))
+        profs = [
+            p for p in profs if p in ("strong", "soft", "explain", "hint", "quality")
+        ]
+        # hint має найнижчий пріоритет у виводі
+        _pri_hint = {"strong": 0, "soft": 1, "explain": 2, "hint": 3, "quality": 4}
+        profs.sort(key=lambda n: _pri_hint.get(n, 99))
         if profs:
             lines.append("## Forward profiles\n\n")
-            # Підсумкова таблиця короткого вигляду
             lines.append(
                 "profile | N | win_rate(K=5/10) | median_ttf_0.5% | median_ttf_1.0% | dedup_dropped_total | skew_dropped_total | notes\n"
             )
             lines.append("---|---:|---:|---:|---:|---:|---:|---\n")
+            n_totals: dict[str, int] = {}
+            from_tags: dict[str, str] = {}
+            # Коротка таблиця
             for name in profs:
                 rows = self._parse_forward_md(self.out_dir / f"forward_{name}.md")
-                # Витягуємо K=5 та K=10, оберемо N як N(K=5) якщо є, інакше сумарне
-                by_k: dict[int, tuple[int, int, float]] = {
-                    int(k): (k, n, h) for k, n, h in rows
-                }
+                by_k = {int(k): (k, n, h) for k, n, h in rows}
                 n5 = by_k.get(5, (5, 0, float("nan")))[1]
                 h5 = by_k.get(5, (5, 0, float("nan")))[2]
                 h10 = by_k.get(10, (10, 0, float("nan")))[2]
                 n_total = sum(n for _, n, _ in rows) if rows else 0
+                n_totals[name] = int(n_total)
                 n_display = n5 if n5 else n_total
                 h5s = f"{h5:.2f}" if h5 == h5 else "nan"
                 h10s = f"{h10:.2f}" if h10 == h10 else "nan"
-                # Витягуємо ttf05_median та ttf10_median з футера forward_<name>.md
+                # футер
                 ttf05_med = "nan"
                 ttf10_med = "nan"
-                try:
-                    import re as _re
-
-                    txt_fwd = (self.out_dir / f"forward_{name}.md").read_text(
-                        encoding="utf-8", errors="ignore"
-                    )
-                    m05 = _re.search(r"ttf05_median=([0-9.]+|nan)", txt_fwd)
-                    if m05:
-                        ttf05_med = m05.group(1)
-                    m10 = _re.search(r"ttf10_median=([0-9.]+|nan)", txt_fwd)
-                    if m10:
-                        ttf10_med = m10.group(1)
-                except Exception:
-                    pass
-                # Парсимо футер для dedup/skew та параметрів
                 dedup_total = "-"
                 skew_total = "-"
-                notes = "ttl=600s" if name == "explain" else "-"
+                notes = "-"
                 try:
-                    import re as _re2
+                    import re as _re_fp
 
-                    txt_fwd = (self.out_dir / f"forward_{name}.md").read_text(
+                    txt = (self.out_dir / f"forward_{name}.md").read_text(
                         encoding="utf-8", errors="ignore"
                     )
-                    # dedup_dropped=NN
-                    m_dd = _re2.search(r"dedup_dropped=(\d+)", txt_fwd)
+                    m05 = _re_fp.search(r"ttf05_median=([0-9.]+|nan)", txt)
+                    if m05:
+                        ttf05_med = m05.group(1)
+                    m10 = _re_fp.search(r"ttf10_median=([0-9.]+|nan)", txt)
+                    if m10:
+                        ttf10_med = m10.group(1)
+                    m_dd = _re_fp.search(r"dedup_dropped=(\d+)", txt)
                     if m_dd:
                         dedup_total = m_dd.group(1)
-                    m_sk = _re2.search(r"skew_dropped=(\d+)", txt_fwd)
+                    m_sk = _re_fp.search(r"skew_dropped=(\d+)", txt)
                     if m_sk:
                         skew_total = m_sk.group(1)
-                    # note=too_short_window
-                    if "note=too_short_window" in txt_fwd:
+                    m_from = _re_fp.search(r"params=\{from:([^}]+)\}", txt)
+                    if m_from:
+                        from_tags[name] = m_from.group(1)
+                    if "note=too_short_window" in txt:
                         notes = (notes + ";" if notes != "-" else "") + "short_window"
                 except Exception:
                     pass
                 lines.append(
                     f"{name} | {n_display} | {h5s}/{h10s} | {ttf05_med} | {ttf10_med} | {dedup_total} | {skew_total} | {notes}\n"
                 )
-            # Детальна розкладка по K нижче (як раніше)
+            # Детальна розкладка
             lines.append("\nprofile | K | N | hit_rate | med_ret% | p75_abs%\n")
             lines.append("---|---:|---:|---:|---:|---:\n")
             for name in profs:
@@ -902,51 +1097,143 @@ class RunnerOrchestrator:
                 for k, n, hit in sorted(rows, key=lambda r: int(r[0])):
                     hit_str = f"{hit:.2f}" if hit == hit else "nan"
                     lines.append(f"{name} | {k} | {n} | {hit_str} | n/a | n/a\n")
-            lines.append("\n")
-            # Таблиця параметрів профілів (presence_min, bias_abs_min, whale_max_age_sec, explain_ttl_sec)
-            lines.append("### Forward profile params\n\n")
+            # OfflineForward acceptance
+            try:
+                base_zero = all(
+                    int(n_totals.get(p, 0)) == 0
+                    for p in ("strong", "soft", "explain", "hint")
+                )
+                quality_n = int(n_totals.get("quality", 0))
+                if base_zero and quality_n > 0:
+                    src = from_tags.get("quality", "quality_snapshot.md")
+                    src_note = (
+                        "from snapshot" if "snapshot" in src else "from quality.csv"
+                    )
+                    lines.append(
+                        f"OfflineForward: quality_profile N>0 ({src_note})\n\n"
+                    )
+                    offline_forward_ok = True
+                else:
+                    offline_forward_ok = False
+            except Exception:
+                offline_forward_ok = False
+            lines.append("\n### Forward profile params\n\n")
             lines.append(
-                "profile | presence_min | bias_abs_min | whale_max_age_sec | explain_ttl_sec\n"
+                "profile | presence_min | bias_abs_min | whale_max_age_sec | explain_ttl_sec | dedup_dropped_total | skew_dropped_total | score_min\n"
             )
-            lines.append("---|---:|---:|---:|---:\n")
+            lines.append("---|---:|---:|---:|---:|---:|---:|---:\n")
             for name in profs:
-                p_presence = "-"
-                p_bias = "-"
-                p_whale = "-"
-                p_ttl = "-"
                 try:
-                    import re as _re3
+                    import re as _re_pp
 
-                    txt_fwd = (self.out_dir / f"forward_{name}.md").read_text(
+                    txt = (self.out_dir / f"forward_{name}.md").read_text(
                         encoding="utf-8", errors="ignore"
                     )
-                    m_presence = _re3.search(r"presence_min:([0-9.]+)", txt_fwd)
-                    if m_presence:
-                        p_presence = m_presence.group(1)
-                    m_bias = _re3.search(r"bias_abs_min:([0-9.]+)", txt_fwd)
-                    if m_bias:
-                        p_bias = m_bias.group(1)
-                    m_whale = _re3.search(r"whale_max_age_sec=(\d+)", txt_fwd)
-                    if m_whale:
-                        p_whale = m_whale.group(1)
-                    m_ttl = _re3.search(r"explain_ttl_sec=(\d+)", txt_fwd)
-                    if m_ttl:
-                        p_ttl = m_ttl.group(1)
-                    else:
-                        # зворотна сумісність
-                        m_ttl2 = _re3.search(r"ttl_sec=(\d+)", txt_fwd)
-                        if m_ttl2:
-                            p_ttl = m_ttl2.group(1)
+                except Exception:
+                    txt = ""
+                m_presence = _re_pp.search(r"presence_min:([0-9.]+)", txt)
+                m_bias = _re_pp.search(r"bias_abs_min:([0-9.]+)", txt)
+                m_whale = _re_pp.search(r"whale_max_age_sec=(\d+)", txt)
+                m_ttl = _re_pp.search(r"explain_ttl_sec=(\d+)", txt) or _re_pp.search(
+                    r"ttl_sec=(\d+)", txt
+                )
+                m_score = _re_pp.search(r"score_min:([0-9.]+)", txt)
+                m_dd = _re_pp.search(r"dedup_dropped=(\d+)", txt)
+                m_sk = _re_pp.search(r"skew_dropped=(\d+)", txt)
+                p_presence = m_presence.group(1) if m_presence else "-"
+                p_bias = m_bias.group(1) if m_bias else "-"
+                p_whale = m_whale.group(1) if m_whale else "-"
+                p_ttl = m_ttl.group(1) if m_ttl else "-"
+                p_score = (
+                    m_score.group(1)
+                    if m_score
+                    else (
+                        "0.55"
+                        if name == "hint"
+                        else ("n/a" if name == "quality" else "-")
+                    )
+                )
+                p_dedup = m_dd.group(1) if m_dd else "-"
+                p_skew = m_sk.group(1) if m_sk else "-"
+                if name in ("hint", "quality"):
+                    lines.append(
+                        f"{name} | n/a | n/a | n/a | n/a | {p_dedup} | {p_skew} | {p_score}\n"
+                    )
+                else:
+                    lines.append(
+                        f"{name} | {p_presence} | {p_bias} | {p_whale} | {p_ttl} | {p_dedup} | {p_skew} | -\n"
+                    )
+            lines.append("\n### Acceptance\n\n")
+            offline_metrics = bool(offline_note)
+
+            def _pf(cond: bool | None) -> str:
+                if cond is None:
+                    return "NA"
+                return "PASS" if cond else "FAIL"
+
+            rule_p95 = None if offline_metrics else (p95 <= 200.0)
+            lines.append(f"- p95(Stage1) ≤ 200 ms: {_pf(rule_p95)}\n")
+            rule_sw = None if offline_metrics else (switch_rate <= 2.0)
+            lines.append(f"- switch_rate ≤ 2/min: {_pf(rule_sw)}\n")
+            rule_stale = None if stale_ratio is None else (stale_ratio < 0.15)
+            if stale_ratio is None:
+                lines.append(f"- stale_ratio < 15%: {_pf(rule_stale)}\n")
+            else:
+                lines.append(
+                    f"- stale_ratio < 15%: {_pf(rule_stale)} (current={stale_ratio:.2f})\n"
+                )
+            explain_path = self.out_dir / "forward_explain.md"
+            fwd_explain_ok = None
+            explain_ttf_ok = None
+            if explain_path.exists():
+                try:
+                    txt = explain_path.read_text(encoding="utf-8", errors="ignore")
+                    import re as _re_acc
+
+                    m_nt = _re_acc.search(r"N_total=(\d+)", txt)
+                    m_ttf05 = _re_acc.search(r"ttf05_median=([0-9.]+|nan)", txt)
+                    m_ttf10 = _re_acc.search(r"ttf10_median=([0-9.]+|nan)", txt)
+                    if m_nt:
+                        fwd_explain_ok = int(m_nt.group(1)) > 0
+                    if m_ttf05 and m_ttf10 and fwd_explain_ok:
+                        try:
+                            v05 = (
+                                float(m_ttf05.group(1))
+                                if m_ttf05.group(1) != "nan"
+                                else float("nan")
+                            )
+                            v10 = (
+                                float(m_ttf10.group(1))
+                                if m_ttf10.group(1) != "nan"
+                                else float("nan")
+                            )
+                            explain_ttf_ok = (v05 == v05) and (v10 == v10)
+                        except Exception:
+                            explain_ttf_ok = False
                 except Exception:
                     pass
+            lines.append(
+                f"- Forward explain N>0 & median_ttf_0.5/1.0: {_pf(fwd_explain_ok and explain_ttf_ok if fwd_explain_ok is not None and explain_ttf_ok is not None else None)}\n"
+            )
+            lines.append(
+                "- BTC/ETH win_rate K=5/10 ≥ baseline, FP(grab_*) ≤ baseline: NA\n"
+            )
+            if offline_metrics and locals().get("offline_forward_ok", False):
                 lines.append(
-                    f"{name} | {p_presence} | {p_bias} | {p_whale} | {p_ttl}\n"
+                    "Notes: offline forward via quality_profile; metrics unavailable.\n"
                 )
+            elif offline_metrics:
+                lines.append("Notes: metrics unavailable; forward evaluated offline.\n")
             lines.append("\n")
         # Verdict
         lines.append("## Verdict\n")
         verdict = "GO"
         reason: str | None = None
+        # Якщо лише офлайн і quality дав N>0 — встановлюємо WARN (offline-only)
+        offline_only = (not snaps) and locals().get("offline_forward_ok", False)
+        if offline_only:
+            verdict = "WARN"
+            reason = "offline-only"
         if p95 > 200.0:
             verdict = "WARN" if p95 <= 280.0 else "NO-GO"
             reason = "latency"
@@ -955,18 +1242,24 @@ class RunnerOrchestrator:
             reason = (reason + ", ") if reason else ""
             reason = f"{reason}switch_rate"
         # ExpCov acceptance: require >= 0.60 for GO; if no data (0.0) — warn explicitly
-        if expcov_global <= 0.0:
-            verdict = "WARN" if verdict == "GO" else verdict
-            reason = (reason + ", ") if reason else ""
-            reason = f"{reason}ExpCov=0"
-        elif expcov_global < 0.60:
-            verdict = "WARN" if verdict == "GO" else verdict
-            reason = (reason + ", ") if reason else ""
-            reason = f"{reason}ExpCov<0.60"
+        if not ("expcov_na" in locals() and expcov_na):
+            if expcov_global <= 0.0:
+                verdict = "WARN" if verdict == "GO" else verdict
+                reason = (reason + ", ") if reason else ""
+                reason = f"{reason}ExpCov=0"
+            elif expcov_global < 0.60:
+                verdict = "WARN" if verdict == "GO" else verdict
+                reason = (reason + ", ") if reason else ""
+                reason = f"{reason}ExpCov<0.60"
         if reason:
             lines.append(f"- {verdict} — причина: {reason}\n")
         else:
             lines.append(f"- {verdict}\n")
+        # acceptance позначка офлайн
+        if locals().get("offline_forward_ok", False):
+            lines.append("- acceptance: offline_OK\n")
+            if offline_only:
+                lines.append("- TODO: зібрати метрики при першій можливості\n")
         out.write_text("".join(lines), encoding="utf-8")
         return out
 
@@ -1218,6 +1511,316 @@ class RunnerOrchestrator:
             except Exception:
                 pass
 
+    # ── Standalone postprocess (offline) ────────────────────────────────────
+    def run_standalone_postprocess(self) -> int:
+        """Generate forward_* and summary.md from an existing out-dir.
+
+        Prerequisites in self.out_dir:
+          - run.log (required)
+          - metrics.txt (optional but recommended)
+        """
+        # Ensure out_dir exists
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.art_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.run_log.exists():
+            print(f"[postprocess] run.log not found in {self.out_dir}")
+            return 1
+
+        # 1) quality.csv
+        q_csv = self.out_dir / "quality.csv"
+        try:
+            self._run_module(
+                "tools.scenario_quality_report",
+                ["--logs", str(self.run_log), "--out", str(q_csv)],
+            )
+        except Exception as e:
+            print(f"[postprocess] quality report failed: {e}")
+
+        # 2) quality_snapshot.md (metrics-dir=self.out_dir)
+        try:
+            self._run_module(
+                "tools.quality_snapshot",
+                [
+                    "--csv",
+                    str(q_csv),
+                    "--metrics-dir",
+                    str(self.out_dir),
+                    "--out",
+                    str(self.out_dir / "quality_snapshot.md"),
+                    "--forward-k",
+                    "3,5,10,20,30",
+                    "--forward-enable-long",
+                    "true",
+                ],
+            )
+        except Exception as e:
+            print(f"[postprocess] quality snapshot failed: {e}")
+
+        # 3) forward profiles (strong/soft/explain)
+        profiles = list(self.cfg.forward_profiles or ["strong", "soft", "explain"])  # type: ignore[attr-defined]
+        # Validate subset
+        profiles = [p for p in profiles if p in FORWARD_PROFILES]
+        # Dedup file shared
+        dedup_path = self.art_dir / "forward_dedup.keys"
+        try:
+            dedup_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Build spec with CLI overrides
+        presence_override = getattr(self.cfg, "pp_presence_min", None)
+        bias_override = getattr(self.cfg, "pp_bias_abs_min", None)
+        whale_override = getattr(self.cfg, "pp_whale_max_age_sec", None)
+        ttl_override = getattr(self.cfg, "pp_explain_ttl_sec", None)
+
+        for name in profiles:
+            spec = dict(FORWARD_PROFILES.get(name, {}))
+            if presence_override is not None:
+                if "presence" in spec:
+                    spec["presence"] = float(presence_override)
+            if bias_override is not None:
+                if "bias" in spec:
+                    spec["bias"] = float(bias_override)
+            if name in ("strong", "soft") and whale_override is not None:
+                spec["whale"] = int(whale_override)
+            if name == "explain" and ttl_override is not None:
+                spec["ttl"] = int(ttl_override)
+
+            out_path = self.out_dir / f"forward_{name}.md"
+            args = [
+                "--log",
+                str(self.run_log),
+                "--out",
+                str(out_path),
+                "--k",
+                "3",
+                "5",
+                "10",
+                "20",
+                "30",
+                "--presence-min",
+                str(spec.get("presence", 0.0)),
+                "--bias-abs-min",
+                str(spec.get("bias", 0.0)),
+                "--dedup-file",
+                str(dedup_path),
+            ]
+            source = str(spec.get("source", "whale"))
+            if source == "explain":
+                args.extend(
+                    [
+                        "--source",
+                        "explain",
+                        "--explain-ttl-sec",
+                        str(int(spec.get("ttl", 600))),
+                    ]
+                )
+            else:
+                args.extend(
+                    [
+                        "--source",
+                        "whale",
+                        "--whale-max-age-sec",
+                        str(int(spec.get("whale", 600))),
+                    ]
+                )
+            try:
+                self._run_module("tools.forward_from_log", args)
+            except Exception as e:
+                print(f"[postprocess] forward {name} failed: {e}")
+
+        # 3b) Explain fallback: if missing or N=0 → rebuild with soft thresholds and TTL=1200
+        exp_path = self.out_dir / "forward_explain.md"
+        need_fallback = True
+        if exp_path.exists():
+            try:
+                txt = exp_path.read_text(encoding="utf-8", errors="ignore")
+                # Heuristic: footer contains 'N=0'
+                need_fallback = "N=0" in txt
+            except Exception:
+                need_fallback = True
+        if need_fallback:
+            try:
+                fb_args = [
+                    "--log",
+                    str(self.run_log),
+                    "--out",
+                    str(exp_path),
+                    "--k",
+                    "3",
+                    "5",
+                    "10",
+                    "20",
+                    "30",
+                    "--presence-min",
+                    str(0.35),
+                    "--bias-abs-min",
+                    str(0.20),
+                    "--source",
+                    "explain",
+                    "--explain-ttl-sec",
+                    str(int(ttl_override or 1200)),
+                    "--dedup-file",
+                    str(dedup_path),
+                ]
+                self._run_module("tools.forward_from_log", fb_args)
+            except Exception as e:
+                print(f"[postprocess] explain fallback failed: {e}")
+
+        # 3c) Hint fallback (smoke): якщо всі strong/soft/explain мають N=0 →
+        #  спершу прогін activation-only; якщо N=0 → другий прогін зі score_min=0.45.
+        try:
+
+            def _has_events(path: Path) -> bool:
+                if not path.exists():
+                    return False
+                try:
+                    txt = path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    return False
+                import re as _re_h
+
+                return bool(
+                    _re_h.search(r"N_total=(?!0)\d+", txt)
+                    or _re_h.search(r"K=\d+: N=(?!0)\d+", txt)
+                )
+
+            all_zero = all(
+                not _has_events(self.out_dir / f"forward_{name}.md")
+                for name in ("strong", "soft", "explain")
+            )
+            if all_zero:
+                print(
+                    "[SMOKE_HINT] strong/soft/explain порожні → запускаємо hint (activation-only)"
+                )
+                hint_path = self.out_dir / "forward_hint.md"
+                hint_args1 = [
+                    "--log",
+                    str(self.run_log),
+                    "--out",
+                    str(hint_path),
+                    "--k",
+                    "3",
+                    "5",
+                    "10",
+                    "20",
+                    "30",
+                    "--source",
+                    "hint",
+                    "--score-min",
+                    "-1",
+                    "--dir-field",
+                    "dir",
+                    "--dedup-file",
+                    str(dedup_path),
+                ]
+                self._run_module("tools.forward_from_log", hint_args1)
+                # Перевіряємо чи зʼявились події
+                if not _has_events(hint_path):
+                    print("[SMOKE_HINT] activation-only N=0 → пробуємо score_min=0.45")
+                    hint_args2 = [
+                        "--log",
+                        str(self.run_log),
+                        "--out",
+                        str(hint_path),
+                        "--k",
+                        "3",
+                        "5",
+                        "10",
+                        "20",
+                        "30",
+                        "--source",
+                        "hint",
+                        "--score-min",
+                        "0.45",
+                        "--dir-field",
+                        "dir",
+                        "--dedup-file",
+                        str(dedup_path),
+                    ]
+                    self._run_module("tools.forward_from_log", hint_args2)
+        except Exception as e:
+            print(f"[postprocess] hint smoke fallback failed: {e}")
+
+        # 3d) Quality fallback: якщо й hint не дав подій (усі strong/soft/explain/hint N=0)
+        try:
+            all_zero = True
+            for name in ("strong", "soft", "explain", "hint"):
+                pth = self.out_dir / f"forward_{name}.md"
+                if not pth.exists():
+                    continue  # відсутній файл не знімає all_zero
+                try:
+                    txt = pth.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                import re as _re_q
+
+                if _re_q.search(r"N_total=(?!0)\d+", txt) or _re_q.search(
+                    r"K=\d+: N=(?!0)\d+", txt
+                ):
+                    all_zero = False
+                    break
+            if all_zero:
+                quality_args = [
+                    "--log",
+                    str(
+                        self.run_log
+                    ),  # для уніфікованого інтерфейсу, не використовується у source=quality
+                    "--out",
+                    str(self.out_dir / "forward_quality.md"),
+                    "--k",
+                    "3",
+                    "5",
+                    "10",
+                    "20",
+                    "30",
+                    "--source",
+                    "quality",
+                    "--quality-csv",
+                    str(self.out_dir / "quality.csv"),
+                    "--dedup-file",
+                    str(dedup_path),
+                ]
+                self._run_module("tools.forward_from_log", quality_args)
+        except Exception as e:
+            print(f"[postprocess] quality fallback failed: {e}")
+
+        # 4) summary
+        try:
+            summary_path = self.generate_summary()
+            import shutil as _sh
+
+            _sh.copyfile(summary_path, self.out_dir / "summary.md")
+        except Exception as e:
+            print(f"[postprocess] summary generation failed: {e}")
+
+        # 5) readme index
+        try:
+            self.write_readme()
+        except Exception:
+            pass
+
+        # Закриваємо tee/handlers (best-effort), щоб звільнити дескриптори
+        try:
+            _close_tee()
+        except Exception:
+            pass
+        try:
+            import logging as _logging
+
+            _lg = _logging.getLogger()
+            for h in list(_lg.handlers):
+                try:
+                    h.flush()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        print(f"[postprocess] Done → {self.out_dir}")
+        return 0
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Unified live/replay runner with reporting")
@@ -1284,17 +1887,77 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     add_common(rep)
 
+    # postprocess (standalone)
+    post = sub.add_parser(
+        "postprocess",
+        help="Generate forward_* and summary.md from existing out-dir without rerunning pipeline",
+    )
+    post.add_argument(
+        "--in-dir",
+        required=True,
+        help="Directory containing run.log & metrics.txt (e.g. reports/prof_canary6)",
+    )
+    post.add_argument(
+        "--forward-profiles",
+        default="strong,soft,explain",
+        help="Comma-separated profiles to generate (subset of strong,soft,explain)",
+    )
+    post.add_argument(
+        "--presence-min",
+        type=float,
+        default=None,
+        help="Override presence_min (all profiles)",
+    )
+    post.add_argument(
+        "--bias-abs-min",
+        type=float,
+        default=None,
+        help="Override bias_abs_min (all profiles)",
+    )
+    post.add_argument(
+        "--whale-max-age-sec",
+        type=int,
+        default=None,
+        help="Override whale_max_age_sec (whale profiles)",
+    )
+    post.add_argument(
+        "--explain-ttl-sec",
+        type=int,
+        default=None,
+        help="Override explain_ttl_sec (explain profile)",
+    )
+    post.add_argument(
+        "--max-lines",
+        type=int,
+        default=None,
+        help="Read at most N lines from run.log (speed-up on huge logs)",
+    )
+
     return p
 
 
 def _parse_args(argv: Iterable[str] | None = None) -> RunnerConfig:
     pa = _build_parser()
     a = pa.parse_args(argv)
+    mode = str(a.mode)
+    if mode == "postprocess":
+        cfg = RunnerConfig(mode=mode, out_dir=Path(a.in_dir))
+        raw_fp = getattr(a, "forward_profiles", None)
+        if isinstance(raw_fp, str) and raw_fp.strip():
+            vals = [s.strip().lower() for s in raw_fp.split(",") if s.strip()]
+            cfg.forward_profiles = [v for v in vals if v in FORWARD_PROFILES]
+        # Direct attribute assignment (avoid setattr for static attr names)
+        cfg.pp_presence_min = getattr(a, "presence_min", None)  # type: ignore[attr-defined]
+        cfg.pp_bias_abs_min = getattr(a, "bias_abs_min", None)  # type: ignore[attr-defined]
+        cfg.pp_whale_max_age_sec = getattr(a, "whale_max_age_sec", None)  # type: ignore[attr-defined]
+        cfg.pp_explain_ttl_sec = getattr(a, "explain_ttl_sec", None)  # type: ignore[attr-defined]
+        cfg.pp_max_lines = getattr(a, "max_lines", None)  # type: ignore[attr-defined]
+        return cfg
     out_dir = Path(a.out_dir)
     cfg = RunnerConfig(
-        mode=str(a.mode),
-        duration_s=int(getattr(a, "duration", 0) or 0) if a.mode == "live" else None,
-        limit=int(getattr(a, "limit", 0) or 0) if a.mode == "replay" else None,
+        mode=mode,
+        duration_s=int(getattr(a, "duration", 0) or 0) if mode == "live" else None,
+        limit=int(getattr(a, "limit", 0) or 0) if mode == "replay" else None,
         namespace=str(a.namespace),
         prom_port=(int(a.prom_port) if a.prom_port is not None else None),
         out_dir=out_dir,
@@ -1309,7 +1972,7 @@ def _parse_args(argv: Iterable[str] | None = None) -> RunnerConfig:
     if isinstance(raw_fp, str) and raw_fp.strip():
         vals = [s.strip().lower() for s in raw_fp.split(",") if s.strip()]
         cfg.forward_profiles = [v for v in vals if v in FORWARD_PROFILES]
-    if a.mode == "replay":
+    if mode == "replay":
         syms = [s.strip().upper() for s in str(a.symbols).split(",") if s.strip()]
         cfg.symbols = syms
         cfg.interval = str(a.interval)
@@ -1320,26 +1983,48 @@ def _parse_args(argv: Iterable[str] | None = None) -> RunnerConfig:
 def main(argv: Iterable[str] | None = None) -> int:
     cfg = _parse_args(argv)
     orch = RunnerOrchestrator(cfg)
-    rc = 1
+    # rc ініціалізуємо як успішний (0) — далі тільки підвищуємо при помилках
+    rc: int = 0
+    if cfg.mode == "postprocess":
+        # Захист: переконаємось, що не передані параметри live/replay
+        try:
+            assert (
+                cfg.duration_s is None and cfg.limit is None
+            ), "postprocess received live/replay arguments"
+        except AssertionError as ae:
+            print(f"[Main] postprocess assertion failed: {ae}")
+            return 1
+        try:
+            rc = orch.run_standalone_postprocess()
+        except Exception:
+            rc = 1
+            try:
+                import logging as _logging
+
+                _logging.getLogger(__name__).exception("postprocess failed")
+            except Exception:
+                print("[Main] postprocess failed (no logger)")
+        return rc
+    # live / replay шляхи
     try:
         if cfg.mode == "live":
             rc = asyncio.run(orch.run_live())
-        else:
+        elif cfg.mode == "replay":
             rc = asyncio.run(orch.run_replay())
+        else:
+            rc = 1
     except asyncio.CancelledError:
-        # Узгоджене завершення по скасуванню (напр., Ctrl+C всередині loop)
         print("[Main] Завершення за скасуванням (CancelledError)", flush=True)
         rc = 0
     except KeyboardInterrupt:
-        # Ctrl+C поза loop — все одно робимо фіналізацію
         print("[Main] Завершення за скасуванням (KeyboardInterrupt)", flush=True)
         rc = 130
     finally:
-        # Завжди виконуємо постпроцесор, навіть якщо ран завершився за скасуванням
-        try:
-            orch.post_process()
-        except Exception as e:  # pragma: no cover
-            print(f"⚠️  Post-process error: {e}")
+        if cfg.mode in {"live", "replay"}:
+            try:
+                orch.post_process()
+            except Exception as e:  # pragma: no cover
+                print(f"⚠️  Post-process error: {e}")
     return rc
 
 

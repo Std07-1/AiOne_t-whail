@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,20 @@ from data.redis_connection import acquire_redis
 from monitoring.telemetry_sink import log_stage3_event
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils import map_reco_to_signal, safe_float
+
+try:
+    from config import config as _config_module
+except Exception:  # pragma: no cover - fallback на дефолти
+    _config_module = None
+
+
+def _cfg_attr(name: str, default: Any) -> Any:
+    """Дістає значення з config.config з безпечним дефолтом."""
+
+    if _config_module is not None and hasattr(_config_module, name):
+        return getattr(_config_module, name)
+    return default
+
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.asset_state_manager import AssetStateManager
@@ -560,12 +575,11 @@ def _pre_open_directional_guard(symbol: str, signal: dict[str, Any]) -> bool:
 
     # Канарейкове обмеження: застосовувати guard лише до певних символів
     if STAGE3_DIRECTIONAL_GUARD_CANARY_ONLY:
-        try:
-            from config.config import CANARY_SYMBOLS as _CANARY
-        except Exception:
-            _canary = set()
+        canary_raw = _cfg_attr("CANARY_SYMBOLS", ())
+        if isinstance(canary_raw, Iterable):
+            _canary = {str(item).upper() for item in canary_raw if item is not None}
         else:
-            _canary = _CANARY
+            _canary = set()
         if _canary and str(symbol).upper() not in _canary:
             logger.debug("Directional guard пропущено для %s (не канарейка)", symbol)
             return True
@@ -589,24 +603,18 @@ def _pre_open_directional_guard(symbol: str, signal: dict[str, Any]) -> bool:
     )
 
     # Завантажуємо пороги з конфігу
-    try:
-        from config.config import DIRECTIONAL_PARAMS
-
+    cfg_dir_params = _cfg_attr("DIRECTIONAL_PARAMS", {})
+    if isinstance(cfg_dir_params, Mapping):
         thr_s = float(
-            DIRECTIONAL_PARAMS.get(
-                "slope_thresh_atr", DIRECTIONAL_PARAMS.get("slope_thresh", 0.25)
+            cfg_dir_params.get(
+                "slope_thresh_atr", cfg_dir_params.get("slope_thresh", 0.25)
             )
         )
-        thr_d = float(DIRECTIONAL_PARAMS.get("dv_ratio_thresh", 1.2))
-        thr_cd = float(DIRECTIONAL_PARAMS.get("cum_delta_thresh", 0.30))
-        from config.config import (
-            FEATURE_STAGE3_USE_CUM_DELTA as _FEATURE_STAGE3_USE_CUM_DELTA,
-        )
-
-        use_cd_flag = bool(_FEATURE_STAGE3_USE_CUM_DELTA)
-    except Exception:
+        thr_d = float(cfg_dir_params.get("dv_ratio_thresh", 1.2))
+        thr_cd = float(cfg_dir_params.get("cum_delta_thresh", 0.30))
+    else:
         thr_s, thr_d, thr_cd = 0.25, 1.2, 0.30
-        use_cd_flag = False
+    use_cd_flag = bool(_cfg_attr("FEATURE_STAGE3_USE_CUM_DELTA", False))
 
     # Обчислюємо умови блокування
     cond_base = slope <= -thr_s and dvr >= thr_d
@@ -1992,23 +2000,26 @@ async def open_trades(
                 sig_type_local = str(signal.get("signal", "NONE")).upper()
                 if sig_type_local == "ALERT_BUY":
                     # Observe-only logging: якщо в конфігу observe=true, логувати would_block
-                    try:
-                        from config.config import (
-                            CANARY_SYMBOLS as _CFG_CANARY,
-                            DIRECTIONAL_PARAMS as _CFG_DIR_PARAMS,
-                            STAGE3_DIRECTIONAL_GUARD_CANARY_ONLY as _CFG_CANARY_ONLY,
-                            STAGE3_DIRECTIONAL_GUARD_OBSERVE as _CFG_OBSERVE,
-                        )
-                    except Exception:
-                        cfg_observe = False
-                        cfg_canary_only = True
-                        canary_set: set[str] = set()
-                        dir_params: dict[str, float] = {}
+                    cfg_observe = bool(
+                        _cfg_attr("STAGE3_DIRECTIONAL_GUARD_OBSERVE", False)
+                    )
+                    cfg_canary_only = bool(
+                        _cfg_attr("STAGE3_DIRECTIONAL_GUARD_CANARY_ONLY", True)
+                    )
+                    canary_raw = _cfg_attr("CANARY_SYMBOLS", ())
+                    if isinstance(canary_raw, Iterable) and not isinstance(
+                        canary_raw, (str, bytes)
+                    ):
+                        canary_set = {
+                            str(item).upper() for item in canary_raw if item is not None
+                        }
                     else:
-                        cfg_observe = bool(_CFG_OBSERVE)
-                        cfg_canary_only = bool(_CFG_CANARY_ONLY)
-                        canary_set = set(_CFG_CANARY)
-                        dir_params = dict(_CFG_DIR_PARAMS)
+                        canary_set = set()
+                    dir_params_raw = _cfg_attr("DIRECTIONAL_PARAMS", {})
+                    if isinstance(dir_params_raw, Mapping):
+                        dir_params = dict(dir_params_raw)
+                    else:
+                        dir_params = {}
                     st_obs = signal.get("stats", {}) or {}
                     mc_obs = signal.get("market_context", {}) or {}
                     dir_obs = (

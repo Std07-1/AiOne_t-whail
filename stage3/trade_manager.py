@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from typing import Any, Protocol
 
 import pandas as pd
 
+from config import flags as feature_flags
 from config.config import (
     PACK_EXHAUSTION_REVERSAL_ENABLED_FLAG,
     STAGE3_PREDICTED_PROFIT_SCALE,
@@ -32,6 +34,7 @@ from config.config import (
     STAGE3_TRADE_PARAMS,
     get_stage3_param,
 )
+from metrics.whale_min_signal_metrics import inc_exit, inc_open
 from monitoring.telemetry_sink import log_stage3_event
 from utils.utils import safe_float
 
@@ -102,6 +105,22 @@ def _load_trade_policy() -> TradePolicy:
 
 
 TRADE_POLICY = _load_trade_policy()
+
+
+# ── Паперові позиції мінімального сигналу ────────────────────────────────────
+
+
+@dataclass
+class MinSignalPaperPosition:
+    side: str
+    risk: dict[str, Any]
+    opened_ts: float
+    time_exit_s: float
+    last_snapshot: dict[str, Any]
+    entry_price: float | None = None
+    atr_at_entry: float | None = None
+    moved_to_be: bool = False
+    sl_price: float | None = None
 
 
 # ── Локальні хелпери ────────────────────────────────────────────────────────
@@ -647,12 +666,349 @@ class TradeLifecycleManager:
             EarlyExitRule(self.policy),
         ]
         self.lock = asyncio.Lock()
+        self._min_signal_positions: dict[str, MinSignalPaperPosition] = {}
         logger.info(
             "Ініціалізовано TradeLifecycleManager: log=%s, summary=%s, cooldown=%.1fs, max_parallel=%d",
             log_file,
             summary_file,
             self.reopen_cooldown,
             self.max_parallel_trades,
+        )
+
+    # ── Мінімальний китовий сигнал (paper lifecycle) ───────────────────────
+    def tick(
+        self,
+        symbol: str,
+        asset: Mapping[str, Any] | None,
+        *,
+        now_ts: float | None = None,
+    ) -> None:
+        if not getattr(feature_flags, "STAGE3_PAPER_ENABLED", False):
+            return
+        if now_ts is None:
+            now_ts = time.time()
+
+        hints = []
+        if isinstance(asset, Mapping):
+            hints_obj = asset.get("hints")
+            if isinstance(hints_obj, list):
+                hints = hints_obj
+
+        snapshot_from_state = self._resolve_snapshot_from_state(asset)
+        for hint in hints:
+            if not isinstance(hint, Mapping):
+                continue
+            if hint.get("kind") != "min_signal":
+                continue
+            snapshot_payload = (
+                (hint.get("payload") or {}).get("snapshot")
+                if isinstance(hint.get("payload"), Mapping)
+                else None
+            )
+            risk_payload = (
+                hint.get("risk") if isinstance(hint.get("risk"), Mapping) else {}
+            )
+            self._open_or_update_min_signal_position(
+                symbol,
+                str(hint.get("side", "")),
+                risk_payload,
+                snapshot_payload,
+                now_ts,
+            )
+            if snapshot_payload:
+                snapshot_from_state = snapshot_payload
+
+        self._evaluate_min_signal_position(symbol, snapshot_from_state, asset, now_ts)
+
+    def has_min_signal_position(self, symbol: str) -> bool:
+        return symbol in self._min_signal_positions
+
+    def _open_or_update_min_signal_position(
+        self,
+        symbol: str,
+        side: str,
+        risk: Mapping[str, Any] | None,
+        snapshot: Mapping[str, Any] | None,
+        now_ts: float,
+    ) -> None:
+        side_text = side.strip().lower()
+        if side_text not in {"long", "short"}:
+            return
+        snapshot_dict = self._normalize_snapshot(snapshot)
+        position = self._min_signal_positions.get(symbol)
+        if position:
+            if snapshot_dict:
+                position.last_snapshot = snapshot_dict
+            return
+
+        opened_ts = self._normalize_timestamp((snapshot_dict or {}).get("ts")) or now_ts
+        risk_dict = dict(risk or {})
+        time_exit_raw = safe_float(risk_dict.get("time_exit_s"))
+        time_exit_s = time_exit_raw if time_exit_raw is not None else 0.0
+        position_obj = MinSignalPaperPosition(
+            side=side_text,
+            risk=risk_dict,
+            opened_ts=opened_ts,
+            time_exit_s=time_exit_s,
+            last_snapshot=snapshot_dict or {},
+        )
+        self._seed_entry_metrics(position_obj, snapshot_dict, None)
+        self._min_signal_positions[symbol] = position_obj
+        inc_open(symbol, side_text)
+        logger.info(
+            "[STRICT_WHALE] Stage3 paper open %s side=%s time_exit=%.0fs",
+            symbol,
+            side_text,
+            time_exit_s,
+        )
+
+    def _evaluate_min_signal_position(
+        self,
+        symbol: str,
+        snapshot_hint: Mapping[str, Any] | None,
+        asset: Mapping[str, Any] | None,
+        now_ts: float,
+    ) -> None:
+        position = self._min_signal_positions.get(symbol)
+        if position is None:
+            return
+
+        snapshot_dict = (
+            self._normalize_snapshot(snapshot_hint) or position.last_snapshot
+        )
+        if not snapshot_dict and isinstance(asset, Mapping):
+            stats_snapshot = self._build_snapshot_from_stats(asset.get("stats"))
+            if stats_snapshot:
+                snapshot_dict = stats_snapshot
+
+        if snapshot_dict:
+            position.last_snapshot = snapshot_dict
+
+        if (
+            position.time_exit_s > 0
+            and (now_ts - position.opened_ts) >= position.time_exit_s
+        ):
+            self._close_min_signal_position(symbol, "time_exit")
+            return
+
+        if not position.last_snapshot:
+            return
+
+        self._seed_entry_metrics(position, position.last_snapshot, asset)
+        current_price = self._resolve_price(position.last_snapshot, asset)
+        if current_price is not None:
+            self._maybe_move_to_break_even(symbol, position, current_price)
+
+        presence = safe_float(position.last_snapshot.get("presence"))
+        if presence is not None and presence < 0.35:
+            self._close_min_signal_position(symbol, "presence_drop")
+            return
+
+        dvr_val = safe_float(position.last_snapshot.get("dvr"))
+        if dvr_val is not None and dvr_val < 1.0:
+            self._close_min_signal_position(symbol, "dvr_drop")
+            return
+
+        bias_val = safe_float(position.last_snapshot.get("bias"))
+        if bias_val is not None:
+            if position.side == "long" and bias_val < 0:
+                self._close_min_signal_position(symbol, "bias_flip")
+                return
+            if position.side == "short" and bias_val > 0:
+                self._close_min_signal_position(symbol, "bias_flip")
+                return
+
+    def _close_min_signal_position(self, symbol: str, reason: str) -> None:
+        position = self._min_signal_positions.pop(symbol, None)
+        if not position:
+            return
+        inc_exit(symbol, position.side, reason)
+        sl_fmt = (
+            f"{float(position.sl_price):.6f}" if position.sl_price is not None else "na"
+        )
+        logger.info(
+            "[STRICT_WHALE] Stage3 paper close %s side=%s reason=%s moved_to_be=%s sl=%s",
+            symbol,
+            position.side,
+            reason,
+            position.moved_to_be,
+            sl_fmt,
+        )
+
+    @staticmethod
+    def _normalize_snapshot(snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(snapshot, Mapping):
+            return {}
+        return dict(snapshot)
+
+    def _resolve_snapshot_from_state(
+        self, asset: Mapping[str, Any] | None
+    ) -> Mapping[str, Any] | None:
+        if not isinstance(asset, Mapping):
+            return None
+        meta = asset.get("last_min_signal_accept")
+        if isinstance(meta, Mapping):
+            snapshot = meta.get("snapshot")
+            if isinstance(snapshot, Mapping):
+                return snapshot
+        return None
+
+    @staticmethod
+    def _build_snapshot_from_stats(stats: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(stats, Mapping):
+            return {}
+        snapshot: dict[str, Any] = {}
+        for key in ("presence", "bias", "dvr", "vwap_dev", "band_pct"):
+            if key in stats:
+                snapshot[key] = stats.get(key)
+        for key in ("ts", "timestamp", "ts_ms", "timestamp_ms"):
+            if key in stats:
+                normalized = TradeLifecycleManager._normalize_timestamp(stats.get(key))
+                if normalized is not None:
+                    snapshot["ts"] = normalized
+                    break
+        return snapshot
+
+    @staticmethod
+    def _normalize_timestamp(raw: Any | None) -> float | None:
+        if raw is None:
+            return None
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if ts > 1e12:
+            ts /= 1000.0
+        elif ts > 1e10:
+            ts /= 1000.0
+        return ts
+
+    @staticmethod
+    def _resolve_numeric_field(
+        container: Mapping[str, Any] | None, keys: tuple[str, ...]
+    ) -> float | None:
+        if not isinstance(container, Mapping):
+            return None
+        for key in keys:
+            if key not in container:
+                continue
+            value = safe_float(container.get(key))
+            if value is None:
+                continue
+            return value
+        return None
+
+    def _resolve_price(
+        self,
+        snapshot: Mapping[str, Any] | None,
+        asset: Mapping[str, Any] | None,
+    ) -> float | None:
+        price_keys = (
+            "price",
+            "last_price",
+            "close",
+            "current_price",
+            "close_price",
+            "mid_price",
+        )
+        candidates: list[Mapping[str, Any] | None] = [snapshot]
+        if isinstance(asset, Mapping):
+            candidates.append(asset)
+            stats = (
+                asset.get("stats") if isinstance(asset.get("stats"), Mapping) else None
+            )
+            if isinstance(stats, Mapping):
+                candidates.append(stats)
+                whale = stats.get("whale")
+                if isinstance(whale, Mapping):
+                    candidates.append(whale)
+        for container in candidates:
+            price_val = self._resolve_numeric_field(container, price_keys)
+            if price_val is not None and price_val > 0:
+                return price_val
+        return None
+
+    def _resolve_atr(
+        self,
+        snapshot: Mapping[str, Any] | None,
+        asset: Mapping[str, Any] | None,
+        price_hint: float | None = None,
+    ) -> float | None:
+        atr_keys = ("atr", "atr_abs")
+        atr_pct_keys = ("atr_pct",)
+        candidates: list[Mapping[str, Any] | None] = [snapshot]
+        if isinstance(asset, Mapping):
+            candidates.append(asset)
+            stats = (
+                asset.get("stats") if isinstance(asset.get("stats"), Mapping) else None
+            )
+            if isinstance(stats, Mapping):
+                candidates.append(stats)
+                whale = stats.get("whale")
+                if isinstance(whale, Mapping):
+                    candidates.append(whale)
+        for container in candidates:
+            atr_val = self._resolve_numeric_field(container, atr_keys)
+            if atr_val is not None and atr_val > 0:
+                return atr_val
+            atr_pct_val = self._resolve_numeric_field(container, atr_pct_keys)
+            if atr_pct_val is not None and atr_pct_val > 0:
+                price_source = price_hint
+                if price_source is None:
+                    price_source = self._resolve_price(snapshot, asset)
+                if price_source and price_source > 0:
+                    return atr_pct_val * price_source
+        return None
+
+    def _seed_entry_metrics(
+        self,
+        position: MinSignalPaperPosition,
+        snapshot: Mapping[str, Any] | None,
+        asset: Mapping[str, Any] | None,
+    ) -> None:
+        if position.entry_price is None:
+            price_val = self._resolve_price(snapshot, asset)
+            if price_val is not None and price_val > 0:
+                position.entry_price = price_val
+        if position.atr_at_entry is None:
+            atr_val = self._resolve_atr(snapshot, asset, position.entry_price)
+            if atr_val is not None and atr_val > 0:
+                position.atr_at_entry = atr_val
+
+    def _maybe_move_to_break_even(
+        self,
+        symbol: str,
+        position: MinSignalPaperPosition,
+        current_price: float,
+    ) -> None:
+        if position.moved_to_be:
+            return
+        tp1_atr = safe_float(position.risk.get("tp1_atr"))
+        if tp1_atr is None or tp1_atr <= 0:
+            return
+        entry_price = position.entry_price
+        atr_at_entry = position.atr_at_entry
+        if entry_price is None or atr_at_entry is None or atr_at_entry <= 0:
+            return
+        if current_price <= 0:
+            return
+        if position.side == "long":
+            trigger_price = entry_price + tp1_atr * atr_at_entry
+            reached = current_price >= trigger_price
+        else:
+            trigger_price = entry_price - tp1_atr * atr_at_entry
+            reached = current_price <= trigger_price
+        if not reached:
+            return
+        position.moved_to_be = True
+        position.sl_price = entry_price
+        logger.info(
+            "[STRICT_WHALE] Stage3 paper move-to-BE %s side=%s entry=%.6f trigger=%.6f tp1_atr=%.2f",
+            symbol,
+            position.side,
+            entry_price,
+            trigger_price,
+            tp1_atr,
         )
 
     async def open_trade(

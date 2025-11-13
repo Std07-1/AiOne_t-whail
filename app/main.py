@@ -78,26 +78,26 @@ load_dotenv()
 
 # ───────────────────────────── Prometheus метрики (опційно) ──────────────
 try:
-    from config.config import PROM_GAUGES_ENABLED as _CFG_PROM_ENABLED
-    from config.config import PROM_HTTP_PORT as _CFG_PROM_PORT
-except Exception:
-    _CFG_PROM_ENABLED = True  # type: ignore[assignment]
-    _CFG_PROM_PORT = 9108  # type: ignore[assignment]
+    from config import config as _cfg  # type: ignore
+except Exception:  # pragma: no cover - дефолт у разі збою імпорту
+    _cfg = None
 
 # Дозволяємо оверрайд порт/ввімкнення через змінні середовища для A/B канарейки
 _env_prom_enabled = os.getenv("PROM_GAUGES_ENABLED")
 if _env_prom_enabled is not None:
     prom_enabled = str(_env_prom_enabled).strip().lower() in {"1", "true", "yes", "on"}
 else:
-    prom_enabled = bool(_CFG_PROM_ENABLED)
+    prom_enabled = bool(getattr(_cfg, "PROM_GAUGES_ENABLED", True))
 
 _env_prom_port = os.getenv("PROM_HTTP_PORT")
 try:
     prom_port = (
-        int(_env_prom_port) if _env_prom_port is not None else int(_CFG_PROM_PORT)
+        int(_env_prom_port)
+        if _env_prom_port is not None
+        else int(getattr(_cfg, "PROM_HTTP_PORT", 9108))
     )
 except Exception:
-    prom_port = int(_CFG_PROM_PORT)
+    prom_port = int(getattr(_cfg, "PROM_HTTP_PORT", 9108))
 
 if prom_enabled:
     try:
@@ -615,6 +615,14 @@ async def run_pipeline() -> None:
             tasks_to_run.append(prod)
         if prefilter_task is not None:
             tasks_to_run.append(prefilter_task)
+
+        try:
+            from app.whale_worker import run_whale_worker
+
+            logger.info("[Main] Запускаємо WhaleWorker у фоні")
+            tasks_to_run.append(asyncio.create_task(run_whale_worker()))
+        except Exception:
+            logger.warning("[Main] Не вдалося запустити WhaleWorker", exc_info=True)
 
         # ───────────────────── Dry‑run тюнер семафорів (під фіче‑флагом) ─────────────────────
         tuner_task: asyncio.Task[None] | None = None

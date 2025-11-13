@@ -90,7 +90,11 @@ def _now_ts_ms(ctx: dict[str, Any], stats: dict[str, Any]) -> int:
 
     for container in (stats, ctx):
         for key in ("now_ts_ms", "ts_ms", "timestamp_ms", "ts", "timestamp"):
-            ts = _resolve_ts_ms(container.get(key)) if isinstance(container, dict) else None
+            ts = (
+                _resolve_ts_ms(container.get(key))
+                if isinstance(container, dict)
+                else None
+            )
             if ts is not None:
                 return ts
     return int(time.time() * 1000)
@@ -201,8 +205,7 @@ def minimal_signal(symbol: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
     whale_block = stats.get("whale") if isinstance(stats.get("whale"), dict) else {}
     presence = _as_float(stats.get("presence", whale_block.get("presence")))
     bias = _as_float(stats.get("bias", whale_block.get("bias")))
-    dvr = _as_float(
-        stats.get("dvr", stats.get(K_DIRECTIONAL_VOLUME_RATIO)))
+    dvr = _as_float(stats.get("dvr", stats.get(K_DIRECTIONAL_VOLUME_RATIO)))
     vwap_dev = _as_float(stats.get("vwap_dev", whale_block.get("vwap_dev")))
     atr = _as_float(stats.get("atr"))
     band_pct = _as_float(stats.get("band_pct"), default=1.0)
@@ -212,6 +215,7 @@ def minimal_signal(symbol: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
         or (isinstance(whale_block, dict) and bool(whale_block.get("stale")))
     )
 
+    now_ts_seconds = int(round(_now_ts_ms(ctx, stats) / 1000))
     snapshot = {
         "presence": presence,
         "bias": bias,
@@ -223,40 +227,80 @@ def minimal_signal(symbol: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
         "near_edge": near_edge_raw,
         "retest_ok": _extract_stat_bool(stats, "retest_ok"),
         "sweep_then_breakout": _extract_stat_bool(stats, "sweep_then_breakout"),
+        "ts": now_ts_seconds,
     }
 
+    def _reject(
+        reason: str,
+        gate: str | None = None,
+        value: Any | None = None,
+        threshold: Any | None = None,
+    ) -> dict[str, Any]:
+        details: dict[str, Any] = {}
+        if gate:
+            details["failed_gate"] = gate
+        if value is not None:
+            details["value"] = value
+        if threshold is not None:
+            details["threshold"] = threshold
+        payload: dict[str, Any] = {"reason": reason}
+        if details:
+            payload["details"] = details
+        snapshot_copy = dict(snapshot)
+        _log_reject(symbol, reason, snapshot_copy)
+        return {"reject": payload, "snapshot": snapshot_copy}
+
     if stale_flag:
-        _log_reject(symbol, "stale", snapshot)
-        return None
+        return _reject("stale", gate="stale_flag", value=True, threshold=False)
 
     direction_val = _normalize_direction(stats.get("direction"))
     if direction_val is None or direction_val == 0.0:
         # сприяємо лише визначеним напрямкам
-        _log_reject(symbol, "direction_unknown", snapshot)
-        return None
+        return _reject(
+            "direction_unknown", gate="direction", value=stats.get("direction")
+        )
 
     aligned_bias = bias * direction_val
     if presence < _MIN_SIGNAL_PRESENCE:
-        _log_reject(symbol, "presence_below_min", snapshot)
-        return None
+        return _reject(
+            "presence_below_min",
+            gate="presence",
+            value=presence,
+            threshold=_MIN_SIGNAL_PRESENCE,
+        )
     if aligned_bias < _MIN_SIGNAL_BIAS:
-        _log_reject(symbol, "bias_direction_mismatch", snapshot)
-        return None
+        return _reject(
+            "bias_direction_mismatch",
+            gate="bias",
+            value=aligned_bias,
+            threshold=_MIN_SIGNAL_BIAS,
+        )
     if dvr < _MIN_SIGNAL_DVR:
-        _log_reject(symbol, "dvr_below_min", snapshot)
-        return None
+        return _reject(
+            "dvr_below_min",
+            gate="dvr",
+            value=dvr,
+            threshold=_MIN_SIGNAL_DVR,
+        )
     if atr <= 0.0:
-        _log_reject(symbol, "atr_missing", snapshot)
-        return None
+        return _reject("atr_missing", gate="atr", value=atr, threshold=0.0)
     if abs(vwap_dev) < (_MIN_SIGNAL_VWAP_DEV_ATR * atr):
-        _log_reject(symbol, "vwap_dev_insufficient", snapshot)
-        return None
+        return _reject(
+            "vwap_dev_insufficient",
+            gate="vwap_dev",
+            value=abs(vwap_dev),
+            threshold=_MIN_SIGNAL_VWAP_DEV_ATR * atr,
+        )
 
     near_edge_ok = bool(near_edge_raw in (True, "upper", "lower"))
     band_ok = band_pct <= _MAX_BAND_PCT
     if not (near_edge_ok or band_ok):
-        _log_reject(symbol, "edge_guard_failed", snapshot)
-        return None
+        return _reject(
+            "edge_guard_failed",
+            gate="edge",
+            value={"near_edge": near_edge_raw, "band_pct": band_pct},
+            threshold={"band_pct_max": _MAX_BAND_PCT},
+        )
 
     side = "long" if direction_val > 0 else "short"
     accept_reasons = [
@@ -283,7 +327,7 @@ def minimal_signal(symbol: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
         "tp2_atr": _TP2_ATR,
         "time_exit_s": _TIME_EXIT_S,
         "reasons": accept_reasons,
-        "snapshot": snapshot,
+        "snapshot": dict(snapshot),
     }
     return result
 

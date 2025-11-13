@@ -12,15 +12,24 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Final, Literal, NotRequired, TypedDict
+from typing import Any, Final, Literal, NotRequired, TypedDict
+
+try:  # не імпортуємо на верхньому рівні config.config у змінному середовищі
+    from config import config as _config_module
+except Exception:  # pragma: no cover - підмінний контекст конфігу
+    _config_module = None
+
+
+def _cfg_attr(name: str, default: Any) -> Any:
+    """Дістає значення з config.config без падіння при відсутності."""
+
+    if _config_module is not None and hasattr(_config_module, name):
+        return getattr(_config_module, name)
+    return default
+
 
 # Телеметрійна директорія: деякі модулі (whale.insight_builder) очікують символ тут
-try:  # не імпортуємо на верхньому рівні config.config у змінному середовищі
-    from config.config import TELEMETRY_BASE_DIR as _TELEMETRY_BASE_DIR  # type: ignore
-
-    TELEMETRY_BASE_DIR: Final[str] = str(_TELEMETRY_BASE_DIR)
-except Exception:  # pragma: no cover - безпечний дефолт
-    TELEMETRY_BASE_DIR = "./telemetry"
+TELEMETRY_BASE_DIR: Final[str] = str(_cfg_attr("TELEMETRY_BASE_DIR", "./telemetry"))
 
 
 class Stage2InsightFallbackStability(TypedDict, total=False):

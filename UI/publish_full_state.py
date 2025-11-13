@@ -56,7 +56,7 @@ from config.config import (
 )
 from config.config_stage2 import STAGE2_VOLATILITY_REGIME
 from config.flags import UI_SIGNAL_V2_BADGES_ENABLED
-from config.keys import build_key
+from config.keys import build_key, normalize_symbol
 from utils.utils import (
     format_price as fmt_price_stage1,
 )
@@ -692,9 +692,9 @@ async def publish_full_state(
                             # Це не змінює контракти Stage1/Stage2/Stage3, лише впливає на відображення бейджів
                             if isinstance(hint_dir, str):
                                 _d = hint_dir.strip().lower()
-                                if _d == "long":
+                                if _d in ("long", "up"):
                                     hint_dir = "BUY"
-                                elif _d == "short":
+                                elif _d in ("short", "down"):
                                     hint_dir = "SELL"
                             hint_score = safe_float(
                                 getattr(hint_blk, "get", dict.get)(hint_blk, "score")
@@ -819,7 +819,8 @@ async def publish_full_state(
 
             # ── Whale/Insight merge (best‑effort, не ламає контрактів) ──
             try:
-                sym_for_keys = str(asset.get("symbol", "")).upper()
+                symbol_raw = asset.get("symbol")
+                sym_for_keys = normalize_symbol(symbol_raw)
                 jget = None
                 redis_obj = getattr(cache_handler, "redis", None)
                 if redis_obj is not None:

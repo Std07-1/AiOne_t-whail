@@ -9,12 +9,18 @@
 
 ```
 # Запуск застосунку (локальний режим)
-& "./venv/Scripts/python.exe" -m app.main
+& ".\.venv\Scripts\python.exe" -m app.main
 
 # Лінт + типи + тести
-& "./venv/Scripts/python.exe" -m ruff check .
-& "./venv/Scripts/python.exe" -m mypy .
-& "./venv/Scripts/python.exe" -m pytest -q
+& ".\.venv\Scripts\python.exe" -m ruff check .
+& ".\.venv\Scripts\python.exe" -m mypy .
+& ".\.venv\Scripts\python.exe" -m pytest -q
+
+# Постпроцес існуючого ран-а (offline, без повторного запуску пайплайна)
+# Припускає, що каталог reports\run_X містить run.log (+ опційно metrics.txt)
+& ".\.venv\Scripts\python.exe" -m tools.unified_runner postprocess --in-dir reports\run_X --forward-profiles strong,soft,explain
+
+# Результат: forward_*.md, quality.csv, quality_snapshot.md, summary.md
 ```
 
 ## Архітектура

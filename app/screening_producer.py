@@ -51,6 +51,7 @@ from config.flags import (
 from config.flags import (
     STAGE1_PREFILTER_STRICT_SOFT_PROFILE as _SOFT_PROFILE,
 )
+from config.flags import STAGE3_MIN_WHALE_SIGNAL_ENABLED
 from config.keys import build_key as _k
 from monitoring.telemetry_sink import log_stage1_event, log_stage1_latency
 from stage1.asset_monitoring import AssetMonitorStage1
@@ -59,6 +60,7 @@ from UI.publish_full_state import RedisLike, publish_full_state
 from utils.utils import create_no_data_signal, get_tick_size
 
 from .asset_state_manager import AssetStateManager
+from .min_signal_adapter import apply_min_signal_hint
 from .process_asset_batch import ProcessAssetBatchv1
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
@@ -506,6 +508,16 @@ if not logger.handlers:
                     reference_symbol,
                     len(tasks),
                 )
+
+            if STAGE3_MIN_WHALE_SIGNAL_ENABLED and state_manager is not None:
+                now_ts = time.time()
+                for symbol in ready_assets:
+                    ctx = state_manager.state.get(symbol)
+                    if not isinstance(ctx, dict) or not isinstance(
+                        ctx.get(K_STATS), dict
+                    ):
+                        continue
+                    apply_min_signal_hint(symbol, ctx, state_manager, now_ts=now_ts)
 
             # Публікація стану
             await publish_full_state(state_manager, store, redis_conn)

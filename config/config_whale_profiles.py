@@ -44,6 +44,10 @@ class ProfileThresholds(TypedDict, total=False):
         - atr_scale: множники для порогів за vol_regime (low/mid/high/…)
         - k_range: рекомендований діапазон K для forward‑оцінки (довідково у meta)
         - cooldown_s: кулдаун на повторну емісію hint після UP/DOWN
+        - band_k: опціональний коефіцієнт для band‑фіч (Stage B)
+        - edge_hits_min: опціональний мінімум попадань у край band
+        - band_squeeze_min: опціональний поріг стиснення band (0..1)
+        - max_pullback_in_band_ratio_max: опціональний макс. відношення pullback у band
     """
 
     presence_min: float
@@ -55,6 +59,12 @@ class ProfileThresholds(TypedDict, total=False):
     atr_scale: dict[str, float]
     k_range: tuple[int, int]
     cooldown_s: int
+
+    # Опціональні band‑/stage‑B поля (додаються у деяких профілях)
+    band_k: float
+    edge_hits_min: int
+    band_squeeze_min: float
+    max_pullback_in_band_ratio_max: float
 
 
 # Базові пресети для маркет-класів

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import time
@@ -21,7 +22,6 @@ from config.config import (
     NAMESPACE,
     SCEN_EXPLAIN_ENABLED,  # type: ignore
     SCEN_EXPLAIN_VERBOSE_EVERY_N,  # type: ignore
-    STAGE1_TRAP,
     STAGE2_PROFILE,
     STAGE2_SIGNAL_V2_PROFILES,
     TELEM_ENRICH_PHASE_PAYLOAD,
@@ -31,13 +31,16 @@ from config.config import (
 from config.flags import (
     SCENARIO_CANARY_PUBLISH_CANDIDATE,
     SCENARIO_TRACE_ENABLED,
-    STAGE1_EXCLUDE_LOW_VOL_ATR_TRIGGERS,
     STAGE1_PREFILTER_STRICT_ENABLED,
+    STAGE1_WHALE_MISSING_META_ENABLED,
     STAGE2_HINT_ENABLED,
     STAGE2_SIGNAL_V2_ENABLED,
     STAGE2_WHALE_EMBED_ENABLED,
     STRICT_SCENARIO_HYSTERESIS_ENABLED,
+    WHALE_MISSING_STALE_MODEL_ENABLED,
+    WHALE_SOFT_STALE_TTL_S,
 )
+from config.keys import normalize_symbol
 from monitoring.telemetry_sink import log_stage1_event
 from process_asset_batch.global_state import (
     _CTX_MEMORY,
@@ -48,7 +51,6 @@ from process_asset_batch.global_state import (
     _LAST_PHASE,
     _PROFILE_STATE,
     _SCEN_ALERT_LAST_TS,
-    _SCEN_EXPLAIN_BATCH_COUNTER,
     _SCEN_EXPLAIN_FORCE_ALL,
     _SCEN_EXPLAIN_LAST_TS,
     _SCEN_HIST_RING,
@@ -63,8 +65,8 @@ from process_asset_batch.global_state import (
 from process_asset_batch.helpers import (
     active_alt_keys,
     compute_ctx_persist,
+    compute_profile_hint_direction_and_score,
     emit_prom_presence,
-    ensure_whale_default,
     explain_should_log,
     htf_adjust_alt_min,
     normalize_and_cap_dvr,
@@ -74,14 +76,14 @@ from process_asset_batch.helpers import (
     update_accum_monitor,
     write_profile_cooldown,
 )
+from process_asset_batch.pipeline.context_stage1 import prepare_stage1_context
 from process_asset_batch.router_signal_v2 import router_signal_v2
+from process_asset_batch.whale_embed import embed_whale_metrics, ensure_whale_snapshot
 from stage1.asset_monitoring import AssetMonitorStage1
 from utils.phase_adapter import detect_phase_from_stats, resolve_scenario
 from utils.utils import (
     create_error_signal,
     create_no_data_signal,
-    normalize_result_types,
-    sanitize_ohlcv_numeric,
 )
 
 # Локальний helper для вибірки last_h1 (мінімальний диф, без зміни контрактів)
@@ -94,6 +96,11 @@ except Exception:  # pragma: no cover
 
 from .asset_state_manager import AssetStateManager
 
+try:
+    from config import config as _cfg  # type: ignore
+except Exception:  # pragma: no cover - дефолт на випадок збою імпорту
+    _cfg = None
+
 # Policy v2 інтеграція (під прапором). Безпечний фолбек при відсутності модуля.
 try:  # noqa: E402
     from stage2 import policy_engine_v2  # type: ignore
@@ -101,10 +108,7 @@ except Exception:  # pragma: no cover
     policy_engine_v2 = None  # type: ignore
 
 # Латентність Stage1: експорт опційної функції спостереження гістограми
-try:
-    from config.config import PROM_GAUGES_ENABLED as _PROM_ENABLED  # type: ignore
-except Exception:
-    _PROM_ENABLED = True  # type: ignore[assignment]
+_PROM_ENABLED = bool(getattr(_cfg, "PROM_GAUGES_ENABLED", True))
 if _PROM_ENABLED:
     try:
         from telemetry.prom_gauges import (  # type: ignore
@@ -154,6 +158,35 @@ if TYPE_CHECKING:  # pragma: no cover - type hints only
 # Rate-limit журналу для Prometheus presence (на символ): ~1 запис / 30с
 _PROM_PRES_LAST_TS: dict[str, float] = {}
 _PROM_CTX_LAST_TS: dict[str, float] = {}
+_WHALE_WARN_LAST_TS: dict[str, float] = {}
+_WHALE_WARN_INTERVAL_SEC = 10.0
+
+# Юніт-тести очікують прямий доступ до pure-хелперів
+_active_alt_keys = active_alt_keys
+_compute_profile_hint_direction_and_score = compute_profile_hint_direction_and_score
+_score_scale_for_class = score_scale_for_class
+_htf_adjust_alt_min = htf_adjust_alt_min
+_read_profile_cooldown = read_profile_cooldown
+_write_profile_cooldown = write_profile_cooldown
+_router_signal_v2 = router_signal_v2
+_should_confirm_pre_breakout = should_confirm_pre_breakout
+_normalize_and_cap_dvr = normalize_and_cap_dvr
+_emit_prom_presence = emit_prom_presence
+_explain_should_log = explain_should_log
+_compute_ctx_persist = compute_ctx_persist
+
+
+def _resolve_whale_snapshot_ttl_s() -> float:
+    try:
+        soft_ttl = float(WHALE_SOFT_STALE_TTL_S)
+    except Exception:
+        soft_ttl = 45.0
+    return max(120.0, soft_ttl)
+
+
+_SNAPSHOT_TTL_S = _resolve_whale_snapshot_ttl_s()
+_MISSING_STALE_MODEL_ENABLED = bool(WHALE_MISSING_STALE_MODEL_ENABLED)
+
 
 # Кільце для контекстних метрик (12 останніх барів)
 _CONTEXT_RING: dict[str, deque[dict[str, Any]]] = {}
@@ -180,7 +213,12 @@ inc_liq_sweep_total = None  # type: ignore[assignment]
 inc_sweep_then_breakout = None  # type: ignore[assignment]
 inc_sweep_reject = None  # type: ignore[assignment]
 set_retest_ok = None  # type: ignore[assignment]
-record_stage1_latency_ms = None  # type: ignore[assignment]
+inc_whale_presence_zero_nonstale = None  # type: ignore[assignment]
+# ВАЖЛИВО: не переозначати record_stage1_latency_ms, якщо вже імпортовано вище.
+# Попередній блок (PROM_GAUGES_ENABLED) імпортує record_stage1_latency_ms з telemetry.prom_gauges.
+# Тут раніше ми затирали його до None і втрачали observe(), тому p95 залишався порожнім.
+if "record_stage1_latency_ms" not in globals():
+    record_stage1_latency_ms = None  # type: ignore[assignment]
 try:
     from config.config import PROM_GAUGES_ENABLED  # noqa: F401
 except Exception:  # pragma: no cover - захисний фолбек
@@ -223,6 +261,12 @@ else:
                 )
             except Exception:
                 _inc_explain_heartbeat = None  # type: ignore[assignment]
+            try:
+                from telemetry.prom_gauges import (  # type: ignore
+                    inc_whale_presence_zero_nonstale as _inc_whale_presence_zero_nonstale,
+                )
+            except Exception:
+                _inc_whale_presence_zero_nonstale = None  # type: ignore[assignment]
 
             # Додаткові (опційні) лічильники для chop/hypothesis
             try:
@@ -292,6 +336,7 @@ else:
             set_presence = _set_presence  # type: ignore[assignment]
             set_phase = _set_phase  # type: ignore[assignment]
             set_scenario = _set_scenario  # type: ignore[assignment]
+            inc_whale_presence_zero_nonstale = _inc_whale_presence_zero_nonstale  # type: ignore[assignment]
             inc_scenario_reject = _inc_scenario_reject  # type: ignore[assignment]
             inc_explain_line = _inc_explain_line  # type: ignore[assignment]
             inc_explain_heartbeat = _inc_explain_heartbeat  # type: ignore[assignment]
@@ -358,6 +403,60 @@ else:
             pass
 
 
+def _maybe_warn_whale_presence_zero(
+    symbol: str,
+    presence: Any,
+    stale: bool,
+    age_ms: int | None,
+) -> bool:
+    """Лог WARN, коли presence==0, але дані не позначені як stale."""
+    try:
+        pres_val = float(presence)
+    except Exception:
+        return False
+    if not math.isfinite(pres_val):
+        return False
+    if abs(pres_val) > 1e-6:
+        return False
+    if stale:
+        return False
+    now = time.time()
+    last_ts = _WHALE_WARN_LAST_TS.get(symbol)
+    if last_ts is not None and (now - last_ts) < _WHALE_WARN_INTERVAL_SEC:
+        return False
+    _WHALE_WARN_LAST_TS[symbol] = now
+    age_repr = "unknown" if age_ms is None else int(age_ms)
+    ring = _WHALE_METRIC_RING.get(symbol)
+
+    def _fmt_pair(src: tuple[Any, Any] | None) -> str:
+        if not isinstance(src, tuple) or len(src) != 2:
+            return "-"
+        try:
+            p_val = float(src[0])
+            b_val = float(src[1])
+        except Exception:
+            return "-"
+        if not (math.isfinite(p_val) and math.isfinite(b_val)):
+            return "-"
+        return f"{p_val:.2f}/{b_val:.2f}"
+
+    head_repr = _fmt_pair(ring[0] if ring else None)
+    tail_repr = _fmt_pair(ring[-1] if ring else None)
+    logger.warning(
+        "[WHALE_DIAG] presence=0 non-stale | sym=%s age_ms=%s head=%s tail=%s",
+        symbol.upper(),
+        age_repr,
+        head_repr,
+        tail_repr,
+    )
+    if callable(inc_whale_presence_zero_nonstale):
+        try:
+            inc_whale_presence_zero_nonstale(symbol.upper())
+        except Exception:
+            pass
+    return True
+
+
 class ProcessAssetBatchv1:
     """
     Клас для обробки батчів активів: Stage1 → whale (Redis/локальний fallback) → Stage2-lite hints → фазування → оновлення state_manager.
@@ -401,405 +500,335 @@ class ProcessAssetBatchv1:
         """
         logger.info("[BATCH] symbols=%s (n=%d)", symbols, len(symbols))
         for symbol in symbols:
-            lower_symbol = symbol.lower()
+            lower_symbol = normalize_symbol(symbol) or str(symbol).lower()
             try:
-                logger.debug("[LOAD] %s: Завантаження даних...", lower_symbol)
-                df = await store.get_df(symbol, timeframe, limit=lookback)
-                if df is None or df.empty or len(df) < 5:
-                    logger.warning(
-                        "[NO_DATA] %s: Недостатньо даних, пропускаємо", lower_symbol
-                    )
-                    state_manager.update_asset(
-                        lower_symbol, create_no_data_signal(symbol)
-                    )
-                    continue
-                if "open_time" in df.columns and "timestamp" not in df.columns:
-                    df = df.rename(columns={"open_time": "timestamp"})
-
-                df = sanitize_ohlcv_numeric(
-                    df, logger_obj=logger, log_prefix=f"[{lower_symbol}] "
+                stage1_ctx = await prepare_stage1_context(
+                    symbol,
+                    monitor,
+                    store,
+                    timeframe,
+                    lookback,
+                    logger=logger,
+                    on_latency=(
+                        record_stage1_latency_ms
+                        if "record_stage1_latency_ms" in globals()
+                        else None
+                    ),
                 )
-                if df.empty:
-                    logger.warning(
-                        "[NO_DATA] %s: sanitized frame порожній, пропускаємо",
-                        lower_symbol,
-                    )
+                if stage1_ctx is None:
                     state_manager.update_asset(
                         lower_symbol, create_no_data_signal(symbol)
                     )
                     continue
 
+                df = stage1_ctx.df
+                normalized = stage1_ctx.normalized
+                stats_container = stage1_ctx.stats
+
+                # Підготовка до винесення whale‑ембеду: no‑op (структурна гарантія)
                 try:
-                    current_price = float(df["close"].iloc[-1])
-                except Exception:
-                    current_price = None
-                try:
-                    volume_last = float(df["volume"].iloc[-1])
-                except Exception:
-                    volume_last = None
-                last_ts_val = None
-                if "timestamp" in df.columns:
-                    try:
-                        last_ts_val = df["timestamp"].iloc[-1]
-                    except Exception:
-                        last_ts_val = None
-
-                logger.debug("[STAGE1] %s: anomaly check", lower_symbol)
-                _t0_ms = time.perf_counter()
-                try:
-                    signal = await monitor.check_anomalies(symbol, df)
-                finally:
-                    try:
-                        if "record_stage1_latency_ms" in globals() and record_stage1_latency_ms is not None:  # type: ignore[name-defined]
-                            dt_ms = (time.perf_counter() - _t0_ms) * 1000.0
-                            record_stage1_latency_ms(float(dt_ms))  # type: ignore[misc]
-                    except Exception:
-                        pass
-                if not isinstance(signal, dict):
-                    logger.warning("[STAGE1] %s: повернув не dict", lower_symbol)
-                    signal = {"symbol": lower_symbol, "signal": "NONE", "stats": {}}
-
-                stats_container = signal.get("stats") or {}
-                if not isinstance(stats_container, dict):
-                    stats_container = {}
-                    signal["stats"] = stats_container
-                if current_price is not None:
-                    stats_container["current_price"] = current_price
-                if volume_last is not None:
-                    stats_container["volume"] = volume_last
-                if last_ts_val is not None:
-                    stats_container["timestamp"] = last_ts_val
-
-                normalized = normalize_result_types(signal)
-                norm_stats = normalized.get("stats")
-                # Stage1: телеметрія сигналу (ALERT/NORMAL) + причини
-                try:
-                    # За потреби повністю виключаємо low_volatility/low_atr з логів stage1_signal
-                    trig = normalized.get("trigger_reasons")
-                    raw_trig = normalized.get("raw_trigger_reasons")
-                    if bool(STAGE1_EXCLUDE_LOW_VOL_ATR_TRIGGERS):
-
-                        def _flt(val: Any) -> Any:
-                            if isinstance(val, list):
-                                return [
-                                    x
-                                    for x in val
-                                    if isinstance(x, str)
-                                    and x not in ("low_volatility", "low_atr")
-                                ]
-                            return val
-
-                        trig = _flt(trig)
-                        raw_trig = _flt(raw_trig)
-
-                    await log_stage1_event(
-                        event="stage1_signal",
-                        symbol=lower_symbol,
-                        payload={
-                            "signal": str(normalized.get("signal")),
-                            "trigger_reasons": trig,
-                            "raw_trigger_reasons": raw_trig,
-                            "stats": normalized.get("stats"),
-                        },
+                    embed_whale_metrics(
+                        store,
+                        symbol,
+                        normalized,
+                        ensure_default=None,
+                        get_prev_presence=None,
+                        set_prev_presence=None,
                     )
                 except Exception:
-                    logger.debug("[TELEM] %s: stage1_signal log failed", lower_symbol)
-
-                # TRAP: телеметрія оцінки (score + fired)
-                try:
-                    trap_score = None
-                    try:
-                        trap_score = float(
-                            (normalized.get("stats") or {}).get("trap_score")
-                        )
-                    except Exception:
-                        trap_score = None
-                    if isinstance(trap_score, (int, float)):
-                        fired = bool(
-                            trap_score
-                            >= float((STAGE1_TRAP or {}).get("score_gate", 0.67))
-                        )
-                        await log_stage1_event(
-                            event="trap_eval",
-                            symbol=lower_symbol,
-                            payload={
-                                "score": float(trap_score),
-                                "fired": fired,
-                                "reasons": normalized.get("trigger_reasons"),
-                            },
-                        )
-                except Exception:
-                    logger.debug("[TELEM] %s: trap_eval log failed", lower_symbol)
-                if not isinstance(norm_stats, dict):
-                    normalized["stats"] = stats_container
-                else:
-                    for k, v in stats_container.items():
-                        norm_stats.setdefault(k, v)
+                    pass
 
                 # Whale embed: Redis → локальний фолбек
                 whale_embedded: dict[str, Any] | None = None
+                redis_payload: dict[str, Any] | None = None
+                payload_missing = False
+                now_ts = time.time()
+
                 try:
                     if STAGE2_WHALE_EMBED_ENABLED:
                         logger.debug(
                             "[STRICT_WHALE] %s: спроба отримати whale-метрики з Redis...",
                             lower_symbol,
                         )
-                        w = None
                         jget = getattr(store.redis, "jget", None)
+                        ns_cfg = getattr(
+                            getattr(store, "cfg", None), "namespace", "ai_one"
+                        )
+                        sym_for_keys = normalize_symbol(symbol)
+                        payload = None
                         if callable(jget):
-                            sym_for_keys = str(symbol).upper()
-                            w = await jget("whale", sym_for_keys, "1m", default=None)
-                        if not isinstance(w, dict):
-                            logger.info(
-                                "[STRICT_WHALE] %s: whale-метрики не знайдено в Redis, очікуємо оновлення від воркера",
-                                lower_symbol,
+                            payload = await jget(
+                                "whale", sym_for_keys, "1m", default=None
                             )
-                            w = {}
-                        else:
+                        if isinstance(payload, dict):
+                            redis_payload = payload
                             try:
                                 ts_dbg = (
-                                    int(w.get("ts"))
-                                    if isinstance(w.get("ts"), (int, float))
+                                    int(payload.get("ts"))
+                                    if isinstance(payload.get("ts"), (int, float))
                                     else None
                                 )
                             except Exception:
                                 ts_dbg = None
-                            # Легка інформативна мітка, що хітнули Redis і маємо валідний словник
                             if ts_dbg is not None:
-                                now_ms_dbg = int(time.time() * 1000)
-                                age_dbg = int(now_ms_dbg - ts_dbg)
+                                now_ms_dbg = int(now_ts * 1000)
+                                age_dbg = max(0, int(now_ms_dbg - ts_dbg))
                                 logger.info(
                                     "[STRICT_WHALE] %s: whale-метрики отримано (age_ms=%s)",
                                     lower_symbol,
                                     age_dbg,
                                 )
-
-                        ts_ms = (
-                            w.get("ts")
-                            if isinstance(w.get("ts"), (int, float))
-                            else None
-                        )
-                        now_ms = int(time.time() * 1000)
-                        age_ms = int(now_ms - int(ts_ms)) if ts_ms is not None else None
-                        stale = bool(age_ms is None or age_ms > 7000)
-                        explain = (
-                            w.get("explain")
-                            if isinstance(w.get("explain"), dict)
-                            else {}
-                        )
-                        zones = (
-                            w.get("zones") if isinstance(w.get("zones"), dict) else {}
-                        )
-                        accum_raw = (
-                            zones.get("accum") if isinstance(zones, dict) else None
-                        )
-                        dist_raw = (
-                            zones.get("dist") if isinstance(zones, dict) else None
-                        )
-                        presence = w.get("presence_score")
-                        bias = w.get("bias")
-                        vdev = w.get("vwap_deviation")
-
-                        try:
-                            atr_val = float(normalized["stats"].get("atr"))
-                        except Exception:
-                            atr_val = None
-                        try:
-                            cp_val2 = float(normalized["stats"].get("current_price"))
-                        except Exception:
-                            cp_val2 = None
-                        atr_pct_local = (
-                            (atr_val / cp_val2 * 100.0)
-                            if atr_val and cp_val2 and cp_val2 > 0
-                            else None
-                        )
-                        if isinstance(atr_pct_local, (int, float)):
-                            if atr_pct_local >= 3.5:
-                                vol_regime = "hyper"
-                            elif atr_pct_local >= 2.0:
-                                vol_regime = "high"
-                            else:
-                                vol_regime = "normal"
                         else:
-                            vol_regime = "unknown"
-
-                            whale_embedded = {
-                                "version": "v2",
-                                "ts": ts_ms,
-                                "age_ms": age_ms,
-                                "stale": stale,
-                                "presence": presence,
-                                "bias": bias,
-                                "vwap_dev": vdev,
-                                "dev_level": (
-                                    explain.get("dev_level")
-                                    if isinstance(explain, dict)
-                                    else None
-                                ),
-                                "zones_summary": {
-                                    "accum_cnt": (
-                                        int(accum_raw)
-                                        if isinstance(accum_raw, (int, float))
-                                        else 0
-                                    ),
-                                    "dist_cnt": (
-                                        int(dist_raw)
-                                        if isinstance(dist_raw, (int, float))
-                                        else 0
-                                    ),
-                                },
-                                "vol_regime": vol_regime,
-                            }
-                            # Домінація: віддаємо перевагу значенню з WhaleWorker; локальний фолбек — якщо немає
-                            try:
-                                dom_in = (
-                                    w.get("dominance") if isinstance(w, dict) else None
-                                )
-                                if (
-                                    isinstance(dom_in, dict)
-                                    and isinstance(dom_in.get("buy"), bool)
-                                    and isinstance(dom_in.get("sell"), bool)
-                                ):
-                                    whale_embedded["dominance"] = {
-                                        "buy": bool(dom_in.get("buy")),
-                                        "sell": bool(dom_in.get("sell")),
-                                    }
-                                else:
-                                    profile_cfg = STAGE2_SIGNAL_V2_PROFILES.get(
-                                        STAGE2_PROFILE
-                                    ) or STAGE2_SIGNAL_V2_PROFILES.get("strict", {})
-                                    dom_cfg = (profile_cfg or {}).get("dominance", {})
-                                    slope_atr_val = 0.0
-                                    try:
-                                        slope_atr_val = float(
-                                            (normalized.get("stats") or {}).get(
-                                                K_PRICE_SLOPE_ATR
-                                            )
-                                            or 0.0
-                                        )
-                                    except Exception:
-                                        slope_atr_val = 0.0
-                                    vdev_abs_min = float(
-                                        dom_cfg.get("vdev_abs_min", 0.01)
-                                    )
-                                    slope_abs_min = float(
-                                        dom_cfg.get("slope_atr_abs_min", 0.5)
-                                    )
-                                    z_accum_min = int(dom_cfg.get("zones_accum_min", 3))
-                                    z_dist_min = int(dom_cfg.get("zones_dist_min", 3))
-                                    dom_buy = bool(
-                                        isinstance(vdev, (int, float))
-                                        and vdev is not None
-                                        and float(vdev) >= vdev_abs_min
-                                        and abs(slope_atr_val) >= slope_abs_min
-                                        and int(zones.get("accum") or 0) >= z_accum_min
-                                    )
-                                    dom_sell = bool(
-                                        isinstance(vdev, (int, float))
-                                        and vdev is not None
-                                        and (-float(vdev)) >= vdev_abs_min
-                                        and abs(slope_atr_val) >= slope_abs_min
-                                        and int(zones.get("dist") or 0) >= z_dist_min
-                                    )
-                                    whale_embedded["dominance"] = {
-                                        "buy": dom_buy,
-                                        "sell": dom_sell,
-                                    }
-                            except Exception:
-                                # best-effort, пропускаємо у разі проблем
-                                pass
-                            normalized.setdefault("stats", {})["whale"] = whale_embedded
-                            accum_cnt = int(
-                                (whale_embedded.get("zones_summary") or {}).get(
-                                    "accum_cnt", 0
-                                )
-                            )
-                            dist_cnt = int(
-                                (whale_embedded.get("zones_summary") or {}).get(
-                                    "dist_cnt", 0
-                                )
-                            )
-                            accum_payload = update_accum_monitor(
-                                lower_symbol,
-                                accum_cnt=accum_cnt,
-                                dist_cnt=dist_cnt,
-                            )
-                            stats_post = normalized.setdefault("stats", {}).setdefault(
-                                "postprocessors", {}
-                            )
-                            stats_post["accum_monitor"] = accum_payload
-                            mc_meta = normalized.setdefault(
-                                "market_context", {}
-                            ).setdefault("meta", {})
-                            meta_post = mc_meta.setdefault("postprocessors", {})
-                            meta_post["accum_monitor"] = accum_payload
-                            if whale_embedded.get("stale"):
-                                tags = (
-                                    normalized["stats"].get("tags")
-                                    if isinstance(normalized["stats"].get("tags"), list)
-                                    else []
-                                )
-                                if "whale_stale" not in tags:
-                                    tags.append("whale_stale")
-                                normalized["stats"]["tags"] = tags
-                            logger.debug(
-                                "[STRICT_WHALE] %s: whale-метрики %s",
-                                lower_symbol,
-                                whale_embedded,
+                            payload_missing = True
+                            logger.warning(
+                                "[WHALE_DIAG] no_whale_payload symbol=%s key=%s:whale:%s:1m",
+                                str(symbol).upper(),
+                                str(ns_cfg or "ai_one"),
+                                sym_for_keys,
                             )
                 except Exception as exc:
                     logger.error(
                         "[STRICT_WHALE] %s: помилка whale-метрик: %s", lower_symbol, exc
                     )
-                    whale_embedded = None
+                    redis_payload = None
 
-                # Гарантуємо дефолтні whale‑метрики (presence=0.0, stale=True)
                 try:
-                    ensure_whale_default(normalized.setdefault("stats", {}))
-                except Exception:
-                    pass
+                    snap = ensure_whale_snapshot(
+                        redis_payload, now_ts, ttl_s=int(_SNAPSHOT_TTL_S)
+                    )
+                    if not _MISSING_STALE_MODEL_ENABLED:
+                        snap["missing"] = False
 
-                # Якщо телеметрія позначена як stale і presence відсутній,
-                # мʼяко переносимо попереднє значення з state (під фіче‑флагом).
-                try:
-                    from config import config as _cfg
-
-                    if bool(
-                        getattr(
-                            _cfg,
-                            "WHALE_PRESENCE_STALE_CARRY_FORWARD_ENABLED",
-                            True,
+                    if STAGE1_WHALE_MISSING_META_ENABLED:
+                        meta_ctx = normalized.setdefault(
+                            "market_context", {}
+                        ).setdefault("meta", {})
+                        meta_ctx["whale_status"] = (
+                            "missing"
+                            if snap.get("missing")
+                            else ("stale" if snap.get("stale") else "fresh")
                         )
+
+                    ts_candidate = snap.get("ts_s", snap.get("ts"))
+                    try:
+                        ts_seconds = float(ts_candidate)
+                    except (TypeError, ValueError):
+                        ts_seconds = 0.0
+                    if ts_seconds > 1e11:
+                        ts_seconds /= 1000.0
+                    ts_seconds = max(0.0, ts_seconds)
+                    age_s = max(0.0, now_ts - ts_seconds)
+                    age_ms = int(age_s * 1000.0)
+                    if isinstance(redis_payload, dict) and isinstance(
+                        redis_payload.get("ts"), (int, float)
                     ):
-                        we = (normalized.get("stats") or {}).get("whale")
-                        if isinstance(we, dict) and bool(we.get("stale")):
-                            pres_val = we.get("presence")
-                            if not isinstance(pres_val, (int, float)):
-                                prev_entry = state_manager.state.get(lower_symbol, {})
-                                prev_pres: float | None = None
-                                try:
-                                    prev_pres = float(
-                                        (prev_entry.get("stats") or {})
-                                        .get("whale", {})
-                                        .get("presence")
-                                    )
-                                except Exception:
-                                    prev_pres = None
-                                if (
-                                    isinstance(prev_pres, (int, float))
-                                    and prev_pres > 0.0
-                                ):
-                                    we["presence"] = prev_pres
-                                    try:
-                                        logger.debug(
-                                            "[STRICT_WHALE] %s carry-forward presence=%.3f",
-                                            lower_symbol,
-                                            prev_pres,
-                                        )
-                                    except Exception:
-                                        pass
-                except Exception:
-                    pass
+                        ts_raw_val = float(redis_payload["ts"])
+                        ts_ms = int(
+                            ts_raw_val if ts_raw_val >= 1e6 else ts_raw_val * 1000.0
+                        )
+                    else:
+                        ts_ms = int(ts_seconds * 1000.0) if ts_seconds > 0 else None
+
+                    _maybe_warn_whale_presence_zero(
+                        lower_symbol,
+                        snap.get("presence"),
+                        bool(snap.get("stale")),
+                        age_ms,
+                    )
+
+                    explain = (
+                        redis_payload.get("explain")
+                        if isinstance(redis_payload, dict)
+                        else None
+                    )
+                    zones = (
+                        redis_payload.get("zones")
+                        if isinstance(redis_payload, dict)
+                        else None
+                    )
+
+                    zones_summary = {"accum_cnt": 0, "dist_cnt": 0}
+                    if isinstance(zones, dict):
+                        accum_raw = zones.get("accum")
+                        dist_raw = zones.get("dist")
+                        zones_summary["accum_cnt"] = (
+                            int(accum_raw) if isinstance(accum_raw, (int, float)) else 0
+                        )
+                        zones_summary["dist_cnt"] = (
+                            int(dist_raw) if isinstance(dist_raw, (int, float)) else 0
+                        )
+                    else:
+                        prev_zones = (
+                            snap.get("zones_summary")
+                            if isinstance(snap, dict)
+                            else None
+                        )
+                        if isinstance(prev_zones, dict):
+                            zones_summary["accum_cnt"] = int(
+                                prev_zones.get("accum_cnt", 0)
+                            )
+                            zones_summary["dist_cnt"] = int(
+                                prev_zones.get("dist_cnt", 0)
+                            )
+
+                    if isinstance(explain, dict):
+                        dev_level = explain.get("dev_level")
+                    else:
+                        dev_level = snap.get("dev_level")
+
+                    try:
+                        atr_val = float(normalized["stats"].get("atr"))
+                    except Exception:
+                        atr_val = None
+                    try:
+                        cp_val2 = float(normalized["stats"].get("current_price"))
+                    except Exception:
+                        cp_val2 = None
+                    atr_pct_local = (
+                        (atr_val / cp_val2 * 100.0)
+                        if atr_val and cp_val2 and cp_val2 > 0
+                        else None
+                    )
+                    if isinstance(atr_pct_local, (int, float)):
+                        if atr_pct_local >= 3.5:
+                            vol_regime = "hyper"
+                        elif atr_pct_local >= 2.0:
+                            vol_regime = "high"
+                        else:
+                            vol_regime = "normal"
+                    else:
+                        vol_regime = "unknown"
+
+                    try:
+                        presence_f = float(snap.get("presence"))
+                    except (TypeError, ValueError):
+                        presence_f = 0.0
+                    try:
+                        bias_f = float(snap.get("bias"))
+                    except (TypeError, ValueError):
+                        bias_f = 0.0
+                    try:
+                        vdev_f = float(snap.get("vwap_dev"))
+                    except (TypeError, ValueError):
+                        vdev_f = 0.0
+                    presence_f = max(0.0, min(1.0, presence_f))
+                    bias_f = max(-1.0, min(1.0, bias_f))
+
+                    dominance_payload = (
+                        redis_payload.get("dominance")
+                        if isinstance(redis_payload, dict)
+                        else snap.get("dominance")
+                    )
+                    dominance: dict[str, bool] | None
+                    if (
+                        isinstance(dominance_payload, dict)
+                        and isinstance(dominance_payload.get("buy"), bool)
+                        and isinstance(dominance_payload.get("sell"), bool)
+                    ):
+                        dominance = {
+                            "buy": bool(dominance_payload.get("buy")),
+                            "sell": bool(dominance_payload.get("sell")),
+                        }
+                    else:
+                        profile_cfg = STAGE2_SIGNAL_V2_PROFILES.get(
+                            STAGE2_PROFILE
+                        ) or STAGE2_SIGNAL_V2_PROFILES.get("strict", {})
+                        dom_cfg = (profile_cfg or {}).get("dominance", {})
+                        try:
+                            slope_atr_val = float(
+                                (normalized.get("stats") or {}).get(K_PRICE_SLOPE_ATR)
+                                or 0.0
+                            )
+                        except Exception:
+                            slope_atr_val = 0.0
+                        vdev_abs_min = float(dom_cfg.get("vdev_abs_min", 0.01))
+                        slope_abs_min = float(dom_cfg.get("slope_atr_abs_min", 0.5))
+                        z_accum_min = int(dom_cfg.get("zones_accum_min", 3))
+                        z_dist_min = int(dom_cfg.get("zones_dist_min", 3))
+                        dom_buy = bool(
+                            vdev_f >= vdev_abs_min
+                            and abs(slope_atr_val) >= slope_abs_min
+                            and zones_summary["accum_cnt"] >= z_accum_min
+                        )
+                        dom_sell = bool(
+                            (-vdev_f) >= vdev_abs_min
+                            and abs(slope_atr_val) >= slope_abs_min
+                            and zones_summary["dist_cnt"] >= z_dist_min
+                        )
+                        dominance = {"buy": dom_buy, "sell": dom_sell}
+
+                    whale_embedded = {
+                        "version": str(snap.get("version", "v2")),
+                        "ts": ts_ms,
+                        "ts_s": ts_seconds,
+                        "age_ms": age_ms,
+                        "age_s": age_s,
+                        "presence": presence_f,
+                        "bias": bias_f,
+                        "vwap_dev": vdev_f,
+                        "missing": bool(snap.get("missing", False)),
+                        "stale": bool(snap.get("stale", False)),
+                        "dev_level": dev_level,
+                        "zones_summary": zones_summary,
+                        "vol_regime": vol_regime,
+                    }
+                    if dominance is not None:
+                        whale_embedded["dominance"] = dominance
+
+                    stats_map = normalized.setdefault("stats", {})
+                    stats_map["whale"] = whale_embedded
+
+                    accum_payload = update_accum_monitor(
+                        lower_symbol,
+                        accum_cnt=zones_summary["accum_cnt"],
+                        dist_cnt=zones_summary["dist_cnt"],
+                    )
+                    stats_post = stats_map.setdefault("postprocessors", {})
+                    stats_post["accum_monitor"] = accum_payload
+                    mc_meta = normalized.setdefault("market_context", {}).setdefault(
+                        "meta", {}
+                    )
+                    meta_post = mc_meta.setdefault("postprocessors", {})
+                    meta_post["accum_monitor"] = accum_payload
+
+                    tags = (
+                        stats_map.get("tags")
+                        if isinstance(stats_map.get("tags"), list)
+                        else []
+                    )
+                    if whale_embedded.get("stale") and "whale_stale" not in tags:
+                        tags.append("whale_stale")
+                    if whale_embedded.get("missing") and "whale_missing" not in tags:
+                        tags.append("whale_missing")
+                    if tags:
+                        stats_map["tags"] = tags
+
+                    logger.debug(
+                        "[STRICT_WHALE] %s: whale_snapshot miss=%s payload=%s",
+                        lower_symbol,
+                        payload_missing,
+                        whale_embedded,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[STRICT_WHALE] %s: помилка whale-метрик: %s", lower_symbol, exc
+                    )
+                    whale_embedded = None
+                    stats_map = normalized.setdefault("stats", {})
+                    stats_map["whale"] = {
+                        "version": "v2",
+                        "ts": None,
+                        "ts_s": 0.0,
+                        "age_ms": 0,
+                        "age_s": 0.0,
+                        "presence": 0.0,
+                        "bias": 0.0,
+                        "vwap_dev": 0.0,
+                        "missing": True,
+                        "stale": True,
+                        "zones_summary": {"accum_cnt": 0, "dist_cnt": 0},
+                        "vol_regime": "unknown",
+                    }
                 # Stage2-lite hints
                 try:
                     if STAGE2_HINT_ENABLED and isinstance(whale_embedded, dict):
@@ -835,6 +864,8 @@ class ProcessAssetBatchv1:
                                 )
                             except Exception:
                                 _prof_enabled = False
+
+                            _htf_on = False
 
                             profile_name = None
                             profile_conf = None
@@ -3054,35 +3085,22 @@ class ProcessAssetBatchv1:
                                     mc_meta["evidence"] = ev_list
                                 if ev_explain:
                                     mc_meta["scenario_explain"] = ev_explain
-                                # Рейт-лімітований explain-лог (≤1/10с/символ) + кожен N‑й батч
+                                # Рейт-лімітований explain-лог (централізовано через telemetry.explain_should_log)
                                 try:
                                     if SCEN_EXPLAIN_ENABLED:
                                         now_ts = time.time()
-                                        # оновлюємо лічильник батчів для символу
-                                        bidx = (
-                                            int(
-                                                _SCEN_EXPLAIN_BATCH_COUNTER.get(
-                                                    lower_symbol, 0
-                                                )
-                                                or 0
-                                            )
-                                            + 1
-                                        )
-                                        _SCEN_EXPLAIN_BATCH_COUNTER[lower_symbol] = bidx
                                         should_log = explain_should_log(
-                                            lower_symbol, now_ts, 10.0
-                                        ) or (
-                                            SCEN_EXPLAIN_VERBOSE_EVERY_N > 0
-                                            and (
-                                                bidx % int(SCEN_EXPLAIN_VERBOSE_EVERY_N)
-                                                == 0
-                                            )
+                                            lower_symbol,
+                                            now_ts,
+                                            min_period_s=10.0,
+                                            every_n=(
+                                                int(SCEN_EXPLAIN_VERBOSE_EVERY_N)
+                                                if int(SCEN_EXPLAIN_VERBOSE_EVERY_N) > 0
+                                                else 20
+                                            ),
+                                            force_all=bool(_SCEN_EXPLAIN_FORCE_ALL),
                                         )
-                                        # Додатковий форс‑вивід, якщо змінна оточення увімкнена
-                                        if _SCEN_EXPLAIN_FORCE_ALL:
-                                            should_log = True
                                         if should_log:
-                                            _SCEN_EXPLAIN_LAST_TS[lower_symbol] = now_ts
                                             scen_tag = str(
                                                 mc_meta.get("scenario_detected")
                                                 or "none"

@@ -54,26 +54,25 @@ if not _logger.handlers:  # захист від повторної ініціа�
 
 
 # ── Базові хелпери ───────────────────────────────────────────────────────────
-def safe_float(value: Any) -> float | None:
-    """Безпечно перетворює значення у float.
-
-    Повертає None, якщо значення не можна конвертувати або воно не є скінченним числом.
+def safe_float(value: Any, default: float | None = None) -> float | None:
+    """Безпечно перетворює значення у float із фолбеком.
 
     Args:
         value: Будь-який об'єкт.
+        default: Значення, що повертається при неможливості конвертації.
 
     Returns:
-        Optional[float]: Коректний float або None.
+        Optional[float]: Коректний float або `default`.
     """
     try:
         # Допомагаємо рядкам з комою як десятковим роздільником
         if isinstance(value, str):
             value = value.strip().replace(",", ".")
         f = float(value)
-        return f if math.isfinite(f) else None
+        return f if math.isfinite(f) else default
     except (TypeError, ValueError):
         _logger.debug("safe_float: не вдалося привести %r до float", value)
-        return None
+        return default
 
 
 def first_not_none(seq: Sequence[Any | None] | None) -> Any | None:

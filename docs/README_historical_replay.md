@@ -64,15 +64,16 @@ Compact JSONL (`telemetry/replay_insights_*.jsonl`) для швидкого ог
 
 ## Forward profiles (офлайн)
 
-Інструмент `tools.forward_from_log` будує «forward» оцінки за три профілі сигналів: `strong`, `soft`, `explain`.
+Інструмент `tools.forward_from_log` будує «forward» оцінки за профілями сигналів: `strong`, `soft`, `explain`, а також офлайн `hint`.
 
 - `source=whale` — бере останній `[STRICT_WHALE]` для символу поблизу часу активації сценарію і фільтрує за порогами `presence_min` та `|bias|>=bias_abs_min`. Додатково перевіряється «свіжість» китового запису за `whale_max_age_sec`.
 - `source=explain` — бере останній `[SCEN_EXPLAIN]` (explain‑payload) для символу та фільтрує за тими ж порогами, але з перевіркою `explain_ttl_sec` (макс. вік explain‑рядка).
+- `source=hint` — парсить рядки `stage2_hint` або `[STAGE2_HINT]` у `run.log`, витягує напрям (`dir=long|short`) та `score=<float>`. Фільтр: `score>=score_min` (дефолт 0.55; якщо увімкнено м'які пороги і `score_min` не задано, встановлюється 0.45). `presence/bias` і TTL не застосовуються. Корисно для офлайн fallback, коли `strong/soft/explain` дали `N=0`.
 
 Дедуплікація: ключ `SYMBOL|ts_ms|(+|-)` (знак за `bias`). Ідентичні події в одному й тому ж барі вважаються дублями; «близнюки» з `ts±1` не зливаються.
 
 Порогові значення:
-- Жорсткі дефолти: `presence_min=0.75`, `bias_abs_min=0.60`, `whale_max_age_sec=600`, `explain_ttl_sec=600`.
+- Жорсткі дефолти: `presence_min=0.75`, `bias_abs_min=0.60`, `whale_max_age_sec=600`, `explain_ttl_sec=600`, `score_min=0.55` (hint).
 - Фіче‑флаг м'яких порогів (офлайн‑only): `FORWARD_SOFT_THRESH_ENABLED=True` разом із профілем `FORWARD_SOFT_THRESH` застосує м'які значення для `whale`/`explain`, якщо CLI не передав явних параметрів. У футері додається `note=soft_thresholds`.
 
 Великі логи: опція `--max-lines N` дозволяє ранньо зупинити парсинг надвеликих логів; у футері буде `note=early_stop`.
@@ -80,4 +81,23 @@ Compact JSONL (`telemetry/replay_insights_*.jsonl`) для швидкого ог
 У підсумку `forward_*.md` містить:
 - Шапку з параметрами фільтра, кількістю побачених/зіставлених подій.
 - Строки `K=<bars>` із часткою «згоди знаку» на горизонтах.
-- Футер із вікном часу, `N_total`, медіанами TTF (`ttf05_median`/`ttf10_median`) і явними `ttf_thresholds`.
+- Футер із вікном часу, `N_total`, медіанами TTF (`ttf05_median`/`ttf10_median`) і явними `ttf_thresholds`. Для `hint` у футері додається `score_min`.
+
+### Hint fallback у `unified_runner postprocess`
+
+Якщо під час офлайн `postprocess` (команда `python -m tools.unified_runner postprocess --in-dir ...`) усі три профілі `forward_strong.md`, `forward_soft.md`, `forward_explain.md` мають `N=0`, автоматично генерується `forward_hint.md` з параметрами:
+
+```
+--source hint --score-min 0.55 --dir-field dir
+```
+
+Це дозволяє отримати хоч якусь forward статистику з «підказкових» (hint) рядків без потреби повторного живого прогона. У summary буде показано профіль `hint` (N, win_rate, median_ttf_*) та його `score_min` у таблиці параметрів.
+
+### Offline KPI без /metrics
+
+Якщо Prometheus `/metrics` недоступний (відсутній `metrics.txt`), `unified_runner` будує секцію `Offline KPI` на основі `run.log`, парсячи `latency_ms=` та `profile_switch` рядки:
+- p95 / mean latency з сирих точок `latency_ms=`.
+- `switch_rate` за кількістю згадок перемикань профілю на інтервалі часу між мін/макс timestamp.
+- ExpCov як і раніше береться з `quality.csv`.
+
+Це забезпечує базові KPI для GO/NOGO оцінки навіть без метрик.

@@ -29,11 +29,23 @@ from config.config import (
 from stage2.phase_detector import detect_phase as _detect_phase
 from utils.utils import safe_float, safe_number
 
+try:
+    from config import config as _cfg  # type: ignore
+except Exception:  # pragma: no cover - fallback на дефолтні значення
+    _cfg = None
+
 logger = logging.getLogger("phase_adapter")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
+
+
+def _cfg_value(name: str, default: Any) -> Any:
+    try:
+        return getattr(_cfg, name)
+    except Exception:
+        return default
 
 
 def build_phase_context_from_stats(
@@ -453,9 +465,7 @@ def resolve_scenario(
             min_htf = 0.20
         # Оверрайд порогу через config: SCEN_HTF_MIN
         try:
-            from config.config import SCEN_HTF_MIN as _SCEN_HTF_MIN  # якщо є у config
-
-            min_htf = float(_SCEN_HTF_MIN)
+            min_htf = float(_cfg_value("SCEN_HTF_MIN", min_htf))
         except Exception:
             pass
         from config.config import PROMOTE_REQ  # lazy import to avoid cycles
@@ -466,17 +476,13 @@ def resolve_scenario(
             pres_min = 0.60
         # Оверрайд через config: SCEN_PULLBACK_PRESENCE_MIN
         try:
-            from config.config import SCEN_PULLBACK_PRESENCE_MIN as _PRES_MIN
-
-            pres_min = float(_PRES_MIN)
+            pres_min = float(_cfg_value("SCEN_PULLBACK_PRESENCE_MIN", pres_min))
         except Exception:
             pass
         require_bias = bool(PROMOTE_REQ.get("require_bias", True))  # type: ignore[arg-type]
         # Овертайд через config: SCEN_REQUIRE_BIAS
         try:
-            from config.config import SCEN_REQUIRE_BIAS as _REQ_BIAS
-
-            require_bias = bool(_REQ_BIAS)
+            require_bias = bool(_cfg_value("SCEN_REQUIRE_BIAS", require_bias))
         except Exception:
             pass
 
@@ -490,9 +496,7 @@ def resolve_scenario(
             cond_volz = (volz is not None) and (volz <= 1.0)
             # Оверрайд порогу DVR через config: SCEN_BREAKOUT_DVR_MIN
             try:
-                from config.config import SCEN_BREAKOUT_DVR_MIN as _DVR_MIN
-
-                _dvr_min = float(_DVR_MIN)
+                _dvr_min = float(_cfg_value("SCEN_BREAKOUT_DVR_MIN", 0.5))
             except Exception:
                 _dvr_min = 0.5
             cond_dvr = (dvr is None) or (dvr >= _dvr_min)
@@ -515,9 +519,9 @@ def resolve_scenario(
                 # htf_stale знижує на 0.10, але не скасовує
                 try:
                     stale_ms = safe_float(st.get("htf_stale_ms"))
-                    from config.config import STAGE1_HTF_STALE_MS as _DEF_STALE
-
-                    stale_lim = safe_float(st.get("htf_stale_limit_ms")) or _DEF_STALE
+                    stale_lim = safe_float(st.get("htf_stale_limit_ms")) or _cfg_value(
+                        "STAGE1_HTF_STALE_MS", STAGE1_HTF_STALE_MS
+                    )
                     if (
                         stale_ms is not None
                         and stale_lim is not None
@@ -534,9 +538,7 @@ def resolve_scenario(
         if phase_name == "momentum":
             # Дозволити відсутній presence як True (керується через config)
             try:
-                from config.config import SCEN_PULLBACK_ALLOW_NA as _ALLOW_NA
-
-                _allow_na_pres = bool(_ALLOW_NA)
+                _allow_na_pres = bool(_cfg_value("SCEN_PULLBACK_ALLOW_NA", False))
             except Exception:
                 _allow_na_pres = False
             cond_pres = (presence is None and _allow_na_pres) or (
@@ -564,9 +566,7 @@ def resolve_scenario(
     # Діагностичний relaxed-режим: дозволити м'якші сценарії навіть без точної фази
     # УВАГА: лише для коротких канарейкових перевірок, вимикайте після тестів.
     try:
-        from config.config import TEST_SCENARIO_SELECTOR_RELAXED as _RELAX
-
-        _relaxed = bool(_RELAX)
+        _relaxed = bool(_cfg_value("TEST_SCENARIO_SELECTOR_RELAXED", False))
     except Exception:
         _relaxed = False
     if _relaxed:
@@ -578,9 +578,7 @@ def resolve_scenario(
                 min_htf = 0.20
             # Оверрайд через config: SCEN_HTF_MIN
             try:
-                from config.config import SCEN_HTF_MIN as _SCEN_HTF_MIN
-
-                min_htf = float(_SCEN_HTF_MIN)
+                min_htf = float(_cfg_value("SCEN_HTF_MIN", min_htf))
             except Exception:
                 pass
             from config.config import PROMOTE_REQ  # lazy import
@@ -591,9 +589,7 @@ def resolve_scenario(
                 pres_min = 0.60
             # Оверрайд через config: SCEN_PULLBACK_PRESENCE_MIN
             try:
-                from config.config import SCEN_PULLBACK_PRESENCE_MIN as _PRES_MIN
-
-                pres_min = float(_PRES_MIN)
+                pres_min = float(_cfg_value("SCEN_PULLBACK_PRESENCE_MIN", pres_min))
             except Exception:
                 pass
             presence = safe_float(
@@ -628,16 +624,12 @@ def resolve_scenario(
                 else None
             )
             try:
-                from config.config import SCEN_BREAKOUT_DVR_MIN as _DVR_MIN
-
-                _dvr_min = float(_DVR_MIN)
+                _dvr_min = float(_cfg_value("SCEN_BREAKOUT_DVR_MIN", 0.5))
             except Exception:
                 _dvr_min = 0.5
             # Relaxed pullback: допускаємо phase None | momentum при достатніх htf/presence
             try:
-                from config.config import SCEN_PULLBACK_ALLOW_NA as _ALLOW_NA
-
-                allow_na_pres = bool(_ALLOW_NA)
+                allow_na_pres = bool(_cfg_value("SCEN_PULLBACK_ALLOW_NA", False))
             except Exception:
                 allow_na_pres = False
             has_pres = (presence is not None and presence >= pres_min) or (

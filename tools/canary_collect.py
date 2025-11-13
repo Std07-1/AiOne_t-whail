@@ -32,6 +32,11 @@ try:
 except Exception:  # pragma: no cover
     Redis = None  # type: ignore
 
+try:
+    from config import config as _cfg  # type: ignore
+except Exception:  # pragma: no cover - дефолт при збоях
+    _cfg = None
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO_ROOT  # write into repo root for easy discovery
@@ -50,6 +55,13 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
     except Exception:
         return float(default)
+
+
+def _cfg_value(name: str, default: float | bool) -> float | bool:
+    try:
+        return getattr(_cfg, name)
+    except Exception:
+        return default
 
 
 async def _redis_hgetall(r: Any, key: str) -> dict[str, Any]:
@@ -169,21 +181,15 @@ def summarize_trace() -> dict[str, float]:
 
     # thresholds (current from config)
     try:
-        from config.config import SCEN_HTF_MIN as _SCEN_HTF_MIN
-
-        htf_min = float(_SCEN_HTF_MIN)
+        htf_min = float(_cfg_value("SCEN_HTF_MIN", 0.20))
     except Exception:
         htf_min = 0.20
     try:
-        from config.config import SCEN_PULLBACK_PRESENCE_MIN as _PRES_MIN
-
-        pres_min = float(_PRES_MIN)
+        pres_min = float(_cfg_value("SCEN_PULLBACK_PRESENCE_MIN", 0.60))
     except Exception:
         pres_min = 0.60
     try:
-        from config.config import SCEN_BREAKOUT_DVR_MIN as _DVR_MIN
-
-        dvr_min = float(_DVR_MIN)
+        dvr_min = float(_cfg_value("SCEN_BREAKOUT_DVR_MIN", 0.50))
     except Exception:
         dvr_min = 0.50
 

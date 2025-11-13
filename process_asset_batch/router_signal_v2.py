@@ -14,6 +14,13 @@ from config.constants import (
 )
 from config.flags import ROUTER_ALERT_REQUIRE_DOMINANCE
 
+try:  # noqa: SIM105 - best-effort імпорт
+    from telemetry.prom_gauges import (  # type: ignore
+        inc_whale_no_payload as _inc_whale_no_payload,
+    )
+except Exception:  # pragma: no cover - телеметрія може бути вимкнена
+    _inc_whale_no_payload = None  # type: ignore[assignment]
+
 logger = logging.getLogger("router_signal_v2")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
@@ -36,7 +43,16 @@ def router_signal_v2(
     """
     st = stats
     wh = st.get("whale") or {}
-    presence = float(wh.get("presence") or 0.0)
+    presence_raw = wh.get("presence")
+    presence: float | None
+    if isinstance(presence_raw, (int, float)):
+        try:
+            presence = float(presence_raw)
+        except Exception:
+            presence = None
+    else:
+        presence = None
+    missing = bool(wh.get("missing"))
     bias = float(wh.get("bias") or 0.0)
     vdev = float(wh.get("vwap_dev") or 0.0)
     zones = wh.get("zones_summary") or {}
@@ -54,11 +70,12 @@ def router_signal_v2(
     # Логування вхідних значень
     symbol = st.get("symbol") or st.get("market") or "-"
     ts = st.get("ts") or "-"
+    pres_log = presence if presence is not None else float("nan")
     logger.info(
         "[STRICT_WHALE] %s %s вхідні дані router_signal_v2 presence=%.3f bias=%.3f vdev=%.4f band=%.4f near=%s rsi=%.1f slope=%.3f dvr=%.3f cd=%.3f",
         symbol,
         ts,
-        presence,
+        pres_log,
         bias,
         vdev,
         band,
@@ -69,17 +86,39 @@ def router_signal_v2(
         cd,
     )
 
-    fresh_default = "AVOID"
-    stale_default = "OBSERVE"
-    sig, conf = (stale_default, 0.0) if stale else (fresh_default, 0.0)
+    sig = "AVOID"
+    conf = 0.0
     reasons: list[str] = []
+    if missing:
+        sig = "OBSERVE"
+        reasons.append("missing")
+        if callable(_inc_whale_no_payload):
+            try:
+                sym_up = str(symbol).upper()
+                if sym_up and sym_up != "-":
+                    _inc_whale_no_payload(sym_up)
+            except Exception:
+                pass
+    if presence is None and "missing" not in reasons:
+        sig = "OBSERVE"
+        reasons.append("no_whale")
+        if callable(_inc_whale_no_payload):
+            try:
+                sym_up = str(symbol).upper()
+                if sym_up and sym_up != "-":
+                    _inc_whale_no_payload(sym_up)
+            except Exception:
+                pass
+    if stale:
+        sig = "OBSERVE"
+        reasons.append("stale")
 
     # Придатні для логів ворота домінування
     dom = (wh.get("dominance") or {}) if isinstance(wh, dict) else {}
     dom_buy = bool(dom.get("buy"))
     dom_sell = bool(dom.get("sell"))
 
-    if not stale:
+    if sig == "AVOID":
         lg = profile_cfg.get("long", {})
         sh = profile_cfg.get("short", {})
         # Long кандидат
@@ -263,7 +302,7 @@ def router_signal_v2(
         sig,
         conf,
         reasons,
-        presence,
+        pres_log,
         bias,
         dom_buy,
         dom_sell,

@@ -235,10 +235,70 @@ def _parse_metrics_context(text: str, symbol: str) -> dict[str, Any]:
     return out
 
 
+def _parse_min_signal_metrics(text: str) -> dict[str, dict[str, Any]]:
+    """Агрегація Prometheus-метрик мінімального сигналу за символами."""
+
+    if not text:
+        return {}
+
+    stats: dict[str, dict[str, Any]] = {}
+
+    def _bucket(symbol: str) -> dict[str, Any]:
+        key = symbol.upper()
+        bucket = stats.get(key)
+        if bucket is None:
+            bucket = {
+                "candidates": 0,
+                "open": 0,
+                "exit_total": 0,
+                "exit_breakdown": {},
+            }
+            stats[key] = bucket
+        return bucket
+
+    def _to_int(value: str) -> int:
+        try:
+            return int(round(float(value)))
+        except Exception:
+            return 0
+
+    rg_candidate = re.compile(
+        r'^ai_one_min_signal_candidates_total\{[^}]*symbol="([^"}]+)"[^}]*\}\s+([0-9eE+\-.]+)$',
+        re.M,
+    )
+    rg_open = re.compile(
+        r'^ai_one_min_signal_open_total\{[^}]*symbol="([^"}]+)"[^}]*\}\s+([0-9eE+\-.]+)$',
+        re.M,
+    )
+    rg_exit = re.compile(
+        r'^ai_one_min_signal_exit_total\{[^}]*symbol="([^"}]+)"[^}]*reason="([^"}]*)"[^}]*\}\s+([0-9eE+\-.]+)$',
+        re.M,
+    )
+
+    for match in rg_candidate.finditer(text):
+        bucket = _bucket(match.group(1))
+        bucket["candidates"] += _to_int(match.group(2))
+
+    for match in rg_open.finditer(text):
+        bucket = _bucket(match.group(1))
+        bucket["open"] += _to_int(match.group(2))
+
+    for match in rg_exit.finditer(text):
+        bucket = _bucket(match.group(1))
+        value = _to_int(match.group(3))
+        bucket["exit_total"] += value
+        reason = match.group(2) or "unknown"
+        breakdown: dict[str, int] = bucket.setdefault("exit_breakdown", {})  # type: ignore[assignment]
+        breakdown[reason] = int(breakdown.get(reason, 0)) + value
+
+    return stats
+
+
 def _render_md(
     rows: list[dict[str, Any]],
     metrics_note: str,
     contexts: dict[str, dict[str, Any]] | None = None,
+    min_signal_stats: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# Quality Snapshot\n\n")
@@ -309,6 +369,31 @@ def _render_md(
                 parts.append(f"presence_sustain={_fmt_float(cps)}")
             if parts:
                 lines.append(f"- {sym}: " + ", ".join(parts) + "\n")
+    if min_signal_stats:
+        lines.append("\n## Min-signal Paper KPI\n\n")
+        lines.append("Symbol | candidates | open | exits | exit_reasons\n")
+        lines.append("---|---:|---:|---:|---\n")
+        for sym in SYMBOLS:
+            bucket = (
+                min_signal_stats.get(sym, {})
+                if isinstance(min_signal_stats, dict)
+                else {}
+            )
+            candidates = int(float(bucket.get("candidates", 0) or 0))
+            opened = int(float(bucket.get("open", 0) or 0))
+            exits = int(float(bucket.get("exit_total", 0) or 0))
+            breakdown = (
+                bucket.get("exit_breakdown", {}) if isinstance(bucket, dict) else {}
+            )
+            if isinstance(breakdown, dict) and breakdown:
+                items = sorted(
+                    ((str(k), int(v)) for k, v in breakdown.items()),
+                    key=lambda kv: (-kv[1], kv[0]),
+                )
+                reasons = ", ".join(f"{name}:{count}" for name, count in items[:3])
+            else:
+                reasons = "-"
+            lines.append(f"{sym} | {candidates} | {opened} | {exits} | {reasons}\n")
     # Обмежуємося ~<=30 рядками
     return "".join(lines)
 
@@ -457,15 +542,18 @@ def main() -> int:
     latest_metrics = _pick_latest_metrics(metrics_dir)
     metrics_note = _extract_summary_from_metrics(latest_metrics)
     contexts: dict[str, dict[str, Any]] = {}
+    min_signal_stats: dict[str, dict[str, Any]] = {}
     try:
         if latest_metrics and latest_metrics.exists():
             text = latest_metrics.read_text(encoding="utf-8", errors="ignore")
             for s in SYMBOLS:
                 contexts[s] = _parse_metrics_context(text, s)
             # Примітка: вилучено «best‑effort» підстановку ExpCov — відображаємо чесні значення з CSV без проксі
+            min_signal_stats = _parse_min_signal_metrics(text)
     except Exception:
         contexts = {}
-    md = _render_md(rows, metrics_note, contexts)
+        min_signal_stats = {}
+    md = _render_md(rows, metrics_note, contexts, min_signal_stats)
     # Додамо forward‑перевірки (по рішенням і цінах)
     try:
         fwd_lines: list[str] = []

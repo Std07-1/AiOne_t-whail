@@ -110,6 +110,31 @@ class AssetStateManager:
             "last_updated": datetime.utcnow().isoformat(),
         }
 
+    def set(self, symbol: str, payload: dict[str, Any]) -> None:
+        """Повністю замінює стан активу (best-effort захист додає службові поля)."""
+
+        base = dict(payload)
+        base.setdefault(K_SYMBOL, symbol)
+        base.setdefault("last_updated", datetime.utcnow().isoformat())
+        self.state[symbol] = base
+
+    def get(self, symbol: str) -> dict[str, Any] | None:
+        """Повертає стан активу або None."""
+
+        return self.state.get(symbol)
+
+    def set_field(self, symbol: str, key: str, value: Any) -> None:
+        """Оновлює одиночне поле стану через update_asset."""
+
+        self.update_asset(symbol, {key: value})
+
+    def set_last_min_signal_accept(self, symbol: str, meta: dict[str, Any]) -> None:
+        """Фіксує метадані останнього прийнятого мінімального сигналу."""
+
+        if not isinstance(meta, dict):
+            return
+        self.update_asset(symbol, {"last_min_signal_accept": dict(meta)})
+
     def get_all_assets(self) -> list[dict[str, Any]]:
         """Отримати всі активи для відображення в UI"""
         if not self.state:
@@ -138,6 +163,25 @@ class AssetStateManager:
                 continue
             trade_ready.append(asset)
         return trade_ready
+
+    def attach_hint(self, symbol: str, hint: dict[str, Any]) -> None:
+        """Додає новий hint до стану активу без зміни інших полів."""
+
+        if symbol not in self.state:
+            self.init_asset(symbol)
+
+        current = self.state[symbol]
+        hints = current.get("hints")
+        if isinstance(hints, list):
+            hints_list = hints
+        elif hints:
+            hints_list = [hints]
+        else:
+            hints_list = []
+
+        hints_list.append(hint)
+        current["hints"] = hints_list
+        self.state[symbol] = current
 
     # ─────────────────────── Confidence перцентилі (збір зразків) ───────────────────────
     def add_confidence_sample(self, value: float | None, max_len: int = 500) -> None:

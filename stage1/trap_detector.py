@@ -29,24 +29,44 @@ if not logger.handlers:  # guard
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
 
+try:
+    from config import config as _cfg  # type: ignore
+except Exception:  # pragma: no cover - fallback
+    _cfg = None
+
+
+def _cfg_mapping(name: str, default: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = getattr(_cfg, name)
+        if isinstance(value, Mapping):
+            return dict(value)
+    except Exception:
+        pass
+    return dict(default)
+
+
+def _cfg_value(name: str, default: Any) -> Any:
+    try:
+        return getattr(_cfg, name)
+    except Exception:
+        return default
+
+
 # Пороги з конфігурації (з безпечними дефолтами)
-try:  # pragma: no cover — конфіг може бути недоступний у деяких середовищах тестів
-    from config.config import STAGE1_TRAP as _TRAP_CFG  # type: ignore
-except Exception:  # pragma: no cover
-    _TRAP_CFG = {
+_TRAP_CFG = _cfg_mapping(
+    "STAGE1_TRAP",
+    {
         "min_dist_to_edge_pct": 0.05,
         "slope_significant": 0.50,
         "acceleration_threshold": 0.60,
         "volume_z_threshold": 2.50,
         "atr_pct_spike_ratio": 2.00,
-    }
+    },
+)
 
-try:  # pragma: no cover
-    from config.config import STAGE2_PROFILE, STRICT_PROFILE_ENABLED, STRONG_REGIME
-except Exception:  # pragma: no cover
-    STAGE2_PROFILE = "legacy"
-    STRICT_PROFILE_ENABLED = False
-    STRONG_REGIME = {}
+STAGE2_PROFILE = _cfg_value("STAGE2_PROFILE", "legacy")
+STRICT_PROFILE_ENABLED = bool(_cfg_value("STRICT_PROFILE_ENABLED", False))
+STRONG_REGIME = _cfg_mapping("STRONG_REGIME", {})
 
 if STRICT_PROFILE_ENABLED and STAGE2_PROFILE == "strict":
     _strict_trap_cfg = dict((STRONG_REGIME or {}).get("trap_thresholds", {}) or {})

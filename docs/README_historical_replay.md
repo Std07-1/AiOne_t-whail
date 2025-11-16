@@ -36,6 +36,19 @@
 - `--start/--end` — межі часу у ISO8601Z або epoch (опц.).
 - `--dump-dir PATH` — альтернативна директорія виводу замість `telemetry/` (опц.).
 
+## Логування реплеїв у PowerShell
+
+Проблема: `Start-Transcript` у VS Code терміналі записує лише службову «шапку» та футер, якщо процес завершується за межами інтерактивної сесії (вихідний файл ~1 KB і не містить рядків `[STRICT_*]`). При цьому `tools.replay_stream` виводить багато службових повідомлень у stderr, тому проста передача stdout у файл теж втрачає частину логів.
+
+Рішення: запускати реплей із перенаправленням обох потоків у `Tee-Object`:
+
+```powershell
+cd C:\Aione_projects\AiOne_t-whail
+ .\.venv\Scripts\python.exe -m tools.replay_stream TONUSDT --interval 1m --source binance --start 2025-11-03T00:00:00Z --end 2025-11-05T12:00:00Z --dump-dir reports\replay_down_ton 2>&1 | Tee-Object -FilePath reports\replay_down_ton\run.log
+```
+
+Так `run.log` отримує і stdout, і stderr, не блокує консольний вивід і не потребує `Stop-Transcript`. Після прогона варто перевірити, що розмір файлу перевищує 1 MB (`Get-Item run.log | Select Length`) — це гарантує, що лог придатний для `tools.extract_phase_episodes`.
+
 ## KPI і перевірки
 - Лічильники фаз: `momentum`, `false_breakout`, `exhaustion`, `drift_trend` (за флагом), `none`.
 - Середні `phase_score` по кожній фазі.

@@ -20,7 +20,6 @@ WHALE_MAX_AGE_SEC = 900.0  # 15 хвилин: достатньо для forward-
 PROFILE_THRESHOLDS = (
     ("strong", {"presence": 0.60, "bias": 0.18, "confidence": 0.85}),
     ("soft", {"presence": 0.50, "bias": 0.12, "confidence": 0.65}),
-    ("explain", {"presence": 0.40, "bias": 0.07, "confidence": 0.40}),
 )
 
 # Бонуси/штрафи за волатильність (vol_regime) — м'які коригування впевненості.
@@ -39,6 +38,7 @@ _DEFAULT_RESULT = {
     "reasons": ["no_data"],
     "profile": "none",
     "confidence": 0.0,
+    "phase_reason": None,
 }
 
 
@@ -126,6 +126,11 @@ def compute_whale_min_signal(whale_view: Mapping[str, Any] | None) -> dict[str, 
     missing = bool(whale_view.get("missing"))
     stale = bool(whale_view.get("stale"))
     age_s = _float(whale_view.get("age_s"), 0.0)
+    phase_reason_raw = whale_view.get("phase_reason")
+    phase_reason = (
+        str(phase_reason_raw).strip() if isinstance(phase_reason_raw, str) else None
+    )
+    phase_reason_norm = phase_reason.lower() if phase_reason else None
     if missing:
         reasons.append("missing_snapshot")
     if stale:
@@ -139,6 +144,7 @@ def compute_whale_min_signal(whale_view: Mapping[str, Any] | None) -> dict[str, 
             "reasons": reasons or ["stale_payload"],
             "profile": "none",
             "confidence": 0.0,
+            "phase_reason": phase_reason,
         }
 
     presence = _float(whale_view.get("presence"), 0.0)
@@ -159,6 +165,7 @@ def compute_whale_min_signal(whale_view: Mapping[str, Any] | None) -> dict[str, 
             "reasons": reasons,
             "profile": profile,
             "confidence": 0.0,
+            "phase_reason": phase_reason,
         }
 
     vol_regime = str(whale_view.get("vol_regime", "unknown") or "unknown")
@@ -172,10 +179,23 @@ def compute_whale_min_signal(whale_view: Mapping[str, Any] | None) -> dict[str, 
         enabled = False
         reasons.append("confidence_zero")
 
+    explain_only = False
+    if phase_reason_norm == "volz_too_low":
+        explain_only = True
+        reasons.append("phase_reason_volz_too_low")
+    elif phase_reason_norm == "presence_cap_no_bias_htf" and confidence < 0.5:
+        explain_only = True
+        reasons.append("phase_reason_presence_cap")
+
+    if explain_only:
+        profile = "explain_only"
+        enabled = False
+
     return {
         "direction": direction,
         "enabled": enabled,
         "reasons": reasons,
         "profile": profile,
         "confidence": confidence,
+        "phase_reason": phase_reason,
     }

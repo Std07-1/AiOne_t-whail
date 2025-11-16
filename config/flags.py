@@ -44,7 +44,7 @@ STAGE3_PAPER_ENABLED: bool = True
 # Stage3: читання китової телеметрії через нормалізований view (rollback-friendly)
 WHALE_MIN_SIGNAL_VIEW_ENABLED: bool = True
 # Stage3: експериментальний розрахунок whale min-signal через v1 модуль
-WHALE_MINSIGNAL_V1_ENABLED: bool = False
+WHALE_MINSIGNAL_V1_ENABLED: bool = True
 
 # Якщо True — позначаємо stats.vol_z_source="proxy" (коли ввімкнено проксі‑агрегацію).
 # За замовчуванням False, Stage1 виставляє "real".
@@ -258,19 +258,26 @@ STRICT_SCENARIO_HYSTERESIS_ENABLED: bool = True
 # але гістерезис ще не підтвердив стабільність, ми все одно публікуємо
 # scenario_detected/scenario_confidence у market_context.meta та Prometheus ai_one_scenario.
 # Контракти Stage1/Stage2 не змінюються; ЗА ЗАМОВЧУВАННЯМ ВИМКНЕНО (канарейка завершена).
-SCENARIO_CANARY_PUBLISH_CANDIDATE: bool = False
+SCENARIO_CANARY_PUBLISH_CANDIDATE: bool = True
 
 # Профільний двигун (Stage1 профілі порогів для hint'ів) — телеметрія‑only
-PROFILE_ENGINE_ENABLED: bool = False
+# Якщо True — Stage1 формує профільні hint'и (long/short/score) на базі
+# профільних порогів (strict/aggressive/conservative). Якщо False — вимикає
+# профільний двигун, Stage1 не формує hint'ів (повертається до legacy‑логіки).
+# Контракти Stage1Signal не змінюються; вплив лише на телеметрію.
+PROFILE_ENGINE_ENABLED: bool = True
 
 # HTF‑контекст (Stage C): вплив на профільну впевненість та alt_confirm у Stage2‑hint
-HTF_CONTEXT_ENABLED: bool = False
+# Якщо True — Stage1 додає htf_strength/htf_ok у market_context.context.htf,
+# що впливає на профільну впевненість (confidence) та alt_confirm у Stage2‑hint.
+# Контракти Stage1/Stage2 не змінюються; вплив лише на телеметрію та профільні hint'и.
+HTF_CONTEXT_ENABLED: bool = True
 
 # ── Forward profiles: soft thresholds (best-effort, tools.only) ────────────────
 # Якщо True — інструмент forward_from_log застосує м'якші пороги для відбору
 # алертів та часових вікон whale/explain за відсутності явних CLI-оверрайдів.
 # Контракти Stage1/2/3 не змінюються; вплив лише на офлайн-звіти forward.
-FORWARD_SOFT_THRESH_ENABLED: bool = False
+FORWARD_SOFT_THRESH_ENABLED: bool = True
 FORWARD_SOFT_THRESH = {
     "whale": {
         "presence_min": 0.50,

@@ -13,6 +13,7 @@ Usage example:
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,9 +25,14 @@ class Episode:
     ts_iso: str
     symbol: str
     phase: str
+    phase_state_current: str
+    phase_state_age_s: float | None
     scenario: str
     confidence: float
     direction: str
+    direction_hint: str
+    whale_bias: float | None
+    htf_strength: float | None
     phase_reason: str
 
 
@@ -101,6 +107,44 @@ def _collect_entry_lines(
     return " ".join(parts), None
 
 
+def _extract_symbol_from_tag(line: str, tag: str) -> str | None:
+    symbol = _extract_simple_value(line, "symbol")
+    if symbol:
+        return symbol.lower()
+    tag_idx = line.find(tag)
+    if tag_idx == -1:
+        return None
+    remainder = line[tag_idx + len(tag) :].lstrip()
+    if not remainder:
+        return None
+    token_chars: list[str] = []
+    for ch in remainder:
+        if ch.isspace() or ch in "-:|":
+            break
+        token_chars.append(ch)
+    return ("".join(token_chars)).lower() if token_chars else None
+
+
+def _fmt_optional_float(value: float | None) -> str:
+    return f"{value:.2f}" if value is not None else ""
+
+
+_DIR_HINT_PATTERN = re.compile(
+    r"direction_hint[\"']?\s*[:=]\s*['\"]?([a-zA-Z_]+)['\"]?",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_direction_hint_token(text: str) -> str | None:
+    match = _DIR_HINT_PATTERN.search(text)
+    if not match:
+        return None
+    value = match.group(1).strip().lower()
+    if value in {"", "none", "null"}:
+        return None
+    return value
+
+
 def extract_episodes(
     log_path: Path,
     symbol: str,
@@ -113,6 +157,11 @@ def extract_episodes(
     last_phase: dict[str, str] = {}
     last_reason: dict[str, str] = {}
     last_scenario: dict[str, tuple[str, float, str]] = {}
+    last_phase_state_current: dict[str, str] = {}
+    last_phase_state_age: dict[str, float] = {}
+    last_whale_bias: dict[str, float] = {}
+    last_htf_strength: dict[str, float] = {}
+    last_direction_hint: dict[str, str] = {}
 
     with log_path.open(encoding="utf-8", errors="ignore") as fh:
         lines_iter = iter(fh)
@@ -148,6 +197,37 @@ def extract_episodes(
                         last_reason[symbol_low] = reasons
                 continue
 
+            if "[PHASE_STATE_UPDATE]" in line:
+                symbol_val = _extract_simple_value(line, "symbol")
+                if symbol_val == symbol_low:
+                    current = _extract_simple_value(line, "current_phase")
+                    if current:
+                        last_phase_state_current[symbol_low] = current
+                    age = _maybe_float(_extract_simple_value(line, "age_s"))
+                    last_phase_state_age[symbol_low] = age
+                continue
+
+            if "[STRICT_WHALE]" in line:
+                symbol_val = _extract_symbol_from_tag(line, "[STRICT_WHALE]")
+                if symbol_val == symbol_low:
+                    bias_val = _maybe_float(_extract_simple_value(line, "bias"))
+                    last_whale_bias[symbol_low] = bias_val
+                continue
+
+            if "[HTF]" in line:
+                if _extract_simple_value(line, "symbol") == symbol_low:
+                    strength = _maybe_float(_extract_simple_value(line, "strength"))
+                    last_htf_strength[symbol_low] = strength
+                continue
+
+            if "[SCEN_EXPLAIN]" in line:
+                symbol_val = _extract_simple_value(line, "symbol")
+                if symbol_val == symbol_low:
+                    dir_hint_val = _extract_simple_value(line, "direction_hint")
+                    if dir_hint_val and dir_hint_val.lower() not in {"none", "null"}:
+                        last_direction_hint[symbol_low] = dir_hint_val.lower()
+                continue
+
             if "[PHASE_STATE_CARRY]" in line:
                 if symbol_low not in line.lower() or ts_iso is None:
                     continue
@@ -161,6 +241,11 @@ def extract_episodes(
                 )
                 last_phase[symbol_low] = phase_val
                 last_reason[symbol_low] = reason
+                age_val = _maybe_float(_extract_simple_value(line, "age_s"))
+                last_phase_state_age[symbol_low] = age_val
+                last_phase_state_current[symbol_low] = (
+                    last_phase_state_current.get(symbol_low) or phase_val or ""
+                )
                 scenario, conf, direction = last_scenario.get(
                     symbol_low, ("carry_forward", 0.0, "unknown")
                 )
@@ -171,9 +256,16 @@ def extract_episodes(
                         ts_iso=ts_iso,
                         symbol=symbol_low,
                         phase=phase_val or "unknown",
+                        phase_state_current=last_phase_state_current.get(
+                            symbol_low, ""
+                        ),
+                        phase_state_age_s=last_phase_state_age.get(symbol_low),
                         scenario=scenario,
                         confidence=conf,
                         direction=direction,
+                        direction_hint=last_direction_hint.get(symbol_low, ""),
+                        whale_bias=last_whale_bias.get(symbol_low),
+                        htf_strength=last_htf_strength.get(symbol_low),
                         phase_reason=reason or "",
                     )
                 )
@@ -194,6 +286,9 @@ def extract_episodes(
                     or _extract_simple_value(combined_line, "side")
                 )
                 conf = _maybe_float(_extract_simple_value(combined_line, "conf"))
+                direction_hint = _extract_direction_hint_token(combined_line)
+                if direction_hint:
+                    last_direction_hint[symbol_low] = direction_hint
                 last_scenario[symbol_low] = (scenario_name, conf, direction)
                 if conf < min_conf:
                     continue
@@ -208,9 +303,16 @@ def extract_episodes(
                         ts_iso=ts_iso,
                         symbol=symbol_low,
                         phase=phase_val,
+                        phase_state_current=last_phase_state_current.get(
+                            symbol_low, ""
+                        ),
+                        phase_state_age_s=last_phase_state_age.get(symbol_low),
                         scenario=scenario_name,
                         confidence=conf,
                         direction=direction,
+                        direction_hint=last_direction_hint.get(symbol_low, ""),
+                        whale_bias=last_whale_bias.get(symbol_low),
+                        htf_strength=last_htf_strength.get(symbol_low),
                         phase_reason=reason,
                     )
                 )
@@ -227,6 +329,9 @@ def extract_episodes(
                     _extract_simple_value(line, "direction")
                     or _extract_simple_value(line, "side")
                 )
+                direction_hint = _extract_direction_hint_token(line)
+                if direction_hint:
+                    last_direction_hint[symbol_low] = direction_hint
                 last_scenario[symbol_low] = (scenario_name, conf, direction)
                 if conf < min_conf:
                     continue
@@ -241,9 +346,16 @@ def extract_episodes(
                         ts_iso=ts_iso,
                         symbol=symbol_low,
                         phase=phase_val,
+                        phase_state_current=last_phase_state_current.get(
+                            symbol_low, ""
+                        ),
+                        phase_state_age_s=last_phase_state_age.get(symbol_low),
                         scenario=scenario_name,
                         confidence=conf,
                         direction=direction,
+                        direction_hint=last_direction_hint.get(symbol_low, ""),
+                        whale_bias=last_whale_bias.get(symbol_low),
+                        htf_strength=last_htf_strength.get(symbol_low),
                         phase_reason=reason,
                     )
                 )
@@ -256,15 +368,28 @@ def extract_episodes(
 def write_markdown(out_path: Path, episodes: Iterable[Episode]) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        "| ts_utc | symbol | phase | scenario | conf | direction | phase_reason |",
-        "|  ---   |  ---   | ---   | ---      | ---  | ---       | ---          |",
+        "| ts_utc | symbol | phase | phase_state_current | phase_state_age_s | scenario | conf | direction | direction_hint | whale_bias | htf_strength | phase_reason |",
+        "|  ---   |  ---   | ---   | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for ep in episodes:
         lines.append(
-            f"| {ep.ts_iso} | {ep.symbol} | {ep.phase} | {ep.scenario} | {ep.confidence:.2f} | {ep.direction} | {ep.phase_reason or ''} |"
+            "| {ts} | {symbol} | {phase} | {phase_state} | {phase_age} | {scenario} | {conf:.2f} | {direction} | {direction_hint} | {whale_bias} | {htf} | {reason} |".format(
+                ts=ep.ts_iso,
+                symbol=ep.symbol,
+                phase=ep.phase,
+                phase_state=ep.phase_state_current or "",
+                phase_age=_fmt_optional_float(ep.phase_state_age_s),
+                scenario=ep.scenario,
+                conf=ep.confidence,
+                direction=ep.direction,
+                direction_hint=ep.direction_hint or "",
+                whale_bias=_fmt_optional_float(ep.whale_bias),
+                htf=_fmt_optional_float(ep.htf_strength),
+                reason=ep.phase_reason or "",
+            )
         )
     if len(lines) == 2:
-        lines.append("| - | - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - | - | - | - | - | - |")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

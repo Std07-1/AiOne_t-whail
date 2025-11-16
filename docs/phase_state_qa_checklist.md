@@ -1,6 +1,6 @@
 # PhaseState QA Checklist
 
-План перевірок перед довгими (≥1h) псевдострімами з carry-forward.
+План перевірок перед довгими (≥1h) псевдострімами з carry-forward. ON/OFF запуски зручно робити через `python -m tools.unified_runner --duration ... --set PHASE_STATE_ENABLED=...` (див. приклад профілю в `docs/TELEMETRY.md`).
 
 ## 1. Артефакти для ON/OFF ран-ів
 
@@ -17,19 +17,21 @@
 Signals truth для carry-forward ON:
 
 ```powershell
-python -m tools.signals_truth \
-  --logs logs/run_phase_state_cf_on.log \
-  --last-hours 2 \
-  --ds-dir datastore \
-  --out reports/phase_state_cf_on/signals_truth.csv \
+cd C:\Aione_projects\AiOne_t-whail
+.\.venv\Scripts\python.exe -m tools.signals_truth `
+  --logs logs/run_phase_state_cf_on.log `
+  --last-hours 2 `
+  --ds-dir datastore `
+  --out reports\phase_state_cf_on\signals_truth.csv `
   --emit-prom true
 ```
 
 Prometheus дамп:
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing http://localhost:9108/metrics \
-  | Out-File -Encoding utf8 reports/phase_state_cf_on/prom_metrics.txt
+cd C:\Aione_projects\AiOne_t-whail
+Invoke-WebRequest -UseBasicParsing http://localhost:9108/metrics |
+  Out-File -Encoding utf8 reports\phase_state_cf_on\prom_metrics.txt
 ```
 
 ## 3. Метрики для порівняння ON/OFF
@@ -44,9 +46,10 @@ Invoke-WebRequest -UseBasicParsing http://localhost:9108/metrics \
 Після запуску:
 
 ```powershell
-python -m tools.analyze_phase_state \
-  --log logs/run_phase_state_cf_on.log \
-  --out reports/phase_state_cf_on/phase_state_qa.md
+cd C:\Aione_projects\AiOne_t-whail
+.\.venv\Scripts\python.exe -m tools.analyze_phase_state `
+  --log logs/run_phase_state_cf_on.log `
+  --out reports\phase_state_cf_on\phase_state_qa.md
 ```
 
 Скрипт збирає кількість carry-подій, розклад reason-кодів, базові статистики `age_s`.
@@ -56,21 +59,23 @@ python -m tools.analyze_phase_state \
 ### ON-ран (PhaseState увімкнено)
 
 ```powershell
-.\.venv\Scripts\python.exe -m tools.signals_truth \
-  --last-hours 8 \
-  --logs reports/phase_state_8h_on/run.log \
-  --ds-dir datastore \
-  --out reports/phase_state_8h_on/signals_qa_on.csv
+cd C:\Aione_projects\AiOne_t-whail
+.\.venv\Scripts\python.exe -m tools.signals_truth `
+  --last-hours 8 `
+  --logs reports\phase_state_8h_on\run.log `
+  --ds-dir datastore `
+  --out reports\phase_state_8h_on\signals_qa_on.csv
 ```
 
 ### OFF-ран (PhaseState вимкнено)
 
 ```powershell
-.\.venv\Scripts\python.exe -m tools.signals_truth \
-  --last-hours 8 \
-  --logs reports/phase_state_8h_off/run.log \
-  --ds-dir datastore \
-  --out reports/phase_state_8h_off/signals_qa_off.csv
+cd C:\Aione_projects\AiOne_t-whail
+.\.venv\Scripts\python.exe -m tools.signals_truth `
+  --last-hours 8 `
+  --logs reports\phase_state_8h_off\run.log `
+  --ds-dir datastore `
+  --out reports\phase_state_8h_off\signals_qa_off.csv
 ```
 
 > `tools.signals_truth` створює валідний CSV навіть без сигналів (у файлі лишається заголовок).
@@ -80,12 +85,13 @@ python -m tools.analyze_phase_state \
 Приклад для BTC (carry + конфіденс ≥0.35):
 
 ```powershell
-.\.venv\Scripts\python.exe -m tools.extract_phase_episodes ^
-  --log reports/phase_state_8h_on/run.log ^
-  --symbol btcusdt ^
-  --out reports/phase_state_8h_on/episodes_btc.md ^
-  --phase-state-carried-only ^
-  --min-conf 0.35 ^
+cd C:\Aione_projects\AiOne_t-whail
+.\.venv\Scripts\python.exe -m tools.extract_phase_episodes `
+  --log reports\phase_state_8h_on\run.log `
+  --symbol btcusdt `
+  --out reports\phase_state_8h_on\episodes_btc.md `
+  --phase-state-carried-only `
+  --min-conf 0.35 `
   --max-episodes 10
 ```
 

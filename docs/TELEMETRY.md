@@ -37,9 +37,18 @@ UI‑publisher публікує агрегований стан у каноні�
 ## 4) Фазний детектор та «тихий тренд» (participation‑light)
 
 - Легке визначення фаз (momentum, exhaustion, false_breakout, pre/post_breakout, drift_trend) здійснюється у Stage2‑lite на базі полів `stats` + контекст (HTF, рівні, волатильність).
-- «Тихий тренд» (`drift_trend`) активується фіче‑флагом `FEATURE_PARTICIPATION_LIGHT` і телеметрійно позначається у UI через `market_context.meta.insights.quiet_mode` (`quiet_score`).
+- «Тихий тренд» (`drift_trend`) активується фіче-флагом `FEATURE_PARTICIPATION_LIGHT` і телеметрійно позначається у UI через `market_context.meta.insights.quiet_mode` (`quiet_score`).
 - Пороги зберігаються у конфігурації Stage2 (див. `config/config_stage2.py`: `PARTICIPATION_LIGHT_THRESHOLDS`).
-- Памʼять фаз (`PhaseState`) тепер експортує мʼякі підказки: кожен виклик адаптера фаз додає у `market_context.meta.phase_state_hint` компактний JSON `{phase, age_s, score, reason, presence, bias, htf_strength, updated_ts}`. Цей блок не змінює рішень Stage2/Stage3 напряму, але допомагає Explain/QA бачити стан carry-forward у UI, ScenarioTrace й `/metrics` без розкриття повного стану PhaseState.
+- Памʼять фаз (`PhaseState`) додає мʼякі підказки: адаптер фаз читає `stats.phase_state` і публікує `market_context.meta.phase_state_hint`, тож Explain/QA бачать carry-forward без зміни контрактів Stage1/Stage2.
+
+### PhaseState hint
+
+- **Джерело.** `phase_adapter.detect_phase_from_stats()` формує `phase_state_hint` і вкладає його у `market_context.meta.phase_state` під ключем `phase_state_hint`; `app/process_asset_batch.py` дублює блок у Stage1 `meta`.
+- **Поля.** `{phase_state_current (поле `phase`), age_s, score, reason, presence, bias, htf_strength, updated_ts, direction_hint}`. Значення presence/bias/htf_strength перетягуються з останнього PhaseState snapshot, `direction_hint` обчислюється через `utils.direction_hint.infer_direction_hint` як мʼякий натяк long/short (не трейдовий сигнал).
+- **Використання.**
+	- `SCENARIO_TRACE` та `market_context.meta` показують hint разом із кандидатом, щоб видно було carry-forward віком/причиною.
+	- `[SCEN_EXPLAIN]` додає `direction_hint`, коли Explain проходить rate-limit.
+	- UI/Prometheus читають блок для QA/спостереження, Stage3 не залежить від нього й контракти не змінені.
 
 ## 5) Найкращі практики
 
@@ -79,6 +88,20 @@ UI‑publisher публікує агрегований стан у каноні�
 Фазний детектор також зберігає `stats.phase_debug.presence_cap_guard` із полями `before`, `after`, `htf_ok`, `htf_strength` (та ім'ям гварда). Це поле не змінює бізнес-логіку, але дозволяє бачити фактичний clamp прямо у Phase Diagnostics/market_context.meta.stats.
 
 Додатково у `stats.phase_debug.reason` записується останній reason-код відмови (той самий, що й у лічильнику `ai_one_phase_reject_total`). Це допомагає дивитися причину прямо з Redis/UI без читання логів, а в логах з'являється рядок `[STRICT_PHASE_REASON]` із упорядкованими полями `symbol ts phase scenario reasons presence bias rr gates`.
+
+### PhaseState QA та `[PHASE_STATE_UPDATE]`
+
+- Прапори: `PHASE_STATE_ENABLED` (config) активує менеджер, а `PHASE_STATE_ENABLED_FLAG` (реекспорт у `stage2/phase_detector`) дозволяє Stage2 використовувати carry-forward фазу. Stage2 читає цей прапор безпосередньо з конфіга під час ініціалізації.
+- `[PHASE_STATE_UPDATE] symbol=... enabled=... raw_phase=... current_phase=... age_s=... reason=...` лог відображає весь життєвий цикл оновлень. Дані паралельно пишуться у `stats["phase_state"]`:
+	`{current_phase, phase_score, age_s, last_reason, last_whale_presence, last_whale_bias, last_htf_strength, updated_ts}`.
+- Soft причини carry-forward: `presence_cap_no_bias_htf`, `htf_gray_low`, `volz_too_low`. Лише вони дозволяють PhaseState утримати фазу (якщо `age_s ≤ PHASE_STATE_MAX_AGE` та немає конфлікту bias). Жорсткі причини (`htf_conflict`, `trend_reversal`, `risk_block`, `low_atr_guard`, `anti_breakout_whale_guard`) миттєво скидають state.
+- Цей snapshot стає джерелом для `phase_state_hint` та Prometheus (через Meta/Redis), тому QA бачить реальний вік, причину й останні whale-поля без розкриття приватного PhaseState namespace.
+
+### Whale signal v1: телеметрія та Prometheus
+
+- Payload збирається у `stage3.whale_signal_telemetry.build_whale_signal_v1_payload` → `market_context.meta.whale_signal_v1` → Stage3 `_enforce_whale_signal_v1`. Поля: `enabled`, `direction`, `profile`, `confidence`, `phase_reason`, `reasons`, `presence`, `bias`, `vwap_dev`, `vol_regime`, `age_s`, `missing`, `stale`, `dominance`, `zones_summary`.
+- Профілі: `strong` (високі presence/|bias|), `soft` (observe/watchlist) та `explain_only` (UI/QA-only; активується при `phase_reason ∈ {volz_too_low, presence_cap_no_bias_htf}` коли conf < 0.5). Якщо профіль `explain_only` або `enabled=False`, Stage3 лише логуватиме snapshot (`whale_signal_profile`, `whale_phase_reason`) і не впливає на позиції.
+- Prometheus: `ai_one_whale_signal_v1_confidence`, `ai_one_whale_signal_v1_enabled`, `ai_one_whale_signal_v1_profile_total`, `ai_one_whale_signal_v1_direction_total`, `ai_one_whale_signal_v1_disabled_total`. Перші два — гейджі, решта — лічильники подій.
 
 Примітки реалізації:
 - Ініціалізація метрик виконується ледачо, збій/відсутність клієнта — no-op і не впливає на пайплайн.
@@ -126,12 +149,17 @@ python -m tools.whale_signal_forward \
 [SCEN_EXPLAIN] symbol=btcusdt scenario=pullback_continuation explain="near_edge_persist=0.67 (w=1.00); compression.index=0.12 (w=0.70); btc_regime_v2=flat (w=0.60)"
 ```
 
-Керування логуванням explain:
+Керування логуванням explain (`process_asset_batch.helpers.explain_should_log`):
 
-- `config/config.py` прапори:
-	- `SCEN_EXPLAIN_ENABLED=True`
-	- `SCEN_EXPLAIN_VERBOSE_EVERY_N=20` — кожен N-й батч для символу, навіть якщо ще не минуло 10 с.
-- Рейт-ліміт реалізовано в `app/process_asset_batch.py` через `_explain_should_log` + пер-символьний лічильник батчів.
+- Прапори `config/config.py`:
+	- `SCEN_EXPLAIN_ENABLED=True` — включає explain-пайплайн.
+	- `SCEN_EXPLAIN_VERBOSE_EVERY_N=20` — heartbeat: навіть якщо 10-секундний мін-інтервал не пройшов, кожен N-й батч матиме explain.
+- Параметри функції `_explain_should_log(symbol, now_ts, min_period_s, every_n, force_all)`:
+	- `min_period_s` — пауза між explain (за замовчуванням 10 с).
+	- `every_n` — лічильник `_SCEN_EXPLAIN_BATCH_COUNTER`; після `every_n` пропущених батчів логування примусово спрацьовує і скидає лічильник.
+	- `force_all` — форсований режим (`SCEN_EXPLAIN_FORCE_ALL`), який знехтовує rate-limit (використовується для реплеїв/QA). Значення можна перевизначити per-call.
+- `_SCEN_EXPLAIN_LAST_TS` тримає останній timestamp; `_SCEN_EXPLAIN_BATCH_COUNTER` показує, скільки батчів було «приглушено». Обидва значення доступні з `process_asset_batch.global_state` для діагностики.
+- Лог `[SCEN_EXPLAIN] ... direction_hint=...` тепер включає мʼякий напрямок із `market_context.meta.phase_state_hint.direction_hint` (тільки для Explain/UI; Stage3 і трейдинг його не використовують).
 
 Аналітика explain у CSV:
 
@@ -146,12 +174,29 @@ python -m tools.whale_signal_forward \
 
 ## PhaseState QA режим (safe)
 
-Псевдостріми на ≥1 годину з carry-forward вимагають окремого профілю, щоб не торкнутися Stage3. Рекомендований набір прапорів для QA/diagnostic запусків `tools.run_window` / `tools.run_window --set ...`:
+Псевдостріми на ≥1 годину з carry-forward вимагають окремого профілю, щоб не торкнутися Stage3. Рекомендований набір прапорів для QA/diagnostic запусків через `python -m tools.unified_runner --duration ... --set ...`:
 
 - `STAGE3_PAPER_ENABLED=true` — Stage3 повністю паперовий.
-- `INSIGHT_DIRECTION_ONLY=true` (або залишити `INSIGHT_TELEMETRY_ONLY=true`) — UI публікує лише direction hints без act.
-- `PHASE_STATE_ENABLED=true` та `PHASE_STATE_ENABLED_FLAG=true` — включають шар PhaseState і його реекспорт для Stage2.
-- `SCEN_EXPLAIN_ENABLED=true` та `SCEN_EXPLAIN_VERBOSE_EVERY_N=20` — explain активний і логуватиметься раз на ≈20 батчів навіть без подій.
-- `PROM_GAUGES_ENABLED=true` — Prometheus-метрики доступні для моніторингу QA-run.
+- `WHALE_MINSIGNAL_V1_ENABLED=true` та `SCEN_CONTEXT_WEIGHTS_ENABLED=false` — телеметрія мін-сигналу активна, контексти фіксуємо.
+- `PHASE_STATE_ENABLED=true` і `PHASE_STATE_ENABLED_FLAG=true` — включають PhaseState manager + використання carry-forward.
+- `SCEN_EXPLAIN_ENABLED=true`, `SCEN_EXPLAIN_VERBOSE_EVERY_N=20`, `SCEN_EXPLAIN_FORCE_ALL=false` — explain активний із heartbeat.
+- `PROM_GAUGES_ENABLED=true`, `PROM_HTTP_PORT=9108` — Prometheus /metrics доступний для QA.
 
-Цей профіль потрібен лише для діагностики PhaseState (довгі псевдостріми, forward-зрізи, metrics) і не дає Stage3 права відкривати ордери.
+Приклад (PowerShell):
+
+```powershell
+cd C:\Aione_projects\AiOne_t-whail
+.\.venv\Scripts\python.exe -m tools.unified_runner `
+	--duration 28800 `
+	--set STATE_NAMESPACE=ai_one_phaseqa `
+	--set PHASE_STATE_ENABLED=true `
+	--set PHASE_STATE_ENABLED_FLAG=true `
+	--set STAGE3_PAPER_ENABLED=true `
+	--set WHALE_MINSIGNAL_V1_ENABLED=true `
+	--set SCEN_EXPLAIN_ENABLED=true `
+	--set SCEN_EXPLAIN_VERBOSE_EVERY_N=20 `
+	--set PROM_GAUGES_ENABLED=true `
+	--log reports\phase_state_8h_on\run.log
+```
+
+Цей профіль потрібен лише для діагностики PhaseState / whale_signal_v1 (довгі псевдостріми, forward-зрізи, metrics) і не дає Stage3 права відкривати ордери: `Stage3_PAPER_ENABLED` + профіль `explain_only` гарантують відсутність змін напрямку.

@@ -65,7 +65,7 @@ PhaseState:
 
 - `stage2/phase_detector.py`: після обчислення phase/result викликаємо `PhaseStateManager.update(symbol, stats, context)`, отримуємо `phase_state.current_phase` та кладемо в `PhaseResult`.
 - `market_context.meta.phase` тепер бере значення з PhaseState (коли прапор увімкнений). Сирий результат детектора зберігаємо в `phase_state.last_detected_phase` для діагностики.
-- Stage2 експортує стислий хінт `phase_state_hint`: адаптер фаз (`utils.phase_adapter.detect_phase_from_stats`) зчитує `stats.phase_state` і повертає словник {phase, age_s, score, reason, presence, bias, htf_strength, updated_ts}. `app/process_asset_batch.py` дублює цей блок у `market_context.meta.phase_state_hint`, щоб Stage3/Explain/QA могли бачити стан памʼяті без зміни контрактів.
+- Stage2 експортує стислий хінт `phase_state_hint`: адаптер фаз (`utils.phase_adapter.detect_phase_from_stats`) зчитує `stats.phase_state` і повертає словник {phase, age_s, score, reason, presence, bias, htf_strength, updated_ts, direction_hint}. `direction_hint` генерується чистою функцією `utils.direction_hint.infer_direction_hint`: вона дозволяє лише `pullback_continuation` сценарії, вимагає |whale_bias| ≥0.25 і узгодження фази (`trend_up`, `trend_down`, `false_breakout`) з bias. `app/process_asset_batch.py` дублює цей блок у `market_context.meta.phase_state_hint`, щоб Stage3/Explain/QA бачили стан памʼяті й одразу мали мʼяку підказку для explain-логів без зміни контрактів.
 - Stage3 / `trade_manager.py`: контракти не змінюємо; Stage3 просто споживає `market_context.meta.phase`, але з меншою кількістю `None`.
 - Telemetry / Prometheus: додаємо серію `phase_state_age_seconds`, `phase_state_carry_forward_total{reason}` для QA.
 
@@ -80,7 +80,7 @@ PhaseState:
 
 1. **Імплементація шару** — клас `PhaseStateManager` (+ Redis адаптер), логувати оновлення й причини carry-forward без зміни Stage3.
 2. **Експериментальний режим** — під `PHASE_STATE_ENABLED` віддавати у пайплайн `current_phase` для reason-кодів зі списку мʼяких. Паралельно писати Prometheus-лічильники `phase_state_carry_forward_total`.
-3. **QA/forward** — прогнати `tools.run_window` (мін. 1 год) ON/OFF, виміряти: частка `phase=None`, вплив на ScenarioTrace/Act, наявність конфліктів з whale bias/HTF. Лише після цього рухатись до прод-канарейки.
+3. **QA/forward** — прогнати `tools.unified_runner` (мін. 1 год) ON/OFF, виміряти: частка `phase=None`, вплив на ScenarioTrace/Act, наявність конфліктів з whale bias/HTF. `tools.unified_runner` піднімає той самий пайплайн, але дозволяє одразу задавати прапори PhaseState, telemetry та whale_signal_v1 в одному місці. Лише після цього рухатись до прод-канарейки.
 
 ## QA-критерії перед канарейкою
 

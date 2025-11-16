@@ -22,6 +22,29 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return num
 
 
+def _extract_phase_reason(stats: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(stats, Mapping):
+        return None
+    reason_candidate: Any | None = None
+    phase_debug = stats.get("phase_debug")
+    if isinstance(phase_debug, Mapping):
+        reason_candidate = phase_debug.get("reason")
+    if reason_candidate is None:
+        phase_state = stats.get("phase_state")
+        if isinstance(phase_state, Mapping):
+            reason_candidate = phase_state.get("last_reason")
+    if reason_candidate is None:
+        phase_payload = stats.get("phase")
+        if isinstance(phase_payload, Mapping):
+            hint = phase_payload.get("phase_state_hint")
+            if isinstance(hint, Mapping):
+                reason_candidate = hint.get("reason")
+    if isinstance(reason_candidate, str):
+        trimmed = reason_candidate.strip()
+        return trimmed or None
+    return None
+
+
 def whale_min_signal_view(stats: Mapping[str, Any] | None) -> dict[str, Any]:
     """Повертає нормалізований view `stats.whale` для Stage3 мін-сигналу."""
 
@@ -67,6 +90,8 @@ def whale_min_signal_view(stats: Mapping[str, Any] | None) -> dict[str, Any]:
     else:
         tags = []
 
+    phase_reason = _extract_phase_reason(stats if isinstance(stats, Mapping) else None)
+
     return {
         "presence": presence,
         "bias": bias,
@@ -79,4 +104,5 @@ def whale_min_signal_view(stats: Mapping[str, Any] | None) -> dict[str, Any]:
         "age_s": age_s,
         "tags": tags,
         "reasons": reasons,
+        "phase_reason": phase_reason,
     }

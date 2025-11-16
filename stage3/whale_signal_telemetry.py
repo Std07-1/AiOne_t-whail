@@ -65,6 +65,7 @@ def build_whale_signal_v1_payload(
         "direction": str(whale_signal.get("direction") or "unknown"),
         "profile": str(whale_signal.get("profile") or "none"),
         "confidence": _float(whale_signal.get("confidence"), 0.0),
+        "phase_reason": (str(whale_signal.get("phase_reason") or "").strip() or None),
         "reasons": reasons,
         "presence": _float(whale_view.get("presence"), 0.0),
         "bias": _float(whale_view.get("bias"), 0.0),

@@ -16,6 +16,7 @@ def test_whale_min_signal_view_with_valid_snapshot() -> None:
             "reasons": ["fresh"],
         },
         "tags": ["whale_soft_stale"],
+        "phase_debug": {"reason": "presence_cap_no_bias_htf"},
     }
 
     view = whale_min_signal_view(stats_payload)
@@ -28,6 +29,7 @@ def test_whale_min_signal_view_with_valid_snapshot() -> None:
     assert view["zones_summary"] == {"accum_cnt": 4, "dist_cnt": 1}
     assert view["tags"] == ["whale_soft_stale"]
     assert view["reasons"] == ["fresh"]
+    assert view["phase_reason"] == "presence_cap_no_bias_htf"
 
 
 def test_whale_min_signal_view_missing_and_stale() -> None:
@@ -66,3 +68,15 @@ def test_whale_min_signal_view_without_whale_payload() -> None:
     assert view["vol_regime"] == "unknown"
     assert view["zones_summary"] == {"accum_cnt": 0, "dist_cnt": 0}
     assert view["tags"] == ["no_whale"]
+    assert view["phase_reason"] is None
+
+
+def test_whale_min_signal_view_phase_reason_from_phase_state_hint() -> None:
+    stats_payload = {
+        "whale": {"presence": 0.1, "bias": 0.0, "vwap_dev": 0.0},
+        "phase": {"phase_state_hint": {"reason": "htf_conflict"}},
+    }
+
+    view = whale_min_signal_view(stats_payload)
+
+    assert view["phase_reason"] == "htf_conflict"

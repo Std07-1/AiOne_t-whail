@@ -161,19 +161,19 @@ WhaleTelemetry — результат чистої функції ядра. Ме
 ## 8. Stage3 Whale View (мінімальний сигнал)
 
 - Мета: підготувати Stage3 до роботи з `WhaleTelemetry`, не змінюючи бізнес-логіку трейд-менеджера.
-- Дія: створити утиліту `stage3.whale_min_signal_view.whale_min_signal_view(stats)`, яка повертає нормалізований зріз `stats.whale` з дефолтами для Stage3 (`presence`, `bias`, `vwap_dev`, `dominance`, `vol_regime`, `zones_summary`, `missing`, `stale`, `age_s`, `tags`).
+- Дія: створити утиліту `stage3.whale_min_signal_view.whale_min_signal_view(stats)`, яка повертає нормалізований зріз `stats.whale` з дефолтами для Stage3 (`presence`, `bias`, `vwap_dev`, `dominance`, `vol_regime`, `zones_summary`, `missing`, `stale`, `age_s`, `tags`, `phase_reason`).
 - Вимоги: жодних нових порогів або правил — лише безпечне читання канонічного payload’у; дефолти відповідають розділу 1.
 - Наступний крок: адаптувати Stage3 мінімальний сигнал до поверненого словника під фіче-флагом; після тестів — поетапно переносити решту Stage3 логіки на `WhaleTelemetry`.
 
 ## Stage3 Whale MinSignal v1 (дизайн)
 
-- **Вхідні поля** (взяти з `WhaleTelemetry` / `whale_min_signal_view`, дефолти як у розділі 1): `presence`, `bias`, `vwap_dev`, `dominance.buy`, `dominance.sell`, `vol_regime`, `zones_summary.accum_cnt`, `zones_summary.dist_cnt`, `missing`, `stale`, `age_s`, `tags`.
+- **Вхідні поля** (взяти з `WhaleTelemetry` / `whale_min_signal_view`, дефолти як у розділі 1): `presence`, `bias`, `vwap_dev`, `dominance.buy`, `dominance.sell`, `vol_regime`, `zones_summary.accum_cnt`, `zones_summary.dist_cnt`, `missing`, `stale`, `age_s`, `tags`, `phase_reason`. `phase_reason` береться з каскаду `_extract_phase_reason`: спочатку `stats.phase_debug.reason`, далі `stats.phase_state.last_reason`, і лише потім `market_context.meta.phase_state_hint.reason`. Таким чином навіть carry-forward з PhaseState потрапляє в мін-сигнал без зміни контрактів Stage1/Stage2.
 - **Hard-deny гейти**: одразу вимикати сигнал, якщо `missing=True`, `stale=True` або `age_s > whale_max_age_sec` (порог підтягується з конфіга). У такому стані `direction="unknown"`, `profile="none"`, додаємо відповідні причини.
 - **Профілі присутності/упередженості**:
-    - `strong`: обов’язкові високі `presence` і `|bias|` (точні числа задаємо у коді; upper-поріг > soft). Використовується для реальних входів.
-    - `soft`: нижчі пороги для `presence` та `|bias|`, дозволяють публікувати рекомендацію лише як «увага».
-    - `explain`: мінімальні пороги, коли хочемо просто тегнути метрику в UI/forward, не впливаючи на трейд-менеджер.
-    - Менш ніж explain → `profile="none"`, `enabled=False`.
+    - `strong`: обов’язкові високі `presence` і `|bias|` (точні числа задаємо у коді; upper-поріг > soft). Це кандидати для реальних входів у майбутньому, коли Stage3 навчиться довіряти цьому сигналу.
+    - `soft`: нижчі пороги для `presence` та `|bias|`; профіль рекомендаційний/observe — публікуємо як попередження, але Stage3 додатково перевіряє напрямок і довіру.
+    - `explain_only`: суто explain/UI статус. Активується, якщо `phase_reason ∈ {volz_too_low}` або `phase_reason == "presence_cap_no_bias_htf"` із `confidence < 0.5`. Такий сигнал не впливає на Stage3 рішення — лише зберігається в снапшоті/телеметрії для QA.
+    - Менш ніж soft → `profile="none"`, `enabled=False`.
 - **Напрямок**: визначається тільки домінансом — `dominance.buy=True` → `direction="long"`, `dominance.sell=True` → `direction="short"`. Якщо жоден прапор не активний, фіксуємо `direction="unknown"` навіть за високих presence/bias.
 - **Бонуси/штрафи**: допускається м’яке коригування `confidence`/`reasons` за `vol_regime` (наприклад, `hyper` → штраф, `normal` → базова вага) та співвідношенням `zones_summary.accum_cnt/dist_cnt` (накопичення підтримує long, надлишок dist → обережність або short). Жодних нових капів без прапорів Stage2 flat-policy.
 - **Forward-артефакти**: поточна статистика `forward_*` — `whales_seen=116`, `alerts_seen=4`, `alerts_matched=0`. Цього горизонту замало для якісного тюнінгу, але дизайн гейтів треба зафіксувати вже зараз, щоб збирати додаткові дані на довших вікнах.

@@ -27,10 +27,17 @@ from config.config import (
     STRICT_HTF_GRAY_GATE_ENABLED,
 )
 from stage2.phase_detector import detect_phase as _detect_phase
+from utils.direction_hint import infer_direction_hint
 from utils.utils import safe_float, safe_number
 
 
-def _build_phase_state_hint(raw: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _build_phase_state_hint(
+    raw: Mapping[str, Any] | None,
+    *,
+    phase_name: str | None = None,
+    scenario: str | None = None,
+    whale_bias_override: float | None = None,
+) -> dict[str, Any] | None:
     """Повертає стиснутий phase_state_hint для market_context/meta."""
 
     if not isinstance(raw, Mapping):
@@ -60,6 +67,20 @@ def _build_phase_state_hint(raw: Mapping[str, Any] | None) -> dict[str, Any] | N
         hint["htf_strength"] = htf_strength
     if updated_ts is not None:
         hint["updated_ts"] = updated_ts
+    try:
+        bias_for_hint = (
+            float(whale_bias_override) if whale_bias_override is not None else bias
+        )
+    except Exception:
+        bias_for_hint = bias
+    direction_hint = infer_direction_hint(
+        phase=phase_name,
+        phase_state_current=phase,
+        whale_bias=bias_for_hint,
+        scenario=scenario,
+    )
+    if direction_hint:
+        hint["direction_hint"] = direction_hint
     return hint
 
 
@@ -323,7 +344,6 @@ def detect_phase_from_stats(
     )
 
     res = _detect_phase(phase_stats, ctx)
-    phase_state_hint = _build_phase_state_hint(phase_stats.get("phase_state"))
     if res is None:
         logger.debug(
             "[STRICT_PHASE] detect_phase_from_stats | symbol=%s phase=None (детектор не повернув результат)",
@@ -331,6 +351,16 @@ def detect_phase_from_stats(
         )
         return None
     _meta = ctx.get("meta", {}) if isinstance(ctx, dict) else {}
+    whale_meta_hint = _meta.get("whale") if isinstance(_meta, Mapping) else {}
+    whale_bias_hint = None
+    if isinstance(whale_meta_hint, Mapping):
+        whale_bias_hint = safe_float(whale_meta_hint.get("whale_bias"))
+    phase_state_hint = _build_phase_state_hint(
+        phase_stats.get("phase_state"),
+        phase_name=getattr(res, "phase", None),
+        scenario=None,
+        whale_bias_override=whale_bias_hint,
+    )
     htf_gate_reason: str | None = None
     _htf_ok = _meta.get("htf_ok") if isinstance(_meta, dict) else None
     _htf_score = _meta.get("htf_score") if isinstance(_meta, dict) else None

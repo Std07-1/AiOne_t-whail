@@ -882,6 +882,19 @@ class TradeLifecycleManager:
         if not isinstance(whale_signal, Mapping):
             return True
 
+        profile = str(whale_signal.get("profile") or "none")
+        if profile == "explain_only":
+            snapshot["whale_signal_profile"] = "explain_only"
+            phase_reason = whale_signal.get("phase_reason")
+            if phase_reason is not None:
+                snapshot["whale_phase_reason"] = phase_reason
+            logger.info(
+                "[STRICT_WHALE] skip enforce: explain_only profile symbol=%s reason=%s",
+                symbol,
+                phase_reason,
+            )
+            return True
+
         if not whale_signal.get("enabled", False):
             self._close_min_signal_position(symbol, "v1_disabled")
             return False

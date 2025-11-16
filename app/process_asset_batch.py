@@ -84,7 +84,11 @@ from process_asset_batch.router_signal_v2 import router_signal_v2
 from process_asset_batch.whale_embed import embed_whale_metrics, ensure_whale_snapshot
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage3.whale_signal_telemetry import build_whale_signal_v1_payload
-from utils.phase_adapter import detect_phase_from_stats, resolve_scenario
+from utils.direction_hint import infer_direction_hint
+from utils.phase_adapter import (
+    detect_phase_from_stats,
+    resolve_scenario,
+)
 from utils.utils import (
     create_error_signal,
     create_no_data_signal,
@@ -901,6 +905,7 @@ class ProcessAssetBatchv1:
 
                             profile_name = None
                             profile_conf = None
+                            thr: dict[str, Any] | None = None
                             if _prof_enabled:
                                 try:
                                     from config.config_whale_profiles import (
@@ -2105,6 +2110,40 @@ class ProcessAssetBatchv1:
                                 pass
                             # ── Liquidity sweep hint (non-invasive, meta only) ──
                             try:
+                                meta_block = normalized.setdefault(
+                                    "market_context", {}
+                                ).setdefault("meta", {})
+                                hint_payload = meta_block.get("phase_state_hint")
+                                if isinstance(hint_payload, dict) and isinstance(
+                                    phase_info, dict
+                                ):
+                                    whale_bias_meta = None
+                                    try:
+                                        whale_meta = meta_block.get("whale")
+                                        if isinstance(whale_meta, dict):
+                                            whale_bias_meta = whale_meta.get(
+                                                "whale_bias"
+                                            )
+                                    except Exception:
+                                        whale_bias_meta = None
+                                    if whale_bias_meta is None:
+                                        try:
+                                            whale_bias_meta = (
+                                                stats_for_phase.get("whale") or {}
+                                            ).get("bias")
+                                        except Exception:
+                                            whale_bias_meta = None
+                                    direction_hint = infer_direction_hint(
+                                        phase=phase_info.get("name"),
+                                        phase_state_current=hint_payload.get("phase"),
+                                        whale_bias=whale_bias_meta,
+                                        scenario=scn_name,
+                                    )
+                                    if direction_hint:
+                                        hint_payload["direction_hint"] = direction_hint
+                            except Exception:
+                                pass
+                            try:
                                 import config.config as _cfg  # type: ignore  # noqa: E402
 
                                 if bool(getattr(_cfg, "LIQ_SWEEP_HINT_ENABLED", True)):
@@ -3147,11 +3186,25 @@ class ProcessAssetBatchv1:
                                                 mc_meta.get("scenario_detected")
                                                 or "none"
                                             )
+                                            try:
+                                                hint_block = (
+                                                    normalized.get("market_context", {})
+                                                    .get("meta", {})
+                                                    .get("phase_state_hint", {})
+                                                )
+                                                direction_hint = (
+                                                    hint_block.get("direction_hint")
+                                                    if isinstance(hint_block, dict)
+                                                    else None
+                                                )
+                                            except Exception:
+                                                direction_hint = None
                                             logger.info(
-                                                '[SCEN_EXPLAIN] symbol=%s scenario=%s explain="%s"',
+                                                '[SCEN_EXPLAIN] symbol=%s scenario=%s explain="%s" direction_hint=%s',
                                                 lower_symbol,
                                                 scen_tag,
                                                 str(ev_explain or ""),
+                                                direction_hint,
                                             )
                                             try:
                                                 if callable(inc_explain_line):  # type: ignore[arg-type]
@@ -3201,6 +3254,20 @@ class ProcessAssetBatchv1:
                                             pred["btc_htf_strength"] = float(btc_htf_s)
                                             if _btc_soft_penalty_applied:
                                                 pred["penalty"] = 0.2
+                                        except Exception:
+                                            pass
+                                        try:
+                                            hint_block = (
+                                                normalized.get("market_context", {})
+                                                .get("meta", {})
+                                                .get("phase_state_hint", {})
+                                            )
+                                            if isinstance(hint_block, dict):
+                                                hint_val = hint_block.get(
+                                                    "direction_hint"
+                                                )
+                                                if hint_val:
+                                                    pred["direction_hint"] = hint_val
                                         except Exception:
                                             pass
                                         decision = "ACCEPT" if scn_name else "REJECT"

@@ -59,6 +59,7 @@ from .flags import (
     INSIGHT_LAYER_ENABLED,
     INSIGHT_TELEMETRY_ONLY,
     PACK_EXHAUSTION_REVERSAL_ENABLED,
+    PHASE_STATE_ENABLED,
     SOFT_RECO_SCORE_THR,
     SOFT_RECOMMENDATIONS_ENABLED,
     STAGE2_ENABLED,
@@ -806,10 +807,14 @@ MANIPULATION_OBSERVER_ENABLED: bool = True
 # Контракти не змінюємо; лише заповнюємо stats.whale["presence"], якщо воно None.
 WHALE_PRESENCE_STALE_CARRY_FORWARD_ENABLED: bool = True
 
-# Проксі-реекспорт флагів Stage2-lite для зручності імпорту з config
+# Проксі-реекспорт флагів Stage2-lite для зручності імпорту з config.
+# PHASE_STATE_ENABLED_FLAG читається при імпорті Stage2 модулів; щоб
+# ad-hoc runner (tools.run_window) підняв carry-forward без рестарту,
+# встановлюйте обидва значення (`PHASE_STATE_ENABLED` + `_FLAG`).
 STAGE2_ENABLED_FLAG: Final[bool] = STAGE2_ENABLED
 STAGE2_PROFILE_NAME: Final[str] = STAGE2_PROFILE
 EXH_STRATEGY_HINT_ENABLED_FLAG: Final[bool] = EXH_STRATEGY_HINT_ENABLED
+PHASE_STATE_ENABLED_FLAG: Final[bool] = PHASE_STATE_ENABLED
 PACK_EXHAUSTION_REVERSAL_ENABLED_FLAG: Final[bool] = PACK_EXHAUSTION_REVERSAL_ENABLED
 TRAP_COOLDOWN_OVERRIDE_ENABLED_FLAG: Final[bool] = TRAP_COOLDOWN_OVERRIDE_ENABLED
 TRAP_COOLDOWN_OVERRIDE_ENABLED_FLAG: Final[bool] = TRAP_COOLDOWN_OVERRIDE_ENABLED
@@ -945,6 +950,7 @@ __all__ = [
     "STAGE2_PROFILE_NAME",
     "EXH_STRATEGY_HINT_ENABLED_FLAG",
     "PACK_EXHAUSTION_REVERSAL_ENABLED_FLAG",
+    "PHASE_STATE_ENABLED_FLAG",
     "TRAP_COOLDOWN_OVERRIDE_ENABLED_FLAG",
     "STAGE2_INSIGHT",
     "STAGE2_VOLATILITY_REGIME",

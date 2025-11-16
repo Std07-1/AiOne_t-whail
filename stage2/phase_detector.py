@@ -19,6 +19,8 @@ Notes:
 from __future__ import annotations
 
 import logging
+import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -28,9 +30,11 @@ from rich.logging import RichHandler
 
 from config.config import (
     EXH_STRATEGY_HINT_ENABLED_FLAG,
+    HTF_GATES,
     K_CUMULATIVE_DELTA,
     K_DIRECTIONAL_VOLUME_RATIO,
     K_PRICE_SLOPE_ATR,
+    PHASE_STATE_ENABLED_FLAG,
     PROMOTE_REQ,
     STAGE2_LOW_ATR_SYMBOL_GUARDS,
     STAGE2_PRESENCE_PROMOTION_GUARDS,
@@ -41,6 +45,8 @@ from config.config import (
 )
 from config.config_stage2 import PARTICIPATION_LIGHT_THRESHOLDS, STAGE2_PHASE_THRESHOLDS
 from config.flags import FEATURE_PARTICIPATION_LIGHT
+from metrics.phase_metrics import PHASE_PRESENCE_CAP_DELTA, PHASE_REJECT_TOTAL
+from stage2.phase_state import PHASE_STATE_MAX_AGE, SOFT_REASON_CODES, PhaseStateManager
 
 # Деякі суворі конфігурації можуть бути відсутні в мінімальній збірці config;
 # забезпечимо безпечні дефолти, щоб не падати при імпорті.
@@ -66,7 +72,154 @@ if not logger.handlers:  # захист від повторної ініціал
     logger.propagate = False
 
 
+PHASE_STATE_MANAGER = PhaseStateManager()
+
+
 STRATEGY_HINT_EXHAUSTION_REVERSAL = "exhaustion_reversal_long"
+VOLZ_MIN_REASON_THRESHOLD = 0.3
+SLOPE_TREND_THRESHOLD = 0.5
+CD_TREND_THRESHOLD = 0.25
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+    except Exception:
+        return 0
+    return 0
+
+
+def _zones_has_entries(zones: Any) -> bool:
+    if not isinstance(zones, Mapping):
+        return False
+    accum = _coerce_int(zones.get("accum_cnt", zones.get("accum")))
+    dist = _coerce_int(zones.get("dist_cnt", zones.get("dist")))
+    return accum > 0 or dist > 0
+
+
+def _has_valid_zones(
+    stats: Mapping[str, Any] | None, context: Mapping[str, Any] | None
+) -> bool:
+    candidates: list[Any] = []
+    if isinstance(stats, Mapping):
+        candidates.append(stats.get("zones_summary"))
+        whale_stats = stats.get("whale")
+        if isinstance(whale_stats, Mapping):
+            candidates.append(whale_stats.get("zones_summary"))
+    candidates.append(_get(context or {}, "meta", "whale", "zones_summary"))
+    return any(_zones_has_entries(cand) for cand in candidates)
+
+
+def _resolve_trend_label(cd_val: float | None, slope_val: float | None) -> str | None:
+    slope = safe_float(slope_val)
+    cd = safe_float(cd_val)
+    try:
+        if slope is not None and abs(float(slope)) >= SLOPE_TREND_THRESHOLD:
+            return "trend_up" if float(slope) > 0 else "trend_down"
+    except Exception:
+        pass
+    try:
+        if cd is not None and abs(float(cd)) >= CD_TREND_THRESHOLD:
+            return "trend_up" if float(cd) > 0 else "trend_down"
+    except Exception:
+        pass
+    if slope is None and cd is None:
+        return None
+    return "flat"
+
+
+def _htf_gray_threshold() -> float:
+    gates = HTF_GATES if isinstance(HTF_GATES, Mapping) else {}
+    try:
+        return float(gates.get("gray_low", 0.10) or 0.10)
+    except Exception:
+        return 0.10
+
+
+def _phase_reject_reason(
+    *,
+    htf_ok: bool | None,
+    htf_strength: float | None,
+    volz: float | None,
+    trend: str | None,
+    has_zones: bool,
+) -> str:
+    try:
+        if htf_ok is False:
+            htf_gray = _htf_gray_threshold()
+            if htf_strength is not None and float(htf_strength) < htf_gray:
+                return "htf_gray_low"
+            return "htf_not_ok"
+        volz_val = safe_float(volz)
+        if volz_val is None or not math.isfinite(float(volz_val)):
+            return "volz_missing"
+        if abs(float(volz_val)) < VOLZ_MIN_REASON_THRESHOLD:
+            return "volz_too_low"
+        if not has_zones:
+            return "no_zones"
+        if trend in {None, "", "flat", "range", "unknown", "neutral"}:
+            return "trend_weak"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _fmt_float(value: Any, precision: int = 3) -> str:
+    try:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.{precision}f}"
+    except Exception:
+        return "na"
+    return "na"
+
+
+def _record_phase_reject(
+    stats_obj: Any,
+    *,
+    symbol: str,
+    symbol_upper: str,
+    reason: str,
+    ts: Any | None = None,
+    scenario: str | None = None,
+    presence: float | None = None,
+    bias: float | None = None,
+    rr: float | None = None,
+    gates: str | None = None,
+) -> None:
+    try:
+        if isinstance(stats_obj, dict):
+            dbg = stats_obj.setdefault("phase_debug", {})  # type: ignore[assignment]
+        else:
+            dbg = None
+        if isinstance(dbg, dict):
+            dbg["reason"] = reason
+    except Exception:
+        pass
+    try:
+        logger.info(
+            (
+                "[STRICT_PHASE_REASON] symbol=%s ts=%s phase=None scenario=%s "
+                "reasons=%s presence=%s bias=%s rr=%s gates=%s"
+            ),
+            symbol,
+            ts if ts is not None else "na",
+            scenario if scenario is not None else "na",
+            reason,
+            _fmt_float(presence),
+            _fmt_float(bias),
+            _fmt_float(rr),
+            gates or "na",
+        )
+    except Exception:
+        pass
+    counter = PHASE_REJECT_TOTAL
+    if counter is None:
+        return
+    try:
+        counter.labels(symbol=symbol_upper, reason=reason).inc()
+    except Exception:
+        pass
 
 
 @dataclass
@@ -82,6 +235,7 @@ class PhaseResult:
     profile: str | None = None
     strategy_hint: str | None = None
     threshold_tag: str | None = None
+    debug: dict[str, Any] | None = None
 
 
 def _get(ctx: Mapping[str, Any], *path: str) -> Any:
@@ -91,6 +245,137 @@ def _get(ctx: Mapping[str, Any], *path: str) -> Any:
             return None
         cur = cur.get(key)
     return cur
+
+
+def _resolve_granularity(
+    stats: Mapping[str, Any] | None, context: Mapping[str, Any] | None
+) -> str:
+    candidates = [
+        (stats or {}).get("granularity") if isinstance(stats, Mapping) else None,
+        (stats or {}).get("interval") if isinstance(stats, Mapping) else None,
+        (stats or {}).get("tf") if isinstance(stats, Mapping) else None,
+        (context or {}).get("granularity") if isinstance(context, Mapping) else None,
+        _get(context or {}, "meta", "granularity"),
+        _get(context or {}, "meta", "interval"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return "1m"
+
+
+def _maybe_update_phase_state(
+    *,
+    stats_obj: dict[str, Any],
+    symbol: str,
+    granularity: str,
+    raw_phase: str | None,
+    raw_score: float | None,
+    phase_reason: str | None,
+    whale_presence: float | None,
+    whale_bias: float | None,
+    htf_strength: float | None,
+    now_ts: float | int | str | None,
+) -> None:
+    manager = PHASE_STATE_MANAGER
+    if manager is None:
+        return
+    try:
+        state = manager.update_from_detector(
+            symbol=symbol,
+            granularity=granularity,
+            raw_phase=raw_phase,
+            raw_score=raw_score,
+            phase_reason=phase_reason,
+            whale_presence=whale_presence,
+            whale_bias=whale_bias,
+            htf_strength=htf_strength,
+            now_ts=now_ts if now_ts is not None else time.time(),
+        )
+    except Exception:
+        return
+    try:
+        stats_obj["phase_state"] = state.to_dict()
+    except Exception:
+        stats_obj["phase_state"] = {
+            "current_phase": state.current_phase,
+            "phase_score": state.phase_score,
+            "age_s": state.age_s,
+            "last_reason": state.last_reason,
+        }
+    try:
+        logger.debug(
+            (
+                "[PHASE_STATE_UPDATE] symbol=%s enabled=%s raw_phase=%s "
+                "current_phase=%s age_s=%.1f reason=%s"
+            ),
+            symbol,
+            PHASE_STATE_ENABLED_FLAG,
+            raw_phase,
+            state.current_phase,
+            float(state.age_s or 0.0),
+            state.last_reason,
+        )
+    except Exception:
+        pass
+
+
+def _apply_phase_state_effective(
+    *,
+    result: PhaseResult,
+    stats_obj: Mapping[str, Any],
+    symbol: str,
+    raw_phase: str | None,
+    raw_score: float,
+) -> tuple[bool, dict[str, Any] | None]:
+    if not PHASE_STATE_ENABLED_FLAG:
+        return False, None
+    if raw_phase is not None:
+        return False, None
+    if not isinstance(stats_obj, Mapping):
+        return False, None
+    state_payload = stats_obj.get("phase_state")
+    if not isinstance(state_payload, Mapping):
+        return False, None
+    current_phase = state_payload.get("current_phase")
+    if not current_phase:
+        return False, None
+    last_reason_raw = state_payload.get("last_reason")
+    last_reason = (
+        (str(last_reason_raw).strip().lower() or None) if last_reason_raw else None
+    )
+    if last_reason not in SOFT_REASON_CODES:
+        return False, None
+    age_val = safe_float(state_payload.get("age_s")) or 0.0
+    if age_val >= PHASE_STATE_MAX_AGE:
+        return False, None
+    state_score = safe_float(state_payload.get("phase_score"))
+    effective_score = (
+        float(state_score)
+        if state_score is not None and math.isfinite(float(state_score))
+        else raw_score
+    )
+    result.phase = str(current_phase)
+    result.score = effective_score
+    dbg = dict(result.debug or {})
+    phase_dbg = dict(dbg.get("phase_state", {}))
+    phase_dbg.update(
+        {
+            "raw_phase": raw_phase,
+            "effective_phase": result.phase,
+            "carry_reason": last_reason,
+            "age_s": age_val,
+        }
+    )
+    dbg["phase_state"] = phase_dbg
+    result.debug = dbg
+    return True, {
+        "phase": result.phase,
+        "age_s": age_val,
+        "reason": last_reason,
+        "score": effective_score,
+        "symbol": symbol,
+    }
 
 
 def _apply_phase_postprocessors(
@@ -167,11 +452,31 @@ def detect_phase(
         - Розглянути експериментальну політику для volz_source == "proxy" (зараз воно відсікає exhaustion/false_breakout).
     """
     stats = stats or {}
+    if not isinstance(stats, dict):
+        try:
+            stats = dict(stats)
+        except Exception:
+            stats = {}
     ctx = context or {}
-
-    # Ідентифікатор інструменту для логування (не критично для логіки)
     symbol = _get(ctx, "symbol") or stats.get("symbol") or "unknown"
+    symbol = str(symbol)
+    symbol_upper = symbol.upper()
+    granularity = _resolve_granularity(stats, ctx)
+    scenario_name = (
+        _get(ctx, "meta", "scenario_active")
+        or _get(ctx, "meta", "scenario_hint")
+        or _get(ctx, "meta", "scenario")
+    )
+    bar_ts = (
+        stats.get("ts")
+        or stats.get("timestamp")
+        or stats.get("bar_ts")
+        or _get(ctx, "timestamp")
+        or _get(ctx, "meta", "ts")
+    )
     logger.info("Початок детекції фази для %s", symbol)
+
+    has_valid_zones = _has_valid_zones(stats, ctx)
 
     strict_profile_active = bool(STAGE2_PROFILE == "strict" and STRICT_PROFILE_ENABLED)
     profile_tag = "strict" if strict_profile_active else "legacy"
@@ -237,6 +542,7 @@ def detect_phase(
     dvr = safe_float(_get(ctx, "directional", K_DIRECTIONAL_VOLUME_RATIO))
     cd = safe_float(_get(ctx, "directional", K_CUMULATIVE_DELTA))
     slope_atr = safe_float(_get(ctx, "directional", K_PRICE_SLOPE_ATR))
+    trend_label = _resolve_trend_label(cd, slope_atr)
 
     # Volz: намагаємось взяти "light" версію, якщо її немає — fallback на "raw"
     volz_v1 = safe_float(stats.get("volume_z_light"))
@@ -291,6 +597,12 @@ def detect_phase(
     vwap_dev_whale = safe_float(whale_ctx.get("vwap_deviation"))
     whale_presence = safe_float(whale_ctx.get("presence_score"))
     whale_bias = safe_float(whale_ctx.get("whale_bias"))
+    rr_snapshot = safe_float(
+        stats.get("rr_ratio")
+        or stats.get("rr_score")
+        or stats.get("risk_reward")
+        or stats.get("rr")
+    )
     dominance_up_flag = bool(whale_ctx.get("dominance_up"))
     dominance_down_flag = bool(whale_ctx.get("dominance_down"))
     dominance_up_source = whale_ctx.get("dominance_up_source")
@@ -298,7 +610,6 @@ def detect_phase(
     dominance_alt_hits = safe_float(whale_ctx.get("dominance_alt_hits"))
     dominance_alt_ready = bool(whale_ctx.get("dominance_alt_ready"))
 
-    symbol_upper = str(symbol).upper() if isinstance(symbol, str) else str(symbol)
     guard_cfg = dict(STAGE2_PRESENCE_PROMOTION_GUARDS or {})
     try:
         min_bias_abs = float(guard_cfg.get("min_bias_abs", 0.15) or 0.15)
@@ -334,6 +645,55 @@ def detect_phase(
         float(htf_strength) if isinstance(htf_strength, (int, float)) else None
     )
 
+    def _finalize_result(
+        result: PhaseResult, reason_override: str | None = None
+    ) -> PhaseResult:
+        raw_phase = result.phase
+        raw_score = result.score
+        if isinstance(stats, dict):
+            _maybe_update_phase_state(
+                stats_obj=stats,
+                symbol=str(symbol),
+                granularity=granularity,
+                raw_phase=result.phase,
+                raw_score=result.score,
+                phase_reason=reason_override,
+                whale_presence=whale_presence,
+                whale_bias=whale_bias,
+                htf_strength=htf_strength_val,
+                now_ts=bar_ts,
+            )
+            if PHASE_STATE_ENABLED_FLAG:
+                try:
+                    dbg = stats.setdefault("phase_debug", {})  # type: ignore[assignment]
+                    if isinstance(dbg, dict):
+                        dbg["phase_raw"] = raw_phase
+                except Exception:
+                    pass
+            applied, info = _apply_phase_state_effective(
+                result=result,
+                stats_obj=stats,
+                symbol=str(symbol),
+                raw_phase=raw_phase,
+                raw_score=raw_score,
+            )
+            if applied and info is not None:
+                try:
+                    logger.info(
+                        (
+                            "[PHASE_STATE_CARRY] symbol=%s phase_raw=%s phase=%s "
+                            "age_s=%.1f reason=%s"
+                        ),
+                        info.get("symbol"),
+                        raw_phase,
+                        info.get("phase"),
+                        float(info.get("age_s", 0.0)),
+                        info.get("reason"),
+                    )
+                except Exception:
+                    pass
+        return result
+
     bias_ok = bias_val is not None and abs(bias_val) >= min_bias_abs
     htf_strength_ok = (
         htf_strength_val is not None and htf_strength_val >= min_htf_strength
@@ -348,6 +708,7 @@ def detect_phase(
         and not (bias_ok and htf_strength_ok)
     ):
         guard_notes.append("presence_cap_no_bias_htf")
+        pres_before = float(presence_val)
         capped_presence = float(min(presence_val, cap_without_confirm))
         try:
             logger.info(
@@ -360,10 +721,39 @@ def detect_phase(
             )
         except Exception:
             pass
+        try:
+            logger.info(
+                "[STRICT_GUARD_PRES_CAP] symbol=%s before=%.3f after=%.3f htf_ok=%s htf_strength=%.3f",
+                symbol,
+                pres_before,
+                capped_presence,
+                bool(htf_ok),
+                htf_strength_val if htf_strength_val is not None else float("nan"),
+            )
+        except Exception:
+            pass
+        try:
+            dbg = stats.setdefault("phase_debug", {})  # type: ignore[assignment]
+            dbg["presence_cap_guard"] = {
+                "guard": "presence_cap_no_bias_htf",
+                "before": float(pres_before),
+                "after": float(capped_presence),
+                "htf_ok": bool(htf_ok),
+                "htf_strength": (
+                    float(htf_strength_val) if htf_strength_val is not None else None
+                ),
+            }
+        except Exception:
+            pass
         whale_presence = capped_presence
         if isinstance(whale_ctx, dict):
             whale_ctx["presence_score"] = capped_presence
         presence_val = capped_presence
+        if pres_before > capped_presence:
+            try:
+                PHASE_PRESENCE_CAP_DELTA.labels(symbol=symbol_upper).inc()
+            except Exception:
+                pass
 
     try:
         min_presence_open = float(
@@ -657,7 +1047,32 @@ def detect_phase(
     except Exception:
         overlay_o = None
 
+    def _missing_fields_count() -> int:
+        return sum(
+            1
+            for v in (
+                band_pct,
+                dvr,
+                cd,
+                slope_atr,
+                volz_v1 if volz_proxy_used else volz,
+                rsi,
+                atr_pct,
+            )
+            if v is None
+        )
+
     if guard_block:
+        debug_payload = {
+            "reject_stage": "guard_block",
+            "guard_notes": list(guard_notes),
+            "presence": presence_val,
+            "bias": bias_val,
+            "htf_strength": htf_strength_val,
+            "atr_pct": float(atr_pct) if isinstance(atr_pct, (int, float)) else None,
+            "missing_fields": _missing_fields_count(),
+            "low_atr_override_active": bool(low_atr_override_active),
+        }
         if guard_notes:
             reasons.extend(guard_notes)
         try:
@@ -686,6 +1101,7 @@ def detect_phase(
                 overlay_o,
                 profile=profile_tag,
                 threshold_tag=threshold_tag,
+                debug=debug_payload,
             ),
             locals(),
             str(symbol),
@@ -739,15 +1155,17 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "impulse_down",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "impulse_down",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     if (
@@ -778,15 +1196,17 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "impulse_up",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "impulse_up",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # -------------------------
@@ -963,16 +1383,18 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "exhaustion",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            strategy_hint=strategy_hint,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "exhaustion",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                strategy_hint=strategy_hint,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # Заборона для proxy-джерела: не повертаємо exhaustion при volz_source='proxy'
@@ -995,15 +1417,17 @@ def detect_phase(
             reasons,
         )
         # Повертаємо без overlay — нижче додамо універсальний блок overlay перед фінальним return
-        return PhaseResult(
-            "exhaustion",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "exhaustion",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # -------------------------
@@ -1035,15 +1459,17 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "false_breakout",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "false_breakout",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # -------------------------
@@ -1085,15 +1511,17 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "momentum",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "momentum",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # -------------------------
@@ -1157,15 +1585,17 @@ def detect_phase(
                 score,
                 reasons,
             )
-            return PhaseResult(
-                "drift_trend",
-                score,
-                reasons,
-                volz_source,
-                proxy_components,
-                overlay_o,
-                profile=profile_tag,
-                threshold_tag=threshold_tag,
+            return _finalize_result(
+                PhaseResult(
+                    "drift_trend",
+                    score,
+                    reasons,
+                    volz_source,
+                    proxy_components,
+                    overlay_o,
+                    profile=profile_tag,
+                    threshold_tag=threshold_tag,
+                )
             )
 
     # -------------------------
@@ -1251,15 +1681,17 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "post_breakout",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "post_breakout",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # 4b) Post-breakdown — симетрія до post_breakout, але для ведмежого ретесту вниз
@@ -1289,15 +1721,17 @@ def detect_phase(
             score,
             reasons,
         )
-        return PhaseResult(
-            "post_breakdown",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "post_breakdown",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # -------------------------
@@ -1493,34 +1927,24 @@ def detect_phase(
             )
         except Exception:
             pass
-        return PhaseResult(
-            "pre_breakout",
-            score,
-            reasons,
-            volz_source,
-            proxy_components,
-            overlay_o,
-            profile=profile_tag,
-            threshold_tag=threshold_tag,
+        return _finalize_result(
+            PhaseResult(
+                "pre_breakout",
+                score,
+                reasons,
+                volz_source,
+                proxy_components,
+                overlay_o,
+                profile=profile_tag,
+                threshold_tag=threshold_tag,
+            )
         )
 
     # -------------------------
     # Нічого не підходить — повертаємо None (консервативний підхід)
     # -------------------------
     # Рахуємо кількість відсутніх полів для діагностики/логування
-    missing = sum(
-        1
-        for v in (
-            band_pct,
-            dvr,
-            cd,
-            slope_atr,
-            volz_v1 if volz_proxy_used else volz,
-            rsi,
-            atr_pct,
-        )
-        if v is None
-    )
+    missing = _missing_fields_count()
     if not reasons:
         logger.info(
             "Не виявлено фази для %s — недостатньо сигналів (missing_fields=%d).",
@@ -1535,12 +1959,52 @@ def detect_phase(
             missing,
         )
 
+    reject_reason = "insufficient_features" if not reasons else "no_rule_match"
+    if isinstance(htf_ok, bool) and htf_ok is False:
+        reject_reason = "htf_gate"
+
+    volz_reason_val = volz_eff if volz_eff is not None else volz
+    reject_reason_code = _phase_reject_reason(
+        htf_ok=bool(htf_ok) if isinstance(htf_ok, bool) else None,
+        htf_strength=htf_strength_val,
+        volz=volz_reason_val,
+        trend=trend_label,
+        has_zones=has_valid_zones,
+    )
+    _record_phase_reject(
+        stats,
+        symbol=symbol,
+        symbol_upper=symbol_upper,
+        reason=reject_reason_code,
+        ts=bar_ts,
+        scenario=(
+            scenario_name if isinstance(scenario_name, str) and scenario_name else None
+        ),
+        presence=(
+            float(whale_presence) if isinstance(whale_presence, (int, float)) else None
+        ),
+        bias=(float(whale_bias) if isinstance(whale_bias, (int, float)) else None),
+        rr=rr_snapshot,
+        gates="+".join(guard_notes) if guard_notes else None,
+    )
+
+    debug_payload = {
+        "missing_fields": missing,
+        "reason_codes": list(reasons),
+        "guard_notes": list(guard_notes),
+        "htf_ok": bool(htf_ok) if isinstance(htf_ok, bool) else None,
+        "htf_strength": htf_strength_val,
+        "low_atr_override_active": bool(low_atr_override_active),
+        "reject_stage": reject_reason,
+        "phase_reject_reason": reject_reason_code,
+    }
+
     # TODO: додати telemetry/metrics: counters для кожного типу невизначеності (missing_fields>n)
     # TODO: посилити логування proxy_components для post-mortem аналізу
     # TODO: інтеграційний тест: перевірити, що volz_source=='proxy' не веде до exhaustion/false_breakout
 
     # Універсальний телеметрійний overlay для Market Insight (Phase 1.5)
-    return _apply_phase_postprocessors(
+    result = _apply_phase_postprocessors(
         PhaseResult(
             None,
             0.0,
@@ -1550,7 +2014,9 @@ def detect_phase(
             overlay_o,
             profile=profile_tag,
             threshold_tag=threshold_tag,
+            debug=debug_payload,
         ),
         locals(),
         str(symbol),
     )
+    return _finalize_result(result, reject_reason_code)

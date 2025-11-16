@@ -15,6 +15,7 @@ from process_asset_batch.global_state import (
     _ACCUM_MONITOR_STATE,
     _DVR_EMA_STATE,
     _PROM_PRES_LAST_TS,
+    _SCEN_EXPLAIN_BATCH_COUNTER,
     _SCEN_EXPLAIN_FORCE_ALL,
     _SCEN_EXPLAIN_LAST_TS,
 )
@@ -147,20 +148,67 @@ async def write_profile_cooldown(
         return
 
 
-def explain_should_log(symbol: str, now_ts: float, min_period_s: float = 10.0) -> bool:
-    """Чи варто логувати [SCEN_EXPLAIN] зараз для символу.
+def explain_should_log(
+    symbol: str,
+    now_ts: float,
+    min_period_s: float = 10.0,
+    *,
+    every_n: int | None = None,
+    force_all: bool | None = None,
+) -> bool:
+    """Рейт-ліміт для explain-логів із опцією «кожен N-й батч».
 
-    Повертає True, якщо минуло ≥ ``min_period_s`` від останнього логування для
-    ``symbol``. Окремо в коді також логуватимемо кожен N-й батч (тонкий слід).
+    Args:
+        symbol: символ, для якого відстежуємо ка́денс.
+        now_ts: поточний timestamp (sec).
+        min_period_s: базовий мін-інтервал між explain-рядками.
+        every_n: якщо >0 — додатково дозволяє логувати кожен N-й батч, навіть
+            якщо min_period ще не минув (тонкий heartbeat).
+        force_all: явний оверрайд (True → логувати завжди, False → ігнорувати
+            глобальний `_SCEN_EXPLAIN_FORCE_ALL`).
     """
-    # У режимі офлайн‑реплею або за явним оверрайдом — логувати завжди
-    if _SCEN_EXPLAIN_FORCE_ALL:
-        return True
+
+    sym = str(symbol or "").lower()
+
+    def _reset_counter() -> None:
+        _SCEN_EXPLAIN_BATCH_COUNTER[sym] = 0
+
     try:
-        last = float(_SCEN_EXPLAIN_LAST_TS.get(symbol.lower()) or 0.0)
+        suppressed = int(_SCEN_EXPLAIN_BATCH_COUNTER.get(sym, 0) or 0)
+    except Exception:
+        suppressed = 0
+
+    try:
+        now_val = float(now_ts)
+    except Exception:
+        now_val = time.time()
+    min_period = max(0.0, float(min_period_s or 0.0))
+    effective_force = _SCEN_EXPLAIN_FORCE_ALL if force_all is None else bool(force_all)
+
+    def _commit_log() -> bool:
+        _SCEN_EXPLAIN_LAST_TS[sym] = now_val
+        _reset_counter()
+        return True
+
+    if effective_force:
+        return _commit_log()
+
+    had_last = sym in _SCEN_EXPLAIN_LAST_TS
+    try:
+        last = float(_SCEN_EXPLAIN_LAST_TS.get(sym) or 0.0)
     except Exception:
         last = 0.0
-    return bool((now_ts - last) >= float(min_period_s))
+    if not had_last:
+        return _commit_log()
+    if (now_val - last) >= min_period:
+        return _commit_log()
+
+    suppressed += 1
+    _SCEN_EXPLAIN_BATCH_COUNTER[sym] = suppressed
+    every = int(every_n or 0)
+    if every > 0 and suppressed % every == 0:
+        return _commit_log()
+    return False
 
 
 def normalize_and_cap_dvr(
@@ -491,13 +539,15 @@ def flag_htf_enabled(default: bool = False) -> bool:
 
 
 def _explain_should_log(symbol: str, now_ts: float, min_period_s: float = 10.0) -> bool:
-    """Спрощена версія для тестів: ігнорує глобальний force_all прапор."""
+    """Спрощена версія для тестів: примусово force_all=False."""
 
-    try:
-        last = float(_SCEN_EXPLAIN_LAST_TS.get(symbol.lower()) or 0.0)
-    except Exception:
-        last = 0.0
-    return bool((now_ts - last) >= float(min_period_s))
+    return explain_should_log(
+        symbol,
+        now_ts,
+        min_period_s=min_period_s,
+        every_n=None,
+        force_all=False,
+    )
 
 
 _should_confirm_pre_breakout = should_confirm_pre_breakout

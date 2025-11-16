@@ -41,6 +41,10 @@ VOLZ_PROXY_ALLOWED_FOR_EXHAUSTION: bool = True
 STAGE3_MIN_WHALE_SIGNAL_ENABLED: bool = True
 # Stage3 паперовий раннер (без реальних угод)
 STAGE3_PAPER_ENABLED: bool = True
+# Stage3: читання китової телеметрії через нормалізований view (rollback-friendly)
+WHALE_MIN_SIGNAL_VIEW_ENABLED: bool = True
+# Stage3: експериментальний розрахунок whale min-signal через v1 модуль
+WHALE_MINSIGNAL_V1_ENABLED: bool = False
 
 # Якщо True — позначаємо stats.vol_z_source="proxy" (коли ввімкнено проксі‑агрегацію).
 # За замовчуванням False, Stage1 виставляє "real".
@@ -75,6 +79,12 @@ STAGE2_HINT_ENABLED: bool = True
 # STAGE2_SIGNAL_V2_ENABLED — флаг для формування "signal_v2" у stats (телеметрія‑only):
 # невтручальний роутер на базі whale+phase/Directional метрик. Не змінює K_SIGNAL.
 STAGE2_SIGNAL_V2_ENABLED: bool = True
+
+# PhaseState v2 (Stage2 memory layer) — наразі лише телеметрія.
+# CLI/runner-и за замовчуванням виставляють саме цей прапор; Stage2
+# використовує реекспорт `PHASE_STATE_ENABLED_FLAG` у `config/config.py`, тож
+# для ручних QA-запусків найпростіше задавати обидва значення одночасно.
+PHASE_STATE_ENABLED: bool = True
 
 # Кризовий хінт стратегії для short-exhaustion (телеметрія → Stage3 профіль)
 EXH_STRATEGY_HINT_ENABLED: bool = True
@@ -296,6 +306,9 @@ __all__ = [
     "STAGE2_HINT_ENABLED",
     "STAGE3_MIN_WHALE_SIGNAL_ENABLED",
     "STAGE3_PAPER_ENABLED",
+    "WHALE_MIN_SIGNAL_VIEW_ENABLED",
+    "WHALE_MINSIGNAL_V1_ENABLED",
+    "PHASE_STATE_ENABLED",
     "EXH_STRATEGY_HINT_ENABLED",
     "INSIGHT_TELEMETRY_ONLY",
     "UI_WHALE_PUBLISH_ENABLED",

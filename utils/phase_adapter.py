@@ -29,6 +29,40 @@ from config.config import (
 from stage2.phase_detector import detect_phase as _detect_phase
 from utils.utils import safe_float, safe_number
 
+
+def _build_phase_state_hint(raw: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Повертає стиснутий phase_state_hint для market_context/meta."""
+
+    if not isinstance(raw, Mapping):
+        return None
+    phase_val = raw.get("current_phase") or raw.get("last_detected_phase")
+    phase = str(phase_val).strip() if isinstance(phase_val, str) else None
+    age_s = safe_float(raw.get("age_s"))
+    score = safe_float(raw.get("phase_score"))
+    reason = raw.get("last_reason")
+    presence = safe_float(raw.get("last_whale_presence"))
+    bias = safe_float(raw.get("last_whale_bias"))
+    htf_strength = safe_float(raw.get("last_htf_strength"))
+    updated_ts = safe_float(raw.get("updated_ts"))
+    if phase is None and age_s is None and score is None:
+        return None
+    hint: dict[str, Any] = {
+        "phase": phase,
+        "age_s": age_s,
+        "score": score,
+        "reason": reason,
+    }
+    if presence is not None:
+        hint["presence"] = presence
+    if bias is not None:
+        hint["bias"] = bias
+    if htf_strength is not None:
+        hint["htf_strength"] = htf_strength
+    if updated_ts is not None:
+        hint["updated_ts"] = updated_ts
+    return hint
+
+
 try:
     from config import config as _cfg  # type: ignore
 except Exception:  # pragma: no cover - fallback на дефолтні значення
@@ -70,10 +104,30 @@ def build_phase_context_from_stats(
     slope_atr = stats.get(K_PRICE_SLOPE_ATR)
 
     # Whale telemetry: best-effort, якщо вже вбудовано у stats.whale (наприклад у screening_producer)
-    whale = stats.get("whale") if isinstance(stats.get("whale"), dict) else {}
-    vwap_dev = whale.get("vwap_dev") if isinstance(whale, dict) else None
-    presence = whale.get("presence") if isinstance(whale, dict) else None
-    bias = whale.get("bias") if isinstance(whale, dict) else None
+    whale_raw = stats.get("whale")
+    whale = whale_raw if isinstance(whale_raw, Mapping) else {}
+    vwap_dev = whale.get("vwap_dev") if isinstance(whale, Mapping) else None
+    presence = whale.get("presence") if isinstance(whale, Mapping) else None
+    bias = whale.get("bias") if isinstance(whale, Mapping) else None
+
+    def _normalize_zones_summary(source: Any) -> dict[str, int] | None:
+        if not isinstance(source, Mapping):
+            return None
+        try:
+            accum_raw = source.get("accum_cnt", source.get("accum", 0))
+            dist_raw = source.get("dist_cnt", source.get("dist", 0))
+            accum_cnt = int(accum_raw) if isinstance(accum_raw, (int, float)) else 0
+            dist_cnt = int(dist_raw) if isinstance(dist_raw, (int, float)) else 0
+        except Exception:
+            return None
+        return {"accum_cnt": accum_cnt, "dist_cnt": dist_cnt}
+
+    zones_source = whale.get("zones_summary") if isinstance(whale, Mapping) else None
+    if zones_source is None:
+        extra_zones = stats.get("zones_summary")
+        if isinstance(extra_zones, Mapping):
+            zones_source = extra_zones
+    zones_summary = _normalize_zones_summary(zones_source)
 
     # Trap блок: phase_detector очікує meta.trap.trap_score
     trap = stats.get("trap") if isinstance(stats.get("trap"), dict) else None
@@ -166,6 +220,14 @@ def build_phase_context_from_stats(
         if reason_val is not None:
             volatility_meta["crisis_reason"] = reason_val
 
+    whale_meta = {
+        "vwap_deviation": safe_float(vwap_dev),
+        "presence_score": safe_float(presence),
+        "whale_bias": safe_float(bias),
+    }
+    if zones_summary is not None:
+        whale_meta["zones_summary"] = zones_summary
+
     ctx: dict[str, Any] = {
         "symbol": symbol,
         "key_levels_meta": {
@@ -184,11 +246,7 @@ def build_phase_context_from_stats(
             "low_gate_effective": safe_float(low_gate_effective),
             "trap": trap_meta if trap_meta else {},
             "volatility": volatility_meta if volatility_meta else {},
-            "whale": {
-                "vwap_deviation": safe_float(vwap_dev),
-                "presence_score": safe_float(presence),
-                "whale_bias": safe_float(bias),
-            },
+            "whale": whale_meta,
         },
         "directional": {
             K_DIRECTIONAL_VOLUME_RATIO: safe_float(dvr),
@@ -265,6 +323,7 @@ def detect_phase_from_stats(
     )
 
     res = _detect_phase(phase_stats, ctx)
+    phase_state_hint = _build_phase_state_hint(phase_stats.get("phase_state"))
     if res is None:
         logger.debug(
             "[STRICT_PHASE] detect_phase_from_stats | symbol=%s phase=None (детектор не повернув результат)",
@@ -272,6 +331,7 @@ def detect_phase_from_stats(
         )
         return None
     _meta = ctx.get("meta", {}) if isinstance(ctx, dict) else {}
+    htf_gate_reason: str | None = None
     _htf_ok = _meta.get("htf_ok") if isinstance(_meta, dict) else None
     _htf_score = _meta.get("htf_score") if isinstance(_meta, dict) else None
     _htf_strength = _meta.get("htf_strength") if isinstance(_meta, dict) else None
@@ -299,7 +359,9 @@ def detect_phase_from_stats(
         if htf_strength_val < htf_gray_thr:
             if isinstance(_meta, dict):
                 _meta["htf_ok"] = False
+                _meta["htf_gate_reason"] = "gray_low"
             _htf_ok = False
+            htf_gate_reason = "gray_low"
             try:
                 logger.info(
                     "[HTF] symbol=%s ok=False reason=gray_low strength=%.4f thr=%.4f",
@@ -349,7 +411,9 @@ def detect_phase_from_stats(
     ):
         if isinstance(_meta, dict):
             _meta["htf_ok"] = False
+            _meta["htf_gate_reason"] = "stale"
         _htf_ok = False
+        htf_gate_reason = "stale"
         try:
             logger.info(
                 "[HTF] symbol=%s ok=False reason=stale htf_stale_ms=%.0f limit_ms=%.0f",
@@ -372,6 +436,34 @@ def detect_phase_from_stats(
         float(_htf_score) if _htf_score is not None else float("nan"),
         float(_htf_strength) if _htf_strength is not None else float("nan"),
     )
+    diag_phase: dict[str, Any] | None = None
+    res_debug = getattr(res, "debug", None)
+    if isinstance(res_debug, Mapping):
+        diag_phase = {
+            "missing_fields": res_debug.get("missing_fields"),
+            "reason_codes": list(res_debug.get("reason_codes", [])),
+            "guard_notes": list(res_debug.get("guard_notes", [])),
+            "reject_stage": res_debug.get("reject_stage"),
+            "low_atr_override_active": res_debug.get("low_atr_override_active"),
+        }
+    diagnostics = {
+        "htf": {
+            "ok": bool(_htf_ok) if isinstance(_htf_ok, bool) else None,
+            "score": safe_float(_htf_score),
+            "strength": htf_strength_val,
+            "gate_reason": (
+                htf_gate_reason
+                or (
+                    _meta.get("htf_gate_reason") if isinstance(_meta, Mapping) else None
+                )
+            ),
+            "stale_ms": htf_stale_ms,
+            "stale_limit_ms": htf_stale_limit,
+        }
+    }
+    if diag_phase:
+        diagnostics["phase_detector"] = diag_phase
+
     return {
         "name": res.phase,
         "score": float(res.score or 0.0),
@@ -381,6 +473,8 @@ def detect_phase_from_stats(
         "profile": res.profile,
         "threshold_tag": res.threshold_tag,
         "strategy_hint": res.strategy_hint,
+        "phase_state_hint": phase_state_hint,
+        "diagnostics": diagnostics,
     }
 
 

@@ -34,8 +34,11 @@ from config.config import (
     STAGE3_TRADE_PARAMS,
     get_stage3_param,
 )
+from config.flags import WHALE_MIN_SIGNAL_VIEW_ENABLED, WHALE_MINSIGNAL_V1_ENABLED
 from metrics.whale_min_signal_metrics import inc_exit, inc_open
 from monitoring.telemetry_sink import log_stage3_event
+from stage3.whale_min_signal_view import whale_min_signal_view
+from stage3.whale_signal_v1 import compute_whale_min_signal
 from utils.utils import safe_float
 
 # ── Logger ───────────────────────────────────────────────────────────────────
@@ -105,6 +108,9 @@ def _load_trade_policy() -> TradePolicy:
 
 
 TRADE_POLICY = _load_trade_policy()
+
+# Мінімальна допустима впевненість v1-сигналу перед закриттям позиції.
+_MINSIGNAL_V1_CONF_MIN = 0.45
 
 
 # ── Паперові позиції мінімального сигналу ────────────────────────────────────
@@ -788,8 +794,12 @@ class TradeLifecycleManager:
             position.time_exit_s > 0
             and (now_ts - position.opened_ts) >= position.time_exit_s
         ):
-            self._close_min_signal_position(symbol, "time_exit")
-            return
+            self._seed_entry_metrics(position, position.last_snapshot, asset)
+
+            if WHALE_MINSIGNAL_V1_ENABLED:
+                # Тимчасовий v1-гейт: вимикається фіче-флагом для експериментів/forward.
+                if not self._enforce_whale_signal_v1(symbol, position, asset):
+                    return
 
         if not position.last_snapshot:
             return
@@ -835,6 +845,65 @@ class TradeLifecycleManager:
             sl_fmt,
         )
 
+    def _enforce_whale_signal_v1(
+        self,
+        symbol: str,
+        position: MinSignalPaperPosition,
+        asset: Mapping[str, Any] | None,
+    ) -> bool:
+        """
+        Повертає True, якщо позицію можна тримати згідно з v1-гейтами.
+
+        Ланцюг виклику та умови:
+        • спрацьовує лише після того, як Stage2/Phase pipeline зафіксував валідну
+            фазу/сценарій і записав snapshot у `last_min_signal_accept` (саме цей
+            snapshot зберігається в `position.last_snapshot`);
+        • якщо `phase=None` / кандидат не побудований, Stage2 не виставляє
+            `last_min_signal_accept`, `_evaluate_min_signal_position` не має даних і
+            не викликає `_enforce_whale_signal_v1`, тому в логах немає її маркерів;
+        • фіче-флаг `WHALE_MINSIGNAL_V1_ENABLED` керує тільки виконанням цієї
+            перевірки, всі попередні гейти (фаза, сценарій, ризик) відбуваються
+            незалежно від нього.
+        """
+
+        snapshot = position.last_snapshot
+        whale_signal = snapshot.get("whale_signal_v1")
+        whale_view = snapshot.get("whale_view")
+
+        stats = asset.get("stats") if isinstance(asset, Mapping) else None
+        if (not isinstance(whale_view, Mapping)) and isinstance(stats, Mapping):
+            whale_view = whale_min_signal_view(stats)
+            snapshot["whale_view"] = whale_view
+
+        if (not isinstance(whale_signal, Mapping)) and isinstance(whale_view, Mapping):
+            whale_signal = compute_whale_min_signal(whale_view)
+            snapshot["whale_signal_v1"] = whale_signal
+
+        if not isinstance(whale_signal, Mapping):
+            return True
+
+        if not whale_signal.get("enabled", False):
+            self._close_min_signal_position(symbol, "v1_disabled")
+            return False
+
+        direction = whale_signal.get("direction")
+        if direction not in {"long", "short"}:
+            self._close_min_signal_position(symbol, "v1_direction_unknown")
+            return False
+
+        if (direction == "long" and position.side != "long") or (
+            direction == "short" and position.side != "short"
+        ):
+            self._close_min_signal_position(symbol, "v1_direction_mismatch")
+            return False
+
+        conf_val = safe_float(whale_signal.get("confidence"))
+        if conf_val is not None and conf_val < _MINSIGNAL_V1_CONF_MIN:
+            self._close_min_signal_position(symbol, "v1_confidence_drop")
+            return False
+
+        return True
+
     @staticmethod
     def _normalize_snapshot(snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
         if not isinstance(snapshot, Mapping):
@@ -858,7 +927,22 @@ class TradeLifecycleManager:
         if not isinstance(stats, Mapping):
             return {}
         snapshot: dict[str, Any] = {}
-        for key in ("presence", "bias", "dvr", "vwap_dev", "band_pct"):
+        # Whale view adapter: читаємо китову телеметрію через нормалізований
+        # зріз, але залишаємо rollback через WHALE_MIN_SIGNAL_VIEW_ENABLED.
+        if WHALE_MIN_SIGNAL_VIEW_ENABLED:
+            whale_view = whale_min_signal_view(stats)
+            snapshot["presence"] = whale_view.get("presence", 0.0)
+            snapshot["bias"] = whale_view.get("bias", 0.0)
+            snapshot["vwap_dev"] = whale_view.get("vwap_dev", 0.0)
+            snapshot["whale_view"] = whale_view
+            if WHALE_MINSIGNAL_V1_ENABLED:
+                snapshot["whale_signal_v1"] = compute_whale_min_signal(whale_view)
+        else:
+            for key in ("presence", "bias", "vwap_dev"):
+                if key in stats:
+                    snapshot[key] = stats.get(key)
+
+        for key in ("dvr", "band_pct"):
             if key in stats:
                 snapshot[key] = stats.get(key)
         for key in ("ts", "timestamp", "ts_ms", "timestamp_ms"):

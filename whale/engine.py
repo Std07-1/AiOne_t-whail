@@ -22,19 +22,7 @@ from typing import Any
 
 from utils.utils import safe_float
 
-try:
-    from config.config_whale import STAGE2_WHALE_TELEMETRY  # type: ignore
-except Exception:  # pragma: no cover
-    STAGE2_WHALE_TELEMETRY = {}  # type: ignore[assignment]
-
-# Локальний стан для EMA згладжування presence (per-symbol, телеметрія-only)
-_PRESENCE_EMA_STATE: dict[str, float] = {}
-
-try:
-    # доступна логіка телеметрії whale v2
-    from .whale_telemetry_scoring import WhaleTelemetryScoring
-except Exception:  # pragma: no cover
-    WhaleTelemetryScoring = None  # type: ignore[assignment]
+from .core import WhaleCore, WhaleInput
 
 
 class WhaleEngine:
@@ -47,6 +35,7 @@ class WhaleEngine:
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
+        self._core = WhaleCore(logger=self._logger)
 
     def enrich_ctx(
         self, *, symbol: str, stats: Mapping[str, Any], ctx: dict[str, Any]
@@ -65,91 +54,52 @@ class WhaleEngine:
         overlay = meta.setdefault("insight_overlay", {})
         whale_meta = meta.setdefault("whale", {})
 
-        # 1) Побудова surrogate "strats" на базі доступних полів (VWAP dev)
-        vwap = safe_float(stats.get("vwap"))
-        price = safe_float(stats.get("current_price"))
-        vwap_dev = None
-        if isinstance(vwap, float) and isinstance(price, float) and vwap > 0:
-            vwap_dev = (price - vwap) / vwap
-        strats: dict[str, Any] = {
-            # базові прапори за замовчуванням False — евристика візьме dev
-            "vwap_buying": False,
-            "vwap_selling": False,
-            "twap_accumulation": False,
-            "iceberg_orders": False,
-            "vwap_deviation": vwap_dev,
+        stats_whale = stats.get("whale")
+        whale_snapshot = stats_whale if isinstance(stats_whale, Mapping) else {}
+
+        directional_ctx = ctx.get("directional") or {}
+        directional_payload = {
+            "price_slope_atr": safe_float(directional_ctx.get("price_slope_atr")),
+            "directional_volume_ratio": safe_float(
+                directional_ctx.get("directional_volume_ratio")
+            ),
+            "trap": overlay.get("trap") if isinstance(overlay, dict) else None,
         }
 
-        presence: float | None = None
-        bias: float | None = None
-        dominance: dict[str, Any] | None = None
+        stage2_derived = {
+            "zones_summary": whale_snapshot.get("zones_summary", {}),
+            "vol_regime": whale_snapshot.get("vol_regime"),
+            "dev_level": whale_snapshot.get("dev_level"),
+        }
 
-        if WhaleTelemetryScoring is not None:
-            try:
-                presence = WhaleTelemetryScoring.presence_score_from(strats, zones=None)
-            except Exception as exc:  # noqa: BLE001
-                self._logger.debug("whale: presence_score_from fail: %s", exc)
-                presence = None
-            try:
-                bias = WhaleTelemetryScoring.whale_bias_from(strats)
-            except Exception as exc:  # noqa: BLE001
-                self._logger.debug("whale: whale_bias_from fail: %s", exc)
-                bias = None
-            try:
-                dominance = WhaleTelemetryScoring.dominance_flags(
-                    whale_bias=bias,
-                    vwap_dev=vwap_dev,
-                    slope_atr=safe_float(
-                        (ctx.get("directional") or {}).get("price_slope_atr")
-                    ),
-                    dvr=safe_float(
-                        (ctx.get("directional") or {}).get("directional_volume_ratio")
-                    ),
-                    trap=(
-                        (meta.get("insight_overlay") or {}).get("trap")
-                        if isinstance(meta.get("insight_overlay"), dict)
-                        else None
-                    ),
-                    iceberg=strats.get("iceberg_orders"),
-                    dist_zones=None,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._logger.debug("whale: dominance_flags fail: %s", exc)
-                dominance = None
-        else:
-            presence = None
-            bias = None
-            dominance = None
+        stats_slice = {
+            "current_price": stats.get("current_price"),
+            "vwap": stats.get("vwap"),
+        }
 
-        # 2) Інʼєкція в meta.whale та дзеркало у insight_overlay для strategy_selector
-        if presence is not None:
-            presence_val = float(presence)
-            # EMA‑згладжування (за фіче‑флагом у STAGE2_WHALE_TELEMETRY)
-            ema_cfg = dict((STAGE2_WHALE_TELEMETRY or {}).get("ema") or {})
-            ema_enabled = bool(ema_cfg.get("enabled", False))
-            alpha_raw = ema_cfg.get("alpha", 0.30)
-            alpha = float(alpha_raw) if isinstance(alpha_raw, (int, float)) else 0.30
-            alpha = max(0.01, min(0.99, alpha))
+        time_ctx = {
+            "now_ts": (
+                safe_float(whale_snapshot.get("ts_s"))
+                if isinstance(whale_snapshot, Mapping)
+                else 0.0
+            ),
+        }
 
-            presence_raw = presence_val
-            if ema_enabled:
-                prev = _PRESENCE_EMA_STATE.get(symbol)
-                if isinstance(prev, (int, float)):
-                    presence_val = float(
-                        alpha * presence_val + (1.0 - alpha) * float(prev)
-                    )
-                # якщо попереднього не було — ініціалізуємо поточним значенням
-                _PRESENCE_EMA_STATE[symbol] = presence_val
-                # Для прозорості додамо сире значення у meta (контракт не порушуємо)
-                whale_meta["presence_score_raw"] = float(presence_raw)
-            whale_meta["presence_score"] = float(presence_val)
-            overlay["whale_presence"] = float(presence_val)
-        if bias is not None:
-            whale_meta["whale_bias"] = float(bias)
-            overlay["whale_bias"] = float(bias)
-        if vwap_dev is not None:
-            whale_meta["vwap_deviation"] = float(vwap_dev)
-        if dominance is not None:
-            whale_meta["dominance"] = dominance
+        whale_input = WhaleInput(
+            symbol=symbol,
+            whale_snapshot=whale_snapshot,
+            stats_slice=stats_slice,
+            stage2_derived=stage2_derived,
+            directional=directional_payload,
+            time_context=time_ctx,
+            meta_overlay=overlay if isinstance(overlay, dict) else None,
+        )
+
+        telemetry = self._core.compute(whale_input)
+
+        if telemetry.meta_payload:
+            whale_meta.update(telemetry.meta_payload)
+        if telemetry.overlay_payload:
+            overlay.update(telemetry.overlay_payload)
 
         return ctx

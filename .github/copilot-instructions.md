@@ -198,6 +198,36 @@ python -m tools.bench_pseudostream \
   --out-dir replay_bench/run
 ```
 
+## Інструкції для запуску Python-кодів у PowerShell (Windows)
+
+Коли генеруєш команди для запуску невеликих Python-фрагментів у VS Code (Windows, PowerShell), дотримуйся таких правил:
+
+1. Використовуй PowerShell-нотацію та явну зміну каталогу:
+  ```powershell
+  cd C:\Aione_projects\AiOne_t-whail
+  .\.venv\Scripts\python.exe -c "<однорядковий Python-код; інструкції розділяй ; >"
+  ```
+
+2. Правила всередині аргумента для -c:
+  - Увесь код має бути в одному рядку.
+  - Окремі інструкції розділяй ;.
+  - Не вставляй переносів рядка, heredoc або конструкції, що залежать від bash/zsh.
+
+3. Заборонено (для мого середовища PowerShell):
+  - Bash heredoc та подібний синтаксис:
+    ```bash
+    python - <<'PY'
+    # такий формат не можна використовувати в PowerShell
+    PY
+    ```
+  - Команди, які припускають, що термінал — це bash/zsh (Linux/WSL/macOS).
+
+Приклад (еталон) для тесту explain_should_log:
+  ```powershell
+  cd C:\Aione_projects\AiOne_t-whail
+  .\.venv\Scripts\python.exe -c "from process_asset_batch.helpers import explain_should_log; from process_asset_batch.global_state import _SCEN_EXPLAIN_LAST_TS, _SCEN_EXPLAIN_BATCH_COUNTER; _SCEN_EXPLAIN_LAST_TS.clear(); _SCEN_EXPLAIN_BATCH_COUNTER.clear(); print(explain_should_log('ethusdt', 0.0, min_period_s=10.0, every_n=3)); print(_SCEN_EXPLAIN_LAST_TS, _SCEN_EXPLAIN_BATCH_COUNTER); print(explain_should_log('ethusdt', 1.0, min_period_s=10.0, every_n=3)); print(_SCEN_EXPLAIN_LAST_TS, _SCEN_EXPLAIN_BATCH_COUNTER)"
+  ```
+
 ## Acceptance
 
 * `episodes_manifest.jsonl` містить обидва сценарії.

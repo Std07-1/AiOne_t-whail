@@ -11,9 +11,10 @@ from rich.logging import RichHandler
 from config.flags import (
     WHALE_CARRY_FORWARD_TTL_S,
     WHALE_MISSING_STALE_MODEL_ENABLED,
-    WHALE_SOFT_STALE_TTL_S,
 )
 from process_asset_batch.whale_embed import ensure_whale_snapshot
+from utils.utils import safe_float
+from whale.core import WhaleCore, WhaleInput
 
 try:
     # не обов'язкова телеметрія; якщо модуль відсутній — тихо пропускаємо
@@ -44,6 +45,8 @@ if not logger.handlers:
     logger.setLevel(logging.DEBUG)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
+
+_WHALE_CORE = WhaleCore(logger=logger)
 
 _SNAPSHOT_TTL_S = 120.0
 
@@ -256,6 +259,9 @@ async def run_whale_stage2(
     # --- 8) vol_regime з normalized.stats ---
     normalized = ctx.setdefault("normalized", {})
     stats = normalized.setdefault("stats", {})
+    market_context = normalized.setdefault("market_context", {})
+    mc_meta = market_context.setdefault("meta", {})
+    overlay = mc_meta.setdefault("insight_overlay", {})
     try:
         atr_val = float(stats.get("atr"))
     except Exception:
@@ -277,74 +283,61 @@ async def run_whale_stage2(
     else:
         vol_regime = "unknown"
 
-    # --- 9) Числові поля (додатковий захист) ---
-    presence_f = _clip(snap.get("presence"), 0.0, 1.0, 0.0)
-    bias_f = _clip(snap.get("bias"), -1.0, 1.0, 0.0)
-    vdev_f = _clip(snap.get("vwap_dev"), -1e9, 1e9, 0.0)
+    dominance_raw = (
+        redis_payload.get("dominance") if isinstance(redis_payload, dict) else None
+    )
 
-    # --- 10) Dominance: з payload або легкий fallback ---
-    dominance = None
-    try:
-        dom_payload = (
-            redis_payload.get("dominance") if isinstance(redis_payload, dict) else None
-        )
-        if (
-            isinstance(dom_payload, dict)
-            and isinstance(dom_payload.get("buy"), bool)
-            and isinstance(dom_payload.get("sell"), bool)
-        ):
-            dominance = {
-                "buy": bool(dom_payload["buy"]),
-                "sell": bool(dom_payload["sell"]),
-            }
-        else:
-            try:
-                slope_atr = float(stats.get("price_slope_atr") or 0.0)
-            except Exception:
-                slope_atr = 0.0
-            vdev_abs_min = 0.01
-            slope_abs_min = 0.5
-            z_accum_min = 3
-            z_dist_min = 3
-            dom_buy = bool(
-                (vdev_f >= vdev_abs_min)
-                and (abs(slope_atr) >= slope_abs_min)
-                and (zones_summary["accum_cnt"] >= z_accum_min)
-            )
-            dom_sell = bool(
-                ((-vdev_f) >= vdev_abs_min)
-                and (abs(slope_atr) >= slope_abs_min)
-                and (zones_summary["dist_cnt"] >= z_dist_min)
-            )
-            dominance = {"buy": dom_buy, "sell": dom_sell}
-    except Exception:
-        dominance = None
-
-    # --- 11) Embed у stats.whale ---
-    whale_embedded: dict[str, Any] = {
-        "version": str((redis_payload or {}).get("version", "v2")),
-        "ts": int(ts_ms),
-        "ts_s": int(ts_s) if ts_s else 0,
-        "age_ms": int(age_ms),
-        "age_s": int(age_s),
-        "presence": presence_f,
-        "bias": bias_f,
-        "vwap_dev": vdev_f,
-        "missing": bool(snap.get("missing", False)),
-        "stale": bool(snap.get("stale", False)),
-        "dev_level": dev_level,
-        "zones_summary": zones_summary,
-        "vol_regime": vol_regime,
+    stats_slice: dict[str, Any] = {
+        "current_price": stats.get("current_price"),
+        "vwap": stats.get("vwap"),
     }
-    if isinstance(dominance, dict):
-        whale_embedded["dominance"] = {
-            "buy": bool(dominance.get("buy")),
-            "sell": bool(dominance.get("sell")),
-        }
-    if isinstance(snap.get("reasons"), list) and snap["reasons"]:
-        whale_embedded["reasons"] = [str(r) for r in snap["reasons"]]
 
-    stats["whale"] = whale_embedded
+    directional_payload: dict[str, Any] = {
+        "price_slope_atr": safe_float(stats.get("price_slope_atr")),
+        "directional_volume_ratio": safe_float(stats.get("directional_volume_ratio")),
+        "trap": overlay.get("trap") if isinstance(overlay, dict) else None,
+    }
+
+    whale_snapshot = {
+        "presence": snap.get("presence"),
+        "bias": snap.get("bias"),
+        "vwap_dev": snap.get("vwap_dev"),
+        "dominance": dominance_raw,
+        "ts": ts_ms,
+        "ts_s": ts_s,
+        "age_ms": age_ms,
+        "age_s": age_s,
+        "missing": snap.get("missing", False),
+        "stale": snap.get("stale", False),
+        "reasons": snap.get("reasons"),
+        "zones_summary": zones_summary,
+        "dev_level": dev_level,
+        "vol_regime": vol_regime,
+        "version": (redis_payload or {}).get("version", "v2"),
+    }
+
+    whale_input = WhaleInput(
+        symbol=symbol,
+        whale_snapshot=whale_snapshot,
+        stats_slice=stats_slice,
+        stage2_derived={
+            "zones_summary": zones_summary,
+            "vol_regime": vol_regime,
+            "dev_level": dev_level,
+        },
+        directional=directional_payload,
+        time_context={"now_ts": now_ts, "age_ms": age_ms, "age_s": age_s},
+        meta_overlay=overlay if isinstance(overlay, dict) else None,
+    )
+
+    telemetry = _WHALE_CORE.compute(whale_input)
+    stats["whale"] = telemetry.stats_payload
+
+    whale_meta = mc_meta.setdefault("whale", {})
+    if telemetry.meta_payload:
+        whale_meta.update(telemetry.meta_payload)
+    if telemetry.overlay_payload and isinstance(overlay, dict):
+        overlay.update(telemetry.overlay_payload)
 
     # --- 12) Постпроцесори + теги ---
     try:
@@ -359,47 +352,36 @@ async def run_whale_stage2(
         )
         stats_post = stats.setdefault("postprocessors", {})
         stats_post["accum_monitor"] = accum_payload
-        mc_meta = normalized.setdefault("market_context", {}).setdefault("meta", {})
         mc_meta.setdefault("postprocessors", {})["accum_monitor"] = accum_payload
     except Exception:
         pass
 
     try:
-        tags = stats.get("tags")
-        if not isinstance(tags, list):
-            tags = []
-        if whale_embedded.get("stale") and "whale_stale" not in tags:
-            tags.append("whale_stale")
-        if whale_embedded.get("missing") and "whale_missing" not in tags:
-            tags.append("whale_missing")
-        if tags:
-            stats["tags"] = tags
+        tag_bucket = stats.get("tags")
+        if not isinstance(tag_bucket, list):
+            tag_bucket = []
+        for tag in telemetry.tags:
+            if tag not in tag_bucket:
+                tag_bucket.append(tag)
+        if tag_bucket:
+            stats["tags"] = tag_bucket
     except Exception:
         pass
 
     # --- 13) Зберегти свіжий снепшот у стейті для майбутнього carry-forward ---
     try:
-        if not whale_embedded.get("missing") and not whale_embedded.get("stale"):
+        if not telemetry.stats_payload.get(
+            "missing"
+        ) and not telemetry.stats_payload.get("stale"):
             state_manager.set_field(
-                lower_symbol, "stats.whale_last", dict(whale_embedded)
+                lower_symbol, "stats.whale_last", dict(telemetry.stats_payload)
             )
     except Exception:
         try:
             asset_entry = state_manager.state.setdefault(lower_symbol, {})
             stats_entry = asset_entry.setdefault("stats", {})
-            stats_entry["whale_last"] = dict(whale_embedded)
+            stats_entry["whale_last"] = dict(telemetry.stats_payload)
         except Exception:
             pass
 
-    # --- 14) Soft-stale тег для логів (без зміни блокувальної логіки) ---
-    try:
-        if whale_embedded.get("stale") and ts_s > 0:
-            soft_age = now_ts - ts_s
-            if soft_age <= float(WHALE_SOFT_STALE_TTL_S):
-                stats.setdefault("tags", [])
-                if "whale_soft_stale" not in stats["tags"]:
-                    stats["tags"].append("whale_soft_stale")
-    except Exception:
-        pass
-
-    return whale_embedded
+    return telemetry.stats_payload

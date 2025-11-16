@@ -37,10 +37,14 @@ from config.flags import (
     STAGE2_SIGNAL_V2_ENABLED,
     STAGE2_WHALE_EMBED_ENABLED,
     STRICT_SCENARIO_HYSTERESIS_ENABLED,
+    WHALE_MINSIGNAL_V1_ENABLED,
     WHALE_MISSING_STALE_MODEL_ENABLED,
     WHALE_SOFT_STALE_TTL_S,
 )
 from config.keys import normalize_symbol
+from metrics.whale_signal_v1_metrics import (
+    record_signal as record_whale_signal_metric,
+)
 from monitoring.telemetry_sink import log_stage1_event
 from process_asset_batch.global_state import (
     _CTX_MEMORY,
@@ -52,7 +56,6 @@ from process_asset_batch.global_state import (
     _PROFILE_STATE,
     _SCEN_ALERT_LAST_TS,
     _SCEN_EXPLAIN_FORCE_ALL,
-    _SCEN_EXPLAIN_LAST_TS,
     _SCEN_HIST_RING,
     _SCEN_LAST_STABLE,
     _SCEN_TRACE_LAST_TS,
@@ -80,6 +83,7 @@ from process_asset_batch.pipeline.context_stage1 import prepare_stage1_context
 from process_asset_batch.router_signal_v2 import router_signal_v2
 from process_asset_batch.whale_embed import embed_whale_metrics, ensure_whale_snapshot
 from stage1.asset_monitoring import AssetMonitorStage1
+from stage3.whale_signal_telemetry import build_whale_signal_v1_payload
 from utils.phase_adapter import detect_phase_from_stats, resolve_scenario
 from utils.utils import (
     create_error_signal,
@@ -802,6 +806,34 @@ class ProcessAssetBatchv1:
                         tags.append("whale_missing")
                     if tags:
                         stats_map["tags"] = tags
+
+                    if WHALE_MINSIGNAL_V1_ENABLED:
+                        try:
+                            whale_signal_payload = build_whale_signal_v1_payload(
+                                stats_map
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[STRICT_WHALE] %s: whale_signal_v1 payload failed",
+                                lower_symbol,
+                                exc_info=True,
+                            )
+                        else:
+                            mc_meta["whale_signal_v1"] = whale_signal_payload
+                            record_whale_signal_metric(
+                                lower_symbol, whale_signal_payload
+                            )
+                            try:
+                                await log_stage1_event(
+                                    event="whale_signal_v1",
+                                    symbol=lower_symbol,
+                                    payload=whale_signal_payload,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "[TELEM] %s: whale_signal_v1 log failed",
+                                    lower_symbol,
+                                )
 
                     logger.debug(
                         "[STRICT_WHALE] %s: whale_snapshot miss=%s payload=%s",
@@ -1756,6 +1788,16 @@ class ProcessAssetBatchv1:
                         symbol=lower_symbol,
                         low_gate_effective=low_gate_eff,
                     )
+                    if isinstance(phase_info, dict):
+                        meta_block = normalized.setdefault(
+                            "market_context", {}
+                        ).setdefault("meta", {})
+                        diag_payload = phase_info.get("diagnostics")
+                        if isinstance(diag_payload, dict):
+                            meta_block["phase_diag"] = diag_payload
+                        hint_payload = phase_info.get("phase_state_hint")
+                        if isinstance(hint_payload, dict):
+                            meta_block["phase_state_hint"] = hint_payload
                     # Публікація bias_state (−1/0/+1) на кожному батчі — єдине місце,
                     # де ми оновлюємо market_context.meta та Prometheus незалежно від того,
                     # чи було 'phase' у stats раніше

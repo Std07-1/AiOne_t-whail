@@ -1,5 +1,18 @@
 # Пам'ять Copilot для AiOne_t • v2025-10-29
 
+## Terminal / Python snippets (Windows, PowerShell)
+
+- ОС: Windows 11, VS Code, інтегрований термінал за замовчуванням — PowerShell (`pwsh`).
+- Проєкт AiOne_t-whail розташований у: `C:\Aione_projects\AiOne_t-whail`.
+- Віртуальне середовище Python: `.venv\Scripts\python.exe` у корені проєкту.
+- Для одноразових тестових викликів Python-функцій я використовую **лише** формат `python -c "..."` з кодом в один рядок, інструкції розділені `;`.
+- Bash-подібний синтаксис типу `python - <<'PY' ... PY` (heredoc) у PowerShell **не працює** і має вважатись невалідним для мого середовища.
+- Приклади тестів для `process_asset_batch.helpers.explain_should_log`:
+
+  ```powershell
+  cd C:\Aione_projects\AiOne_t-whail
+  .\.venv\Scripts\python.exe -c "from process_asset_batch.helpers import explain_should_log; from process_asset_batch.global_state import _SCEN_EXPLAIN_LAST_TS, _SCEN_EXPLAIN_BATCH_COUNTER; _SCEN_EXPLAIN_LAST_TS.clear(); _SCEN_EXPLAIN_BATCH_COUNTER.clear(); print(explain_should_log('ethusdt', 0.0, min_period_s=10.0, every_n=3)); print(_SCEN_EXPLAIN_LAST_TS, _SCEN_EXPLAIN_BATCH_COUNTER); print(explain_should_log('ethusdt', 1.0, min_period_s=10.0, every_n=3)); print(_SCEN_EXPLAIN_LAST_TS, _SCEN_EXPLAIN_BATCH_COUNTER)"
+  ```
 ## Місія
 
 * Win-rate↑, PnL↑, FP↓. Latency ≤200 мс/бар.
@@ -31,6 +44,32 @@
 * Стандартизація виходів: усі `--out` без каталогу автоматично у `reports/…` (tools: quality_snapshot, quality_dashboard, scenario_quality_report). Рун‑логи `--log` без каталогу автоматично у `logs/runs/…` (tools.run_window). Існуючі артефакти з кореня перенесено у `reports/`, run_*.log → `logs/runs/`.
 * Дефолти закріплено: `SCEN_CONTEXT_WEIGHTS_ENABLED=False` як джерело правди у `config/config.py`. FSM sweep→retest→bias — без змін. Forward‑K=3/5/10/20/30 увімкнено у snapshot/dashboard.
 * D6 запущено у фоні: 4h A‑only ран (`tools.run_window`, лог → `logs/runs/run_A_D6_4h.log`) + монітор 4h (`tools.monitor_observation --deep-state --symbols BTC,ETH,TON,SNX,SOL,TRX,XRP,LINK`, артефакти → `reports/`).
+
+## Останні дії (2025-11-13)
+
+* `config/config.py`: додано `get_stage3_param`, приведено `safe_float` до сигнатури з `default`, щоб Stage3/whale логіка знову мала fallback без дублювання.
+* Відновлено прапори/аліаси для Stage3 paper: `STAGE3_PAPER_ENABLED` у `config/flags.py`, helper-експорти (`_compute_profile_hint_direction_and_score`, `_should_confirm_pre_breakout`, `_normalize_and_cap_dvr`, `_emit_prom_presence`) тепер офіційно делегують у `process_asset_batch.helpers`.
+* Створено шім `tools/run_window.py` → `tools.unified_runner live` (попередження + auto `--report`, перенесення `STATE_NAMESPACE`, `PROM_HTTP_PORT`).
+* Мінімальний сигнал Stage3: виправлено логування відмов, читання `time_exit_s` і Prometheus-метрики; таргетований pytest `tests/test_min_signal_paper.py` проходить.
+* Додано базову ``pytest`` підтримку корутин (`tests/conftest.py` hook) — для smoke використовується локальний event loop без зовнішніх плагінів.
+* Сформовано план тотальної реорганізації whale-логіки: єдиний core‑модуль із чистими функціями, окремі адаптери для Stage2/Stage3/метрик, поетапне видалення `_`-шімів, Stage3 — останній етап після стабілізації ядра.
+
+### Карта whale-модулів (стан на 2025-11-13)
+
+| Модуль/файл | Роль | Стан | Коментарі |
+| --- | --- | --- | --- |
+| `whale/engine.py` | Оркестратор телеметрії: обчислює presence/bias/dominance, інʼєктує у `ctx.meta.whale`, підтримує EMA через `_PRESENCE_EMA_STATE`. | Мутує стан (глобальний EMA, in-place ctx). | Чистий enrichment без I/O; скоринг винесено у `whale_telemetry_scoring.py`. |
+| `whale/whale_telemetry_scoring.py` | Статичні функції для скорингу presence/bias/dominance з параметрами `config_whale.py`. | Pure. | Використовується engine й Stage2. |
+| `app/whale_worker.py` | Асинхронний Stage1/2 воркер: читає Redis, рахує VWAP dev, iceberg, збагачує payload і публікує у Redis. | Мутує стан (локальні таймери, Redis). | Частково дублює presence/dominance логіку, що вже є в engine. |
+| `process_asset_batch/helpers.py` | Канонічні Stage2-хелпери (alt keys, DVR EMA, pre-breakout). | Мутує стан через `_DVR_EMA_STATE` тощо. | Експортує `_alias` для зворотної сумісності. |
+| `app/process_asset_batch.py` | Головний Stage2 процесор: підтягує whale-метрики, фази, сценарії, DVR. | Мутує стан (глобальні кеші, cooldown). | Містить дублікати логіки pre-breakout/alt-confirm. |
+| `stage3/trade_manager.py` | Менеджер угод Stage3: відкриття, trailing, exit. | Мутує стан (поточні позиції). | Спирається на Stage2 сигнали; whale-логіка не вбудована. |
+| `stage3/open_trades.py` | Відкриття угод Stage3 з гейтами participation/volatility. | Мутує стан (дебаунс, виклики менеджера). | Частково повторює Stage2 гейти. |
+| `config/config_whale.py` | Центр конфігурації whale-метрик (ваги, пороги, EMA). | Статичний. | Має бути SoT для всіх констант whale. |
+| `config/flags.py` | Feature-флаги (`WHALE_SCORING_V2_ENABLED`, `ENABLE_LARGE_ORDER_DETECTION` та ін.). | Статичний. | Використовуватиметься для поступового перемикання на нове ядро. |
+| `Stage1/helpers.py` | Допоміжні Stage1 функції (ATR, глибина стакану, кеші). | Мутує стан (Redis). | Whale-логіки немає; корисні патерни кеш-менеджменту. |
+| `stage3/min_signal_adapter.py` | Файл відсутній; потрібна реалізація в новій архітектурі. | — | Створити як adapter поверх нового whale-core. |
+| Інші (`metrics/whale_*`, `whale_stage2.py`, `embed_whale_metrics.py`) | Не знайдено в репозиторії (ймовірно заархівовано/вбудовано). | — | Під час міграції перевірити історичні згадки. |
 
 ### Policy Engine v2 (T0) інтеграція
 
@@ -122,6 +161,7 @@ Acceptance T0: у `reports/signals_qa.csv` має бути ≥1 TP/FP; у `/metr
 * [ ] Stage2 читає override з Redis пріоритетно. Ключ: `ai_one:overrides:low_atr_spike:{symbol}`.
 * [ ] Санітизація numeric перед усіма `.to_csv/.to_parquet`. Усунути pandas warnings.
 * [ ] Тести `pytest -q`: presence_cap_flat, risk_clamp_flat, accum_monitor_fallback, htf_gray_stale, override_ttl.
+* [ ] Реорганізувати whale-ядро (Single SoT: core + адаптери, без дубльованих `_`-шімів; Stage3 відкласти до завершення Stage2/metrics інтеграції).
 
 ### P1 — спостережність і A/B
 * [x] Опційні Prometheus-гейджі (лінива ініціалізація, no-op без залежності).
